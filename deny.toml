@@ -92,6 +92,20 @@ allow = [
   "MIT",
   "Apache-2.0",
   "Unicode-3.0",
+  # Permissive licenses pulled in by the bevy and loro dependency trees.
+  "MIT-0",
+  "ISC",
+  "Zlib",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  # Weak copyleft, file-scoped; used as unmodified dependencies only (im,
+  # option-ext via directories later).
+  "MPL-2.0",
+  # Font-data licences for egui's embedded default fonts (epaint_default_fonts).
+  "OFL-1.1",
+  "Ubuntu-font-1.0",
   #"Apache-2.0 WITH LLVM-exception",
 ]
 # The confidence threshold for detecting a license from license text.

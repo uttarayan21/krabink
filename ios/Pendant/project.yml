@@ -1,0 +1,39 @@
+# XcodeGen spec for the iPad app. Generate the project with:
+#   nix run nixpkgs#xcodegen   (in this directory)
+# Requires ios/PendantCore to be built first (scripts/build-ios-core.sh).
+name: Pendant
+options:
+  bundleIdPrefix: dev.darksailor
+  deploymentTarget:
+    iOS: "17.0"
+packages:
+  PendantCore:
+    path: ../PendantCore
+targets:
+  Pendant:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    dependencies:
+      - package: PendantCore
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: dev.darksailor.pendant
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        # iPad-first, but runs on iPhone too for cheap simulator checks.
+        TARGETED_DEVICE_FAMILY: "1,2"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: >-
+          UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown
+          UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
+  PendantUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - UITests
+    dependencies:
+      - target: Pendant
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES

@@ -25,8 +25,9 @@
   }: let
     # Read outside eachSystem: the crate name is system-independent, and the
     # githubActions matrix below needs it to tell the canonical checks apart
-    # from their unprefixed aliases.
-    cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+    # from their unprefixed aliases. The root manifest is a virtual workspace,
+    # so the name comes from the desktop crate.
+    cargoToml = builtins.fromTOML (builtins.readFile ./crates/pendant/Cargo.toml);
     name = cargoToml.package.name;
   in
     flake-utils.lib.eachSystem [
@@ -43,11 +44,20 @@
         };
         inherit (pkgs) lib;
 
-        toolchain = pkgs.rust-bin.nightly.latest.default;
-        toolchainWithLLvmTools = toolchain.override {
+        # iOS cross targets for pendant-ffi staticlib builds (Mac only).
+        iosTargets = lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+          "aarch64-apple-ios"
+          "aarch64-apple-ios-sim"
+        ];
+        toolchain = pkgs.rust-bin.nightly.latest.default.override {
+          targets = iosTargets;
+        };
+        toolchainWithLLvmTools = pkgs.rust-bin.nightly.latest.default.override {
+          targets = iosTargets;
           extensions = ["rust-src" "llvm-tools"];
         };
-        toolchainWithRustAnalyzer = toolchain.override {
+        toolchainWithRustAnalyzer = pkgs.rust-bin.nightly.latest.default.override {
+          targets = iosTargets;
           extensions = ["rust-src" "rust-analyzer"];
         };
         craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
@@ -134,6 +144,7 @@
           pkg = craneLib.buildPackage (commonArgs
             // {inherit cargoArtifacts;}
             // {
+              cargoExtraArgs = "-p ${name}";
               postInstall = ''
                 mkdir -p $out/bin
                 mkdir -p $out/share/bash-completions
@@ -144,8 +155,15 @@
                 $out/bin/${name} completions zsh > $out/share/zsh/site-functions/_${name}
               '';
             });
+          server = craneLib.buildPackage (commonArgs
+            // {inherit cargoArtifacts;}
+            // {
+              pname = "pendant-server";
+              cargoExtraArgs = "-p pendant-server";
+            });
         in {
           "${name}" = pkg;
+          pendant-server = server;
           default = pkg;
         };
 

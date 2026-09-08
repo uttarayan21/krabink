@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Swift smoke test: build the host cdylib, generate Swift bindings, compile
+# scripts/smoke/main.swift against them and run it. macOS only (M6 gate).
+set -euo pipefail
+
+if [[ "$(uname)" != "Darwin" ]]; then
+  echo "error: the Swift smoke test needs macOS (swiftc)" >&2
+  exit 1
+fi
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+gen="$root/target/swift-smoke"
+
+cargo build -p pendant-ffi --lib
+rm -rf "$gen"
+mkdir -p "$gen"
+cargo run -q -p pendant-ffi --features bindgen --bin uniffi-bindgen -- \
+  generate --library target/debug/libpendant_ffi.dylib --language swift --out-dir "$gen"
+cp "$gen/pendantFFI.modulemap" "$gen/module.modulemap"
+
+# Clean env: a nix devShell's clang setup breaks Xcode's swiftc
+# ("missing required module 'SwiftShims'").
+env -i HOME="$HOME" PATH=/usr/bin:/bin TERM=dumb \
+  xcrun swiftc -o "$gen/smoke" scripts/smoke/main.swift "$gen/pendant.swift" \
+  -I "$gen" -L target/debug -lpendant_ffi
+
+DYLD_LIBRARY_PATH=target/debug "$gen/smoke"

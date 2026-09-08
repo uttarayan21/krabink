@@ -1,0 +1,35 @@
+[package]
+name = "pendant-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "UniFFI bindings surface exposing pendant-core to Swift"
+
+[lib]
+name = "pendant_ffi"
+# staticlib for the iOS XCFramework, cdylib for macOS smoke tests and
+# library-mode bindgen, plain lib for Rust unit/integration tests.
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+# Pulls in the uniffi CLI for the bindgen bin; keep it off for iOS lib builds.
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+pendant-core.workspace = true
+uniffi.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pendant-server.workspace = true
+axum.workspace = true
+tempfile.workspace = true
