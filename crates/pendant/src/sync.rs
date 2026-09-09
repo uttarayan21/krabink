@@ -21,6 +21,9 @@ use crate::ui::EditorState;
 
 const RECONNECT_MIN: std::time::Duration = std::time::Duration::from_millis(500);
 const RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+/// A black-holed address (wrong network) must not stall the link for the
+/// OS's TCP timeout.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Raised by the UI when a doc needs server subscription (note opened).
 #[derive(Message)]
@@ -195,7 +198,13 @@ async fn transport_task(
             }
         };
 
-        match tokio_tungstenite::connect_async(request).await {
+        let attempt =
+            tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
+                .await
+                .map_err(|_| {
+                    tokio_tungstenite::tungstenite::Error::Io(std::io::ErrorKind::TimedOut.into())
+                });
+        match attempt.and_then(|r| r) {
             Ok((socket, _)) => {
                 tracing::info!(server, "sync connected");
                 backoff = RECONNECT_MIN;

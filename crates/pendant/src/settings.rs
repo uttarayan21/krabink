@@ -45,9 +45,11 @@ fn apply_adopted(
         Err(err) => tracing::error!(%err, "persisting pairing failed"),
     }
     relay.add_token(&info.token);
+    // Desktop-to-desktop takes the preferred direct path + fallback only;
+    // the alternates are for mobile clients that hop networks.
     transport.replace_remotes(
         runtime.0.handle(),
-        info.endpoints().into_iter().map(str::to_string),
+        std::iter::once(info.server.clone()).chain(info.fallback.clone()),
         &info.token,
     );
     // Our QR keeps advertising our own relay as the direct path; the
@@ -56,6 +58,8 @@ fn apply_adopted(
         server: relay.advertised.clone(),
         token: info.token.clone(),
         fallback: Some(info.fallback.clone().unwrap_or_else(|| info.server.clone())),
+        alt: relay.alt.clone(),
+        relay_id: Some(transport.device().to_string()),
     });
 }
 
@@ -71,6 +75,7 @@ pub enum SettingsAction {
 /// caller because it spans several ECS resources.
 pub struct SettingsView {
     pub links: Vec<LinkStatus>,
+    pub mdns_name: Option<String>,
     pub this_device: String,
     pub devices: Vec<DeviceMeta>,
     pub now_ms: u64,
@@ -176,6 +181,16 @@ impl Settings {
                 });
                 ui.end_row();
             }
+        });
+        if !self.info.alt.is_empty() {
+            ui.weak("also reachable at:");
+            for alt in &self.info.alt {
+                ui.monospace(alt);
+            }
+        }
+        ui.weak(match &view.mdns_name {
+            Some(name) => format!("mDNS: {name}"),
+            None => "mDNS: off (advertising failed)".to_string(),
         });
         if view.links.len() == 1 {
             ui.weak("no dedicated relay: devices must reach this desktop directly.");

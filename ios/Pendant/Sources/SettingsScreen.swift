@@ -22,6 +22,10 @@ struct SettingsScreen: View {
                     LabeledContent(
                         "server",
                         value: UserDefaults.standard.string(forKey: "serverURL") ?? "not set")
+                    if let alt = model.pairInfo?.alt, !alt.isEmpty {
+                        LabeledContent("also", value: alt.joined(separator: "\n"))
+                    }
+                    LabeledContent("found nearby", value: model.discoveredURL ?? "no")
                     LabeledContent(
                         "fallback relay",
                         value: UserDefaults.standard.string(forKey: "fallbackURL") ?? "none")

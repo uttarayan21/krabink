@@ -180,32 +180,52 @@ impl From<pcore::DeviceMeta> for DeviceInfo {
 /// Sync coordinates carried by a `pendant://pair` URI (QR pairing).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct PairInfo {
-    /// Direct path: the sharing desktop's embedded relay.
+    /// Preferred direct path: the sharing desktop's embedded relay.
     pub server: String,
     pub token: String,
-    /// Dedicated relay to route through when `server` is unreachable.
+    /// Dedicated relay to route through when no direct path is reachable.
     pub fallback: Option<String>,
+    /// Further direct paths to the same desktop (other interfaces).
+    pub alt: Vec<String>,
+    /// The desktop's device id: match against the `id` TXT record of a
+    /// browsed `_pendant._tcp` service to find it by mDNS.
+    pub relay_id: Option<String>,
+}
+
+impl From<pcore::PairInfo> for PairInfo {
+    fn from(p: pcore::PairInfo) -> Self {
+        Self {
+            server: p.server,
+            token: p.token,
+            fallback: p.fallback,
+            alt: p.alt,
+            relay_id: p.relay_id,
+        }
+    }
+}
+
+impl From<PairInfo> for pcore::PairInfo {
+    fn from(p: PairInfo) -> Self {
+        Self {
+            server: p.server,
+            token: p.token,
+            fallback: p.fallback,
+            alt: p.alt,
+            relay_id: p.relay_id,
+        }
+    }
 }
 
 /// Build the pairing URI a client renders as a QR code.
 #[uniffi::export]
-pub fn build_pair_uri(server: String, token: String, fallback: Option<String>) -> String {
-    pcore::PairInfo {
-        server,
-        token,
-        fallback,
-    }
-    .to_uri()
+pub fn build_pair_uri(info: PairInfo) -> String {
+    pcore::PairInfo::from(info).to_uri()
 }
 
 /// Parse a scanned/opened pairing URI; `None` when it is not one of ours.
 #[uniffi::export]
 pub fn parse_pair_uri(uri: String) -> Option<PairInfo> {
-    pcore::PairInfo::parse(&uri).map(|p| PairInfo {
-        server: p.server,
-        token: p.token,
-        fallback: p.fallback,
-    })
+    pcore::PairInfo::parse(&uri).map(Into::into)
 }
 
 /// Entry in the note registry (the workspace doc).
@@ -233,7 +253,10 @@ impl From<pcore::NoteMeta> for NoteInfo {
 pub enum SyncState {
     Disconnected,
     Connecting,
-    Connected,
+    /// Handshake done; `url` is the path that won (direct or fallback).
+    Connected {
+        url: String,
+    },
     /// Server rejected us; reconnecting without change is pointless.
     Fatal {
         message: String,

@@ -2,11 +2,19 @@
 //! [`ClientSession`], persists imports, and fans events out to listeners.
 //! One task per [`crate::Core`], driven entirely by [`Cmd`]s — the FFI
 //! mutators never block on the network.
+//!
+//! Path selection: every direct path (the desktop's addresses on its
+//! interfaces, plus whatever mDNS found) is dialled in parallel and the
+//! first handshake wins. The dedicated fallback relay is only dialled when
+//! none of them answers. While on the fallback, the direct paths are
+//! re-probed every [`PROBE_EVERY`] and the session moves over the moment
+//! one answers.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use futures::stream::FuturesUnordered;
 use futures::{SinkExt, StreamExt};
 use pendant_core::{
     ClientDocs, ClientEffect, ClientMsg, ClientSession, DocKey, Flush, ServerMsg, WetInk,
@@ -28,10 +36,29 @@ pub(crate) enum Cmd {
 
 const BACKOFF_START: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// A direct address on the wrong network black-holes SYNs; give up on it
+/// well before the OS would.
+const DIRECT_TIMEOUT: Duration = Duration::from_secs(5);
+const FALLBACK_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often, while on the fallback relay, the direct paths are retried.
+const PROBE_EVERY: Duration = Duration::from_secs(20);
 
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type Sink = futures::stream::SplitSink<Socket, WsMessage>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Direct,
+    Fallback,
+}
+
+/// An open socket plus how it was reached.
+struct Dialed {
+    url: String,
+    route: Route,
+    socket: Socket,
+}
 
 /// How a connection attempt ended, deciding what the outer loop does next.
 enum ConnEnd {
@@ -41,10 +68,18 @@ enum ConnEnd {
     Reconnect(SyncTarget),
     /// Transport dropped or failed; retry with backoff.
     Lost,
+    /// A direct path answered while on the fallback: move over to it.
+    Upgrade(Box<Dialed>),
     /// Server rejected us; give up until told otherwise.
     Fatal(String),
     /// The `Core` was dropped.
     Shutdown,
+}
+
+/// What interrupted the dial or the backoff pause.
+enum Step<T> {
+    Done(T),
+    Cmd(Option<Cmd>),
 }
 
 pub(crate) async fn run(shared: Weak<Shared>, mut rx: mpsc::UnboundedReceiver<Cmd>) {
@@ -62,54 +97,150 @@ pub(crate) async fn run(shared: Weak<Shared>, mut rx: mpsc::UnboundedReceiver<Cm
 
         notify_sync_state(&shared, SyncState::Connecting);
         let mut backoff = BACKOFF_START;
-        // Alternate direct path / fallback relay: attempt 0 direct, 1
-        // fallback, 2 direct… so a lost direct path lands on the dedicated
-        // relay after one backoff and keeps probing for the direct path.
-        let mut attempt = 0u32;
-        loop {
-            let Some(strong) = shared.upgrade() else {
+        'attempts: loop {
+            if shared.upgrade().is_none() {
                 return;
+            }
+            let step = {
+                let snapshot = target.clone();
+                tokio::select! {
+                    dialed = dial_target(&snapshot) => Step::Done(dialed),
+                    cmd = rx.recv() => Step::Cmd(cmd),
+                }
             };
-            let url = match (&target.fallback, attempt % 2) {
-                (Some(fallback), 1) => fallback.as_str(),
-                _ => target.url.as_str(),
-            };
-            match connection(&strong, &mut rx, url, &target.token).await {
-                ConnEnd::Shutdown => return,
-                ConnEnd::Suspend => {
+            let mut dialed = match step {
+                Step::Cmd(None) => return,
+                Step::Cmd(Some(Cmd::Suspend)) => {
                     notify_sync_state(&shared, SyncState::Disconnected);
                     break;
                 }
-                ConnEnd::Fatal(message) => {
-                    notify_sync_state(&shared, SyncState::Fatal { message });
-                    break;
-                }
-                ConnEnd::Reconnect(next) => {
+                Step::Cmd(Some(Cmd::Connect(next))) => {
                     target = next;
-                    attempt = 0;
-                    notify_sync_state(&shared, SyncState::Connecting);
+                    continue;
                 }
-                ConnEnd::Lost => {
-                    drop(strong);
-                    attempt += 1;
-                    tokio::select! {
-                        _ = tokio::time::sleep(backoff) => {}
-                        cmd = rx.recv() => match cmd {
-                            None => return,
-                            Some(Cmd::Suspend) => {
-                                notify_sync_state(&shared, SyncState::Disconnected);
-                                break;
-                            }
-                            Some(Cmd::Connect(next)) => {
-                                target = next;
-                                attempt = 0;
-                            }
-                            Some(_) => {}
-                        },
+                Step::Cmd(Some(_)) => continue,
+                Step::Done(None) => {
+                    match pause(&mut rx, backoff).await {
+                        Step::Cmd(None) => return,
+                        Step::Cmd(Some(Cmd::Suspend)) => {
+                            notify_sync_state(&shared, SyncState::Disconnected);
+                            break;
+                        }
+                        Step::Cmd(Some(Cmd::Connect(next))) => target = next,
+                        Step::Cmd(Some(_)) | Step::Done(()) => {}
                     }
                     backoff = (backoff * 2).min(BACKOFF_MAX);
+                    continue;
+                }
+                Step::Done(Some(dialed)) => dialed,
+            };
+            backoff = BACKOFF_START;
+
+            loop {
+                let Some(strong) = shared.upgrade() else {
+                    return;
+                };
+                match connection(&strong, &mut rx, &target, dialed).await {
+                    ConnEnd::Shutdown => return,
+                    ConnEnd::Suspend => {
+                        notify_sync_state(&shared, SyncState::Disconnected);
+                        break 'attempts;
+                    }
+                    ConnEnd::Fatal(message) => {
+                        notify_sync_state(&shared, SyncState::Fatal { message });
+                        break 'attempts;
+                    }
+                    ConnEnd::Reconnect(next) => {
+                        target = next;
+                        notify_sync_state(&shared, SyncState::Connecting);
+                        continue 'attempts;
+                    }
+                    ConnEnd::Upgrade(next) => {
+                        tracing::info!(url = next.url, "direct path back; leaving fallback");
+                        notify_sync_state(&shared, SyncState::Connecting);
+                        dialed = *next;
+                    }
+                    ConnEnd::Lost => {
+                        drop(strong);
+                        notify_sync_state(&shared, SyncState::Connecting);
+                        match pause(&mut rx, backoff).await {
+                            Step::Cmd(None) => return,
+                            Step::Cmd(Some(Cmd::Suspend)) => {
+                                notify_sync_state(&shared, SyncState::Disconnected);
+                                break 'attempts;
+                            }
+                            Step::Cmd(Some(Cmd::Connect(next))) => target = next,
+                            Step::Cmd(Some(_)) | Step::Done(()) => {}
+                        }
+                        backoff = (backoff * 2).min(BACKOFF_MAX);
+                        continue 'attempts;
+                    }
                 }
             }
+        }
+    }
+}
+
+/// Sleep out a backoff unless a command arrives first.
+async fn pause(rx: &mut mpsc::UnboundedReceiver<Cmd>, backoff: Duration) -> Step<()> {
+    tokio::select! {
+        _ = tokio::time::sleep(backoff) => Step::Done(()),
+        cmd = rx.recv() => Step::Cmd(cmd),
+    }
+}
+
+/// One WebSocket handshake with a deadline.
+async fn dial(url: &str, token: &str, timeout: Duration) -> Result<Socket, String> {
+    let mut request = url
+        .into_client_request()
+        .map_err(|err| format!("bad server url {url:?}: {err}"))?;
+    let auth = format!("Bearer {token}")
+        .parse()
+        .map_err(|_| "token not header-safe".to_string())?;
+    request.headers_mut().insert("Authorization", auth);
+    match tokio::time::timeout(timeout, tokio_tungstenite::connect_async(request)).await {
+        Ok(Ok((socket, _))) => Ok(socket),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err("timed out".into()),
+    }
+}
+
+/// Race every direct path; the first handshake wins, the rest are dropped.
+async fn dial_direct(direct: &[String], token: &str) -> Option<Dialed> {
+    let mut pending: FuturesUnordered<_> = direct
+        .iter()
+        .map(|url| async move { (url.clone(), dial(url, token, DIRECT_TIMEOUT).await) })
+        .collect();
+    while let Some((url, result)) = pending.next().await {
+        match result {
+            Ok(socket) => {
+                return Some(Dialed {
+                    url,
+                    route: Route::Direct,
+                    socket,
+                });
+            }
+            Err(err) => tracing::info!(url, "direct path failed: {err}"),
+        }
+    }
+    None
+}
+
+/// Direct paths first; the fallback relay only when none of them answered.
+async fn dial_target(target: &SyncTarget) -> Option<Dialed> {
+    if let Some(dialed) = dial_direct(&target.direct, &target.token).await {
+        return Some(dialed);
+    }
+    let fallback = target.fallback.as_ref()?;
+    match dial(fallback, &target.token, FALLBACK_TIMEOUT).await {
+        Ok(socket) => Some(Dialed {
+            url: fallback.clone(),
+            route: Route::Fallback,
+            socket,
+        }),
+        Err(err) => {
+            tracing::warn!(url = fallback, "fallback relay failed: {err}");
+            None
         }
     }
 }
@@ -117,33 +248,24 @@ pub(crate) async fn run(shared: Weak<Shared>, mut rx: mpsc::UnboundedReceiver<Cm
 async fn connection(
     shared: &Arc<Shared>,
     rx: &mut mpsc::UnboundedReceiver<Cmd>,
-    url: &str,
-    token: &str,
+    target: &SyncTarget,
+    dialed: Dialed,
 ) -> ConnEnd {
-    let mut request = match url.into_client_request() {
-        Ok(request) => request,
-        Err(err) => return ConnEnd::Fatal(format!("bad server url {url:?}: {err}")),
-    };
-    let auth = match format!("Bearer {token}").parse() {
-        Ok(auth) => auth,
-        Err(_) => return ConnEnd::Fatal("token not header-safe".into()),
-    };
-    request.headers_mut().insert("Authorization", auth);
-
-    let socket = match tokio_tungstenite::connect_async(request).await {
-        Ok((socket, _)) => socket,
-        Err(err) => {
-            tracing::warn!(url, "sync connect failed: {err}");
-            return ConnEnd::Lost;
-        }
-    };
+    let Dialed { url, route, socket } = dialed;
     let (mut sink, mut stream) = socket.split();
-    let mut session = ClientSession::new(shared.device, token.to_string());
+    let mut session = ClientSession::new(shared.device, target.token.clone());
 
     let effects = session.connect();
-    if let Err(end) = apply_effects(&mut session, &mut sink, shared, effects).await {
+    if let Err(end) = apply_effects(&mut session, &mut sink, shared, &url, effects).await {
         return end;
     }
+
+    // On the fallback, keep looking for a direct path. The probe runs on its
+    // own task so a slow dial never stalls the live session.
+    let mut probe_tick = tokio::time::interval(PROBE_EVERY);
+    probe_tick.tick().await; // the first tick fires immediately; skip it
+    let mut probe: Option<tokio::task::JoinHandle<Option<Dialed>>> = None;
+    let probing = route == Route::Fallback && !target.direct.is_empty();
 
     loop {
         tokio::select! {
@@ -162,7 +284,7 @@ async fn connection(
                     Some(Cmd::Ephemeral { doc, payload }) => session.ephemeral(doc, payload),
                     Some(Cmd::Subscribe(_)) => Vec::new(),
                 };
-                if let Err(end) = apply_effects(&mut session, &mut sink, shared, effects).await {
+                if let Err(end) = apply_effects(&mut session, &mut sink, shared, &url, effects).await {
                     return end;
                 }
             }
@@ -187,8 +309,18 @@ async fn connection(
                 for notify in docs.pending {
                     notify.dispatch();
                 }
-                if let Err(end) = apply_effects(&mut session, &mut sink, shared, effects).await {
+                if let Err(end) = apply_effects(&mut session, &mut sink, shared, &url, effects).await {
                     return end;
+                }
+            }
+            _ = probe_tick.tick(), if probing && probe.is_none() => {
+                let (direct, token) = (target.direct.clone(), target.token.clone());
+                probe = Some(tokio::spawn(async move { dial_direct(&direct, &token).await }));
+            }
+            found = async { probe.as_mut().expect("guarded").await }, if probe.is_some() => {
+                probe = None;
+                if let Ok(Some(next)) = found {
+                    return ConnEnd::Upgrade(Box::new(next));
                 }
             }
         }
@@ -201,6 +333,7 @@ async fn apply_effects(
     session: &mut ClientSession,
     sink: &mut Sink,
     shared: &Arc<Shared>,
+    via: &str,
     effects: Vec<ClientEffect>,
 ) -> Result<(), ConnEnd> {
     let mut queue: VecDeque<ClientEffect> = effects.into();
@@ -208,7 +341,12 @@ async fn apply_effects(
         match effect {
             ClientEffect::Send(msg) => send_msg(sink, &msg).await?,
             ClientEffect::Connected => {
-                notify_sync_state_arc(shared, SyncState::Connected);
+                notify_sync_state_arc(
+                    shared,
+                    SyncState::Connected {
+                        url: via.to_string(),
+                    },
+                );
                 for (doc, have) in open_docs(shared) {
                     queue.extend(session.subscribe(doc, have));
                 }

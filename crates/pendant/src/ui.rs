@@ -78,12 +78,14 @@ fn editor_ui(
     mut subscribes: MessageWriter<SubscribeNeeded>,
     mut settings: ResMut<Settings>,
     transport: Res<SyncTransport>,
+    relay: Res<crate::relay::EmbeddedRelay>,
     mut adopted: MessageWriter<crate::settings::PairAdopted>,
     follow: Res<FollowLatest>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     let view = crate::settings::SettingsView {
         links: transport.links(),
+        mdns_name: relay.mdns_name.clone(),
         this_device: transport.device().to_string(),
         devices: docs.workspace.devices(),
         now_ms: crate::docs::now_ms(),

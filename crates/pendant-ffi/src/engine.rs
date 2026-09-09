@@ -79,11 +79,12 @@ pub(crate) struct State {
     pub server: Option<SyncTarget>,
 }
 
-/// Where background sync connects: direct path first, dedicated relay as
-/// fallback; both take the same token.
+/// Where background sync connects: every direct path is raced, the
+/// dedicated relay is only used when none of them answers; all take the
+/// same token.
 #[derive(Clone)]
 pub(crate) struct SyncTarget {
-    pub url: String,
+    pub direct: Vec<String>,
     pub token: String,
     pub fallback: Option<String>,
 }
@@ -281,12 +282,14 @@ impl Core {
         }))
     }
 
-    /// `url` is tried first on every (re)connect; `fallback` on the attempt
-    /// after a failed one, so a device that cannot reach the desktop
-    /// directly ends up on the dedicated relay within one backoff step.
-    pub fn set_sync_server(&self, url: String, token: String, fallback: Option<String>) {
+    /// Every `direct` path is dialled in parallel on each (re)connect and
+    /// the first handshake wins; `fallback` is only used when none of them
+    /// answers within a few seconds. While on the fallback the direct paths
+    /// are re-probed periodically and the session moves over as soon as
+    /// one answers.
+    pub fn set_sync_server(&self, direct: Vec<String>, token: String, fallback: Option<String>) {
         self.shared.lock_state().server = Some(SyncTarget {
-            url,
+            direct,
             token,
             fallback,
         });
