@@ -3,8 +3,8 @@
 // the tool picker and the ruler. Every visible stroke — committed or wet,
 // local or remote — is tessellated by the Rust core (`strokeTriangles` /
 // `wetTriangles`: the same ribbon geometry the desktop renders) and filled
-// into CAShapeLayers on an ink view *under* the canvas. Desktop and iPad
-// therefore draw identical ink from identical data.
+// into CAShapeLayers on an ink view over the canvas content. Desktop and
+// iPad therefore draw identical ink from identical data.
 //
 // Local strokes: PencilKit renders the live stroke itself (lowest latency)
 // while the active observer streams wet samples onto the ephemeral channel;
@@ -441,15 +441,14 @@ struct SketchCanvas: UIViewRepresentable {
         canvas.delegate = context.coordinator
         canvas.isAccessibilityElement = true
         canvas.accessibilityIdentifier = "sketchCanvas"
-        // PencilKit only shows the stroke being drawn; everything else is
-        // the ink view underneath, so the canvas must not paint over it.
-        canvas.isOpaque = false
         canvas.backgroundColor = .white
 
-        // All ink (committed + remote wet) lives in content coordinates
-        // under PencilKit's transparent drawing view.
+        // All ink (committed + remote wet) lives in content coordinates on
+        // top of PencilKit's content view (which paints opaquely, so nothing
+        // can sit beneath it). PencilKit only ever holds the stroke being
+        // drawn, which therefore renders under existing ink until pen-up.
         let ink = InkView(frame: CGRect(origin: .zero, size: canvas.contentSize))
-        canvas.insertSubview(ink, at: 0)
+        canvas.addSubview(ink)
 
         // Pen tracking + outbound wet stream ride the active observer
         // variant the iM2 spike validated (passive observers never see
