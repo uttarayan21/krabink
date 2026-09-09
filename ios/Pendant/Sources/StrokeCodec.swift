@@ -51,7 +51,8 @@ enum StrokeCodec {
     /// PencilKit's control points carry azimuth/altitude but not barrel
     /// roll, so roll is looked up from the nearest sample by location.
     static func encode(_ stroke: PKStroke, id: String, samples: [PenSample] = []) -> Stroke {
-        let baseWidth = Float(stroke.path.first?.size.width ?? 10)
+        let scale = Float(renderedWidthScale(stroke))
+        let baseWidth = Float(stroke.path.first?.size.width ?? 10) * scale
         let points = stroke.path.map { p in
             StrokePoint(
                 x: Float(p.location.x),
@@ -61,7 +62,7 @@ enum StrokeCodec {
                 tilt: Tilt(
                     azimuth: Float(p.azimuth), altitude: Float(p.altitude),
                     roll: Float(nearestRoll(to: p.location, in: samples))),
-                size: PointSize(w: Float(p.size.width), h: Float(p.size.height)))
+                size: PointSize(w: Float(p.size.width) * scale, h: Float(p.size.height) * scale))
         }
         return Stroke(
             id: id,
@@ -71,6 +72,23 @@ enum StrokeCodec {
             kind: .bsplineControl,
             points: points,
             createdMs: UInt64(max(0, stroke.path.creationDate.timeIntervalSince1970 * 1000)))
+    }
+
+    /// PencilKit draws some inks (the marker's chisel nib above all) wider
+    /// than the point sizes it stores. Its own render bounds tell how wide
+    /// the ink really is; scale the stored sizes so every renderer of the
+    /// shared model draws what PencilKit drew.
+    private static func renderedWidthScale(_ stroke: PKStroke) -> CGFloat {
+        let widths = stroke.path.map { $0.size.width }
+        guard let maxWidth = widths.max(), maxWidth > 0, !stroke.path.isEmpty else { return 1 }
+        var box = CGRect.null
+        for p in stroke.path { box = box.union(CGRect(origin: p.location, size: .zero)) }
+        let rendered = stroke.renderBounds
+        // Each side of the render bounds extends ~half the rendered width
+        // beyond the path on the axis where the ink is widest.
+        let extra = max(rendered.width - box.width, rendered.height - box.height)
+        guard extra > 0 else { return 1 }
+        return min(4, max(0.5, extra / maxWidth))
     }
 
     private static func nearestRoll(to location: CGPoint, in samples: [PenSample]) -> CGFloat {

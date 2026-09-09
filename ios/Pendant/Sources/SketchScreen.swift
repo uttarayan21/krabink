@@ -351,8 +351,8 @@ final class SketchModel {
 
 /// All ink on screen: one CAShapeLayer per committed stroke (z = CRDT
 /// order) plus wet overlays on top, each filled with the core's ribbon
-/// triangles. The triangles are wound consistently, so the non-zero fill
-/// rule reproduces the desktop mesh's coverage exactly.
+/// outline (one polygon, non-zero rule: same coverage as the desktop mesh,
+/// one clean antialiased edge).
 @MainActor
 final class InkView: UIView {
     private var strokes: [String: CAShapeLayer] = [:]
@@ -378,7 +378,7 @@ final class InkView: UIView {
         shape.fillColor = StrokeCodec.unpack(stroke.color).cgColor
         shape.strokeColor = nil
         shape.fillRule = .nonZero
-        shape.path = Self.path(strokeTriangles(stroke: stroke))
+        shape.path = Self.polygon(strokeOutline(stroke: stroke))
         shape.zPosition = CGFloat(z)
         layer.addSublayer(shape)
         strokes[stroke.id] = shape
@@ -402,6 +402,20 @@ final class InkView: UIView {
     func addWet(_ wet: CALayer) {
         wet.zPosition = 1_000_000
         layer.addSublayer(wet)
+    }
+
+    /// Flat `[x0, y0, x1, y1, …]` outline → one closed polygon.
+    static func polygon(_ xy: [Float]) -> CGPath {
+        let path = CGMutablePath()
+        guard xy.count >= 6 else { return path }
+        path.move(to: CGPoint(x: CGFloat(xy[0]), y: CGFloat(xy[1])))
+        var i = 2
+        while i + 1 < xy.count {
+            path.addLine(to: CGPoint(x: CGFloat(xy[i]), y: CGFloat(xy[i + 1])))
+            i += 2
+        }
+        path.closeSubpath()
+        return path
     }
 
     /// Flat `[x0, y0, x1, y1, x2, y2, …]` triangles → one closed subpath each.
@@ -438,7 +452,7 @@ final class WetLayer {
 
     func append(_ batch: [WetPoint]) {
         points.append(contentsOf: batch)
-        layer.path = InkView.path(wetTriangles(points: points, tool: tool, baseWidth: baseWidth))
+        layer.path = InkView.polygon(wetOutline(points: points, tool: tool, baseWidth: baseWidth))
     }
 }
 

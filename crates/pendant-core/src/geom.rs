@@ -249,6 +249,23 @@ pub fn ribbon_triangles(tool: Tool, points: &[StrokePoint], base_width: f32) -> 
     out
 }
 
+/// The ribbon's outline as one closed polygon: the left edge forward, then
+/// the right edge back. Path fillers (CoreGraphics, SVG) get a single
+/// antialiased boundary instead of seams between hundreds of triangles;
+/// fill with the non-zero rule so a ribbon folding over itself still
+/// covers. Empty when there is nothing to draw.
+pub fn ribbon_outline(tool: Tool, points: &[StrokePoint], base_width: f32) -> Vec<[f32; 2]> {
+    let mesh = ribbon_for(tool, points, base_width);
+    let n = mesh.positions.len();
+    if n < 4 {
+        return Vec::new();
+    }
+    // `ribbon` emits (left, right) pairs per source point.
+    let left = (0..n).step_by(2).map(|i| mesh.positions[i]);
+    let right = (1..n).step_by(2).rev().map(|i| mesh.positions[i]);
+    left.chain(right).collect()
+}
+
 /// Whole-stroke hit test: does a circle of `radius` at (`x`, `y`) touch the
 /// ink of this flattened polyline? Used by the eraser on every platform so
 /// erasing behaves the same everywhere.
@@ -471,6 +488,26 @@ mod tests {
             ribbon_for(Tool::Pen, &[with_nib(0.0, 0.0), with_nib(10.0, 0.0)], 8.0).positions,
             ribbon(&[fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0)], 8.0).positions
         );
+    }
+
+    #[test]
+    fn outline_walks_left_then_right() {
+        let pts = [fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0), fpt(20.0, 0.0, 1.0)];
+        let outline = ribbon_outline(Tool::Pen, &pts, 2.0);
+        assert_eq!(outline.len(), 6);
+        // Left edge (y = +1) forward, right edge (y = -1) back.
+        assert_eq!(outline[0][0], 0.0);
+        assert_eq!(outline[2][0], 20.0);
+        assert!((outline[2][1] - 1.0).abs() < 1e-4);
+        assert_eq!(outline[3][0], 20.0);
+        assert!((outline[3][1] + 1.0).abs() < 1e-4);
+        assert_eq!(outline[5][0], 0.0);
+        // A dot is a quad.
+        assert_eq!(
+            ribbon_outline(Tool::Pen, &[fpt(1.0, 1.0, 1.0)], 2.0).len(),
+            4
+        );
+        assert!(ribbon_outline(Tool::Pen, &[], 2.0).is_empty());
     }
 
     #[test]

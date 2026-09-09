@@ -123,7 +123,7 @@ struct SketchPreview: UIViewRepresentable {
                 image = placeholder(size: CGSize(width: maxSide, height: 120))
             } else {
                 let shapes = strokes.map { stroke in
-                    (InkView.path(strokeTriangles(stroke: stroke)), StrokeCodec.unpack(stroke.color))
+                    (InkView.polygon(strokeOutline(stroke: stroke)), StrokeCodec.unpack(stroke.color))
                 }
                 let bounds = shapes
                     .reduce(CGRect.null) { $0.union($1.0.boundingBox) }

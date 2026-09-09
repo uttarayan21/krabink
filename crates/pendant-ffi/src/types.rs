@@ -184,6 +184,27 @@ pub fn stroke_triangles(stroke: Stroke) -> Vec<f32> {
     ))
 }
 
+/// The committed stroke's ink as one closed outline polygon, flat
+/// `[x0, y0, x1, y1, …]`. Same geometry as [`stroke_triangles`] but a single
+/// boundary, so path fillers antialias it cleanly. Fill non-zero.
+#[uniffi::export]
+pub fn stroke_outline(stroke: Stroke) -> Vec<f32> {
+    let stroke = pcore::Stroke::from(stroke);
+    let flat = pcore::flatten_stroke(&stroke);
+    flatten_xy(pcore::ribbon_outline(stroke.tool, &flat, stroke.base_width))
+}
+
+/// Provisional (wet) ink outline for the points received so far.
+#[uniffi::export]
+pub fn wet_outline(points: Vec<WetPoint>, tool: Tool, base_width: f32) -> Vec<f32> {
+    let flat: Vec<pcore::StrokePoint> = points.iter().map(wet_to_stroke_point).collect();
+    flatten_xy(pcore::ribbon_outline(
+        tool.into(),
+        &flat,
+        base_width.max(WET_WIDTH_FALLBACK),
+    ))
+}
+
 /// Provisional (wet) ink for the points received so far, same geometry
 /// as [`stroke_triangles`].
 #[uniffi::export]
