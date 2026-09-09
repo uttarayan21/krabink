@@ -101,6 +101,12 @@ final class AppModel {
         core.listDevices()
     }
 
+    /// Forget a paired device everywhere. It comes back if it reconnects
+    /// with the same token; this is housekeeping, not revocation.
+    func removeDevice(id: String) {
+        try? core.removeDevice(id: id)
+    }
+
     /// Foreground / network-return: restart background sync.
     func resume() {
         guard hasServer else { return }

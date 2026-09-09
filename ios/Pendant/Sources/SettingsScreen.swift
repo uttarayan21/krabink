@@ -9,6 +9,7 @@ struct SettingsScreen: View {
     @Bindable var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var devices: [DeviceInfo] = []
+    @State private var deviceToRemove: DeviceInfo?
     @State private var joinURI = ""
     @State private var joinFailed = false
     @State private var showScanner = false
@@ -52,6 +53,18 @@ struct SettingsScreen: View {
                                     .foregroundStyle(.secondary)
                             }
                         }
+                        .swipeActions(edge: .trailing) {
+                            if device.id != model.core.deviceId() {
+                                Button("remove", role: .destructive) {
+                                    deviceToRemove = device
+                                }
+                            }
+                        }
+                    }
+                    if devices.count > 1 {
+                        Text("swipe a device to remove it; it re-appears if it reconnects")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
 
@@ -100,6 +113,24 @@ struct SettingsScreen: View {
                 }
             }
             .onAppear(perform: refresh)
+            .confirmationDialog(
+                "Remove \(deviceToRemove?.name ?? "device")?",
+                isPresented: Binding(
+                    get: { deviceToRemove != nil },
+                    set: { if !$0 { deviceToRemove = nil } }),
+                titleVisibility: .visible
+            ) {
+                Button("Remove", role: .destructive) {
+                    if let device = deviceToRemove {
+                        model.removeDevice(id: device.id)
+                        refresh()
+                    }
+                    deviceToRemove = nil
+                }
+                Button("Cancel", role: .cancel) { deviceToRemove = nil }
+            } message: {
+                Text("Forgets it on every device. It comes back if it reconnects with the same token.")
+            }
             .sheet(isPresented: $showScanner) {
                 ScanScreen { uri in
                     let adopted = model.adoptPair(uri: uri)
@@ -113,6 +144,7 @@ struct SettingsScreen: View {
     private func refresh() {
         devices = model.devices()
     }
+
 
     private func shortId(_ id: String) -> String {
         String(id.prefix(8))

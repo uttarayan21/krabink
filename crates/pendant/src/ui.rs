@@ -88,8 +88,21 @@ fn editor_ui(
         devices: docs.workspace.devices(),
         now_ms: crate::docs::now_ms(),
     };
-    if let Some(info) = settings.window(ctx, &view) {
-        adopted.write(crate::settings::PairAdopted(info));
+    match settings.window(ctx, &view) {
+        Some(crate::settings::SettingsAction::Join(info)) => {
+            adopted.write(crate::settings::PairAdopted(info));
+        }
+        Some(crate::settings::SettingsAction::RemoveDevice(id)) => match docs.remove_device(&id) {
+            Ok(payload) if !payload.is_empty() => {
+                commits.write(LocalCommit {
+                    doc: DocKey::WORKSPACE,
+                    payload,
+                });
+            }
+            Ok(_) => {}
+            Err(err) => tracing::error!(%err, id, "removing device failed"),
+        },
+        None => {}
     }
 
     if follow.0

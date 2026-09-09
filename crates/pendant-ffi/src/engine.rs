@@ -351,6 +351,23 @@ impl Core {
     }
 
     /// Every device that ever joined this workspace, most recent first.
+    /// Forget a device in the synced registry (every peer's list loses the
+    /// row). Not revocation: it re-registers if it reconnects with a valid
+    /// token.
+    pub fn remove_device(&self, id: String) -> Result<()> {
+        let payload = {
+            let mut state = self.shared.lock_state();
+            commit_workspace(&mut state, |ws| ws.remove_device(&id))?
+        };
+        if let Some(payload) = payload {
+            let _ = self.shared.cmd.send(Cmd::Update {
+                doc: DocKey::WORKSPACE,
+                payload,
+            });
+        }
+        Ok(())
+    }
+
     pub fn list_devices(&self) -> Vec<DeviceInfo> {
         let state = self.shared.lock_state();
         state

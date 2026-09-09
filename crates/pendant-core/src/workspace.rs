@@ -115,6 +115,15 @@ impl WorkspaceDoc {
         Ok(())
     }
 
+    /// Forget a device: every peer's list loses the row. The device
+    /// re-registers itself if it connects again with a valid token; this
+    /// is housekeeping, not revocation (that needs a token rotation).
+    pub fn remove_device(&self, id: &str) -> Result<()> {
+        self.doc.get_map(DEVICES).delete(id)?;
+        self.doc.commit();
+        Ok(())
+    }
+
     /// All devices that ever joined, most recently seen first.
     pub fn devices(&self) -> Vec<DeviceMeta> {
         let devices = self.doc.get_map(DEVICES);
@@ -231,5 +240,13 @@ mod tests {
         .unwrap();
         assert_eq!(a.devices().len(), 2);
         assert_eq!(a.devices()[0].id, "dev-a");
+
+        // Removal syncs; removing an unknown id is a no-op, not an error.
+        b.remove_device("dev-a").unwrap();
+        b.remove_device("nope").unwrap();
+        a.import_update(&b.export_updates_since(&a.version()).unwrap())
+            .unwrap();
+        assert_eq!(a.devices().len(), 1);
+        assert_eq!(a.devices()[0].id, "dev-b");
     }
 }
