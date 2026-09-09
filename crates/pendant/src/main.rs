@@ -2,8 +2,9 @@ mod cli;
 mod config;
 mod docs;
 mod errors;
-mod pairing;
+mod relay;
 mod replay;
+mod settings;
 mod sketch;
 mod sync;
 mod ui;
@@ -15,8 +16,14 @@ use pendant_core::Store;
 
 use crate::config::RuntimeConfig;
 use crate::docs::Docs;
-use crate::sync::{SyncPlugin, SyncTransport};
+use crate::relay::EmbeddedRelay;
+use crate::sync::{LinkKind, SyncPlugin, SyncTransport};
 use crate::ui::EditorUiPlugin;
+
+/// The tokio runtime behind the embedded relay and every sync link. Lives
+/// as a resource so it outlives transport swaps (joining a workspace).
+#[derive(Resource)]
+pub struct Runtime(pub tokio::runtime::Runtime);
 
 fn main() -> Result<()> {
     let args = cli::Cli::parse();
@@ -48,12 +55,49 @@ fn run_app(args: cli::Cli) -> Result<()> {
         .change_context(Error)
         .attach("loading workspace")?;
 
-    let transport = match &config.server {
-        Some(server) => SyncTransport::connect(server.clone(), config.token.clone(), config.device),
-        None => {
-            tracing::warn!("no server configured; running offline");
-            SyncTransport::disabled(config.device)
-        }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .change_context(Error)
+        .attach("tokio runtime")?;
+
+    // Always serve our own relay: accepts the per-install token plus the
+    // remote relays' token so one QR opens every path.
+    let relay = EmbeddedRelay::start(
+        runtime.handle(),
+        args.relay_listen,
+        &config.relay_store_path,
+        [config.relay_token.clone(), config.token.clone()]
+            .into_iter()
+            .filter(|t| !t.is_empty())
+            .collect(),
+    )?;
+
+    let mut transport = SyncTransport::new(config.device);
+    transport.add_link(
+        runtime.handle(),
+        LinkKind::Embedded,
+        relay.local.clone(),
+        config.relay_token.clone(),
+    );
+    let remotes = config.remote_relays();
+    if remotes.is_empty() {
+        tracing::info!("no dedicated relay configured; direct pairing only");
+    }
+    for server in remotes {
+        transport.add_link(
+            runtime.handle(),
+            LinkKind::Remote,
+            server,
+            config.token.clone(),
+        );
+    }
+
+    let pair = pendant_core::PairInfo {
+        server: relay.advertised.clone(),
+        token: config.pair_token(),
+        fallback: config.server.clone(),
     };
 
     App::new()
@@ -66,21 +110,26 @@ fn run_app(args: cli::Cli) -> Result<()> {
             ..default()
         }))
         .add_plugins(bevy_egui::EguiPlugin::default())
-        .add_plugins((SyncPlugin, EditorUiPlugin, crate::sketch::SketchPlugin))
+        .add_plugins((
+            SyncPlugin,
+            EditorUiPlugin,
+            crate::sketch::SketchPlugin,
+            settings::SettingsPlugin,
+        ))
         .insert_resource(docs)
+        .insert_resource(Runtime(runtime))
+        .insert_resource(relay)
         .insert_resource(transport)
-        .insert_resource(pairing::PairShare::new(config.server.clone().map(
-            |server| pendant_core::PairInfo {
-                server,
-                token: config.token.clone(),
-            },
-        )))
+        .insert_resource(settings::Settings::new(pair))
         .insert_resource(crate::ui::FollowLatest(args.follow_latest))
         .add_systems(Startup, setup)
         .run();
     Ok(())
 }
 
-fn setup(mut commands: Commands) {
+fn setup(mut commands: Commands, relay: Res<EmbeddedRelay>) {
     commands.spawn(Camera2d);
+    // Bevy's LogPlugin owns the subscriber; anything logged before App::run
+    // is lost, so announce the relay here.
+    info!(advertised = %relay.advertised, "embedded relay up");
 }

@@ -156,17 +156,46 @@ impl From<pcore::Stroke> for Stroke {
     }
 }
 
+/// One row of the synced device registry.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub platform: String,
+    /// Unix millis of the last time this device came online (not liveness).
+    pub last_seen_ms: u64,
+}
+
+impl From<pcore::DeviceMeta> for DeviceInfo {
+    fn from(m: pcore::DeviceMeta) -> Self {
+        Self {
+            id: m.id,
+            name: m.name,
+            platform: m.platform,
+            last_seen_ms: m.last_seen_ms,
+        }
+    }
+}
+
 /// Sync coordinates carried by a `pendant://pair` URI (QR pairing).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct PairInfo {
+    /// Direct path: the sharing desktop's embedded relay.
     pub server: String,
     pub token: String,
+    /// Dedicated relay to route through when `server` is unreachable.
+    pub fallback: Option<String>,
 }
 
 /// Build the pairing URI a client renders as a QR code.
 #[uniffi::export]
-pub fn build_pair_uri(server: String, token: String) -> String {
-    pcore::PairInfo { server, token }.to_uri()
+pub fn build_pair_uri(server: String, token: String, fallback: Option<String>) -> String {
+    pcore::PairInfo {
+        server,
+        token,
+        fallback,
+    }
+    .to_uri()
 }
 
 /// Parse a scanned/opened pairing URI; `None` when it is not one of ours.
@@ -175,6 +204,7 @@ pub fn parse_pair_uri(uri: String) -> Option<PairInfo> {
     pcore::PairInfo::parse(&uri).map(|p| PairInfo {
         server: p.server,
         token: p.token,
+        fallback: p.fallback,
     })
 }
 

@@ -7,7 +7,8 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use pendant_core::{DocKey, NoteId};
 
 use crate::docs::Docs;
-use crate::pairing::PairShare;
+use crate::settings::Settings;
+use crate::sync::SyncTransport;
 use crate::sync::{LocalCommit, SubscribeNeeded};
 
 /// When set, the newest note auto-opens as the library changes (replay rig).
@@ -75,11 +76,21 @@ fn editor_ui(
     mut markdown: NonSendMut<MarkdownCache>,
     mut commits: MessageWriter<LocalCommit>,
     mut subscribes: MessageWriter<SubscribeNeeded>,
-    mut pair: ResMut<PairShare>,
+    mut settings: ResMut<Settings>,
+    transport: Res<SyncTransport>,
+    mut adopted: MessageWriter<crate::settings::PairAdopted>,
     follow: Res<FollowLatest>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
-    pair.window(ctx);
+    let view = crate::settings::SettingsView {
+        links: transport.links(),
+        this_device: transport.device().to_string(),
+        devices: docs.workspace.devices(),
+        now_ms: crate::docs::now_ms(),
+    };
+    if let Some(info) = settings.window(ctx, &view) {
+        adopted.write(crate::settings::PairAdopted(info));
+    }
 
     if follow.0
         && let Some(newest) = docs.workspace.notes().first().map(|n| n.id)
@@ -138,8 +149,8 @@ fn editor_ui(
                     Err(err) => tracing::error!(%err, "create note failed"),
                 }
             }
-            if pair.info.is_some() && ui.button("⧉ pair device").clicked() {
-                pair.open = !pair.open;
+            if ui.button("⚙ settings").clicked() {
+                settings.open = !settings.open;
             }
             ui.separator();
             for meta in docs.workspace.notes() {

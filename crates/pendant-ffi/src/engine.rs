@@ -13,7 +13,9 @@ use pendant_core::{DeviceId, DocKey, Flush, NoteId, NoteMeta, SketchId, Store, W
 use tokio::sync::mpsc;
 
 use crate::net::{self, Cmd};
-use crate::types::{NoteInfo, Stroke, StrokePoint, SyncState, Tool, WetPoint, rgba_from_u32};
+use crate::types::{
+    DeviceInfo, NoteInfo, Stroke, StrokePoint, SyncState, Tool, WetPoint, rgba_from_u32,
+};
 
 /// Errors crossing the FFI boundary. Flattened to message-carrying variants;
 /// Swift rarely needs more than "which kind" + a human-readable cause.
@@ -74,7 +76,16 @@ pub(crate) struct State {
     pub workspace: WorkspaceDoc,
     pub notes: HashMap<NoteId, OpenNote>,
     pub core_listener: Option<Arc<dyn CoreListener>>,
-    pub server: Option<(String, String)>,
+    pub server: Option<SyncTarget>,
+}
+
+/// Where background sync connects: direct path first, dedicated relay as
+/// fallback; both take the same token.
+#[derive(Clone)]
+pub(crate) struct SyncTarget {
+    pub url: String,
+    pub token: String,
+    pub fallback: Option<String>,
 }
 
 /// Everything shared between the FFI objects and the network task.
@@ -270,16 +281,23 @@ impl Core {
         }))
     }
 
-    pub fn set_sync_server(&self, url: String, token: String) {
-        self.shared.lock_state().server = Some((url, token));
+    /// `url` is tried first on every (re)connect; `fallback` on the attempt
+    /// after a failed one, so a device that cannot reach the desktop
+    /// directly ends up on the dedicated relay within one backoff step.
+    pub fn set_sync_server(&self, url: String, token: String, fallback: Option<String>) {
+        self.shared.lock_state().server = Some(SyncTarget {
+            url,
+            token,
+            fallback,
+        });
     }
 
     /// Start (or restart) background sync with the configured server.
     pub fn connect(&self) -> Result<()> {
-        let Some((url, token)) = self.shared.lock_state().server.clone() else {
+        let Some(target) = self.shared.lock_state().server.clone() else {
             return Err(PendantError::NoServer);
         };
-        let _ = self.shared.cmd.send(Cmd::Connect { url, token });
+        let _ = self.shared.cmd.send(Cmd::Connect(target));
         Ok(())
     }
 
@@ -290,6 +308,57 @@ impl Core {
 
     pub fn device_id(&self) -> String {
         self.shared.device.to_string()
+    }
+
+    /// Drop a note from the shared registry: every peer's list loses the row.
+    /// The note doc's history stays in local stores (GC is backlog).
+    pub fn delete_note(&self, id: String) -> Result<()> {
+        let note_id: NoteId = id.parse().map_err(|_| PendantError::MalformedId { id })?;
+        let payload = {
+            let mut state = self.shared.lock_state();
+            state.notes.remove(&note_id);
+            commit_workspace(&mut state, |ws| ws.remove(note_id))?
+        };
+        if let Some(payload) = payload {
+            let _ = self.shared.cmd.send(Cmd::Update {
+                doc: DocKey::WORKSPACE,
+                payload,
+            });
+        }
+        Ok(())
+    }
+
+    /// Upsert this device into the synced registry. The app shell calls it
+    /// with a user-facing name whenever it (re)connects to a workspace.
+    pub fn register_device(&self, name: String, platform: String) -> Result<()> {
+        let meta = pcore::DeviceMeta {
+            id: self.shared.device.to_string(),
+            name,
+            platform,
+            last_seen_ms: now_ms(),
+        };
+        let payload = {
+            let mut state = self.shared.lock_state();
+            commit_workspace(&mut state, |ws| ws.upsert_device(&meta))?
+        };
+        if let Some(payload) = payload {
+            let _ = self.shared.cmd.send(Cmd::Update {
+                doc: DocKey::WORKSPACE,
+                payload,
+            });
+        }
+        Ok(())
+    }
+
+    /// Every device that ever joined this workspace, most recent first.
+    pub fn list_devices(&self) -> Vec<DeviceInfo> {
+        let state = self.shared.lock_state();
+        state
+            .workspace
+            .devices()
+            .into_iter()
+            .map(Into::into)
+            .collect()
     }
 }
 

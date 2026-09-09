@@ -4,7 +4,7 @@
 //! Locks are only ever taken one at a time and never held across an await.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -31,7 +31,23 @@ pub struct PeerRegistry {
 pub struct AppState {
     pub docs: Arc<Mutex<ServerDocs>>,
     pub peers: Arc<Mutex<PeerRegistry>>,
-    pub tokens: Arc<Vec<String>>,
+    /// Accepted bearer tokens; grows at runtime when an embedding client
+    /// adopts a new workspace token.
+    pub tokens: Arc<RwLock<Vec<String>>>,
+}
+
+impl AppState {
+    pub fn tokens(&self) -> Vec<String> {
+        self.tokens.read().expect("token list poisoned").clone()
+    }
+
+    /// Accept `token` from now on (no-op if already accepted).
+    pub fn add_token(&self, token: String) {
+        let mut tokens = self.tokens.write().expect("token list poisoned");
+        if !token.is_empty() && !tokens.contains(&token) {
+            tokens.push(token);
+        }
+    }
 }
 
 pub async fn ws_handler(
@@ -43,7 +59,7 @@ pub async fn ws_handler(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|token| state.tokens.iter().any(|t| t == token));
+        .is_some_and(|token| state.tokens().iter().any(|t| t == token));
     if !authorized {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -76,7 +92,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     });
 
-    let mut session = ServerSession::new(state.tokens.as_ref().clone());
+    let mut session = ServerSession::new(state.tokens());
 
     while let Some(Ok(msg)) = stream.next().await {
         let Message::Binary(frame) = msg else {

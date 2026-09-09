@@ -27,6 +27,8 @@ targets:
         CFBundleURLTypes:
           - CFBundleURLName: dev.darksailor.pendant.pair
             CFBundleURLSchemes: [pendant]
+        NSCameraUsageDescription: >-
+          Pendant uses the camera to scan another device's pairing QR code.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.darksailor.pendant

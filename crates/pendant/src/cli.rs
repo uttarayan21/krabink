@@ -7,12 +7,18 @@ pub struct Cli {
     /// instances run side by side.
     #[clap(long)]
     pub data_dir: Option<std::path::PathBuf>,
-    /// Sync server url, e.g. ws://127.0.0.1:8722/ws. Overrides config.toml.
+    /// Dedicated relay url, e.g. wss://relay.example.com/ws, used as the
+    /// fallback path when a device cannot reach this desktop's embedded
+    /// relay directly. Overrides config.toml.
     #[clap(long)]
     pub server: Option<String>,
-    /// Bearer token for the sync server. Overrides config.toml.
+    /// Bearer token for the dedicated relay. Overrides config.toml.
     #[clap(long)]
     pub token: Option<String>,
+    /// Address the embedded relay listens on. Falls back to an ephemeral
+    /// port when taken.
+    #[clap(long, default_value = crate::relay::DEFAULT_LISTEN)]
+    pub relay_listen: std::net::SocketAddr,
     /// Auto-open the most recently updated note whenever the library
     /// changes. Meant for demos and the replay latency rig.
     #[clap(long)]

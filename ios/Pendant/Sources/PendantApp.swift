@@ -40,42 +40,105 @@ struct SketchRef: Identifiable {
 
 struct ContentView: View {
     @Bindable var model: AppModel
-    @State private var selection: String?
+    // Set-based selection: single tap outside edit mode still selects one
+    // row (drives the detail pane); edit mode turns it into multi-select.
+    @State private var selection = Set<String>()
+    @State private var editMode: EditMode = .inactive
     @State private var openSketch: SketchRef?
     @State private var preview = false
-    @State private var showPair = false
+    @State private var showSettings = false
+    @State private var confirmBulkDelete = false
+    @State private var confirmBulkDeleteFinal = false
 
     var body: some View {
         NavigationSplitView {
-            List(model.notes, id: \.id, selection: $selection) { note in
-                Text(note.title.isEmpty ? "untitled" : note.title)
-                    .tag(note.id)
+            List(selection: $selection) {
+                ForEach(model.notes, id: \.id) { note in
+                    Text(note.title.isEmpty ? "untitled" : note.title)
+                        .tag(note.id)
+                        .swipeActions {
+                            Button("delete", role: .destructive) {
+                                selection.remove(note.id)
+                                model.deleteNote(id: note.id)
+                            }
+                            .accessibilityIdentifier("deleteNote")
+                        }
+                }
             }
+            .environment(\.editMode, $editMode)
             .navigationTitle("pendant")
             .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        selection = model.createNote()
-                    } label: {
-                        Image(systemName: "square.and.pencil")
+                if editMode.isEditing {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("done") {
+                            withAnimation {
+                                selection.removeAll()
+                                editMode = .inactive
+                            }
+                        }
+                        .accessibilityIdentifier("doneSelecting")
                     }
-                    .accessibilityIdentifier("newNote")
-                }
-                if model.pairURI != nil {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button("delete (\(selection.count))", role: .destructive) {
+                            confirmBulkDelete = true
+                        }
+                        .disabled(selection.isEmpty)
+                        .accessibilityIdentifier("bulkDelete")
+                    }
+                } else {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button {
+                            withAnimation {
+                                selection.removeAll()
+                                editMode = .active
+                            }
+                        } label: {
+                            Image(systemName: "checkmark.circle")
+                        }
+                        .accessibilityIdentifier("selectNotes")
+                    }
+                    ToolbarItem(placement: .primaryAction) {
+                        Button {
+                            if let id = model.createNote() { selection = [id] }
+                        } label: {
+                            Image(systemName: "square.and.pencil")
+                        }
+                        .accessibilityIdentifier("newNote")
+                    }
                     ToolbarItem(placement: .topBarTrailing) {
                         Button {
-                            showPair = true
+                            showSettings = true
                         } label: {
-                            Image(systemName: "qrcode")
+                            Image(systemName: "gearshape")
                         }
-                        .accessibilityIdentifier("pairDevice")
+                        .accessibilityIdentifier("settings")
                     }
                 }
             }
-            .sheet(isPresented: $showPair) {
-                if let uri = model.pairURI {
-                    PairScreen(uri: uri)
+            .alert(
+                "delete \(selection.count) note\(selection.count == 1 ? "" : "s")?",
+                isPresented: $confirmBulkDelete
+            ) {
+                Button("delete", role: .destructive) {
+                    confirmBulkDeleteFinal = true
                 }
+                Button("cancel", role: .cancel) {}
+            } message: {
+                Text("you will be asked to confirm once more.")
+            }
+            .alert(
+                "really delete \(selection.count) note\(selection.count == 1 ? "" : "s")?",
+                isPresented: $confirmBulkDeleteFinal
+            ) {
+                Button("delete forever", role: .destructive) {
+                    bulkDelete()
+                }
+                Button("cancel", role: .cancel) {}
+            } message: {
+                Text("this cannot be undone.")
+            }
+            .sheet(isPresented: $showSettings) {
+                SettingsScreen(model: model)
             }
             .safeAreaInset(edge: .bottom) {
                 Text(model.syncState)
@@ -85,7 +148,7 @@ struct ContentView: View {
                     .padding(.bottom, 4)
             }
         } detail: {
-            if let id = selection, let note = model.note(for: id) {
+            if selection.count == 1, let id = selection.first, let note = model.note(for: id) {
                 Group {
                     if preview {
                         SketchPreview(model: note) { sketchId in
@@ -134,5 +197,13 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private func bulkDelete() {
+        for id in selection {
+            model.deleteNote(id: id)
+        }
+        selection.removeAll()
+        withAnimation { editMode = .inactive }
     }
 }

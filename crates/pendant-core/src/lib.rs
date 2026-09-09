@@ -42,7 +42,7 @@ pub use sync::{
 };
 pub use sync_doc::SyncDoc;
 pub use wetink::{WetInk, WetPoint};
-pub use workspace::{NoteMeta, WorkspaceDoc};
+pub use workspace::{DeviceMeta, NoteMeta, WorkspaceDoc};
 
 /// Errors produced by the core document model.
 #[derive(Debug, thiserror::Error)]

@@ -15,11 +15,11 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
-use crate::engine::{CoreListener, NoteListener, Shared};
+use crate::engine::{CoreListener, NoteListener, Shared, SyncTarget};
 use crate::types::{NoteInfo, SyncState, rgba_to_u32};
 
 pub(crate) enum Cmd {
-    Connect { url: String, token: String },
+    Connect(SyncTarget),
     Suspend,
     Subscribe(DocKey),
     Update { doc: DocKey, payload: Vec<u8> },
@@ -38,7 +38,7 @@ enum ConnEnd {
     /// User asked to go offline; wait for the next `Connect`.
     Suspend,
     /// New connection parameters arrived mid-flight.
-    Reconnect { url: String, token: String },
+    Reconnect(SyncTarget),
     /// Transport dropped or failed; retry with backoff.
     Lost,
     /// Server rejected us; give up until told otherwise.
@@ -51,26 +51,30 @@ pub(crate) async fn run(shared: Weak<Shared>, mut rx: mpsc::UnboundedReceiver<Cm
     // Offline until the first Connect; commands other than Connect are safely
     // droppable here (subscriptions are re-derived from open notes, updates
     // are re-derived from version vectors on catch-up).
-    let mut next: Option<(String, String)> = None;
     loop {
-        let (mut url, mut token) = match next.take() {
-            Some(params) => params,
-            None => loop {
-                match rx.recv().await {
-                    None => return,
-                    Some(Cmd::Connect { url, token }) => break (url, token),
-                    Some(_) => {}
-                }
-            },
+        let mut target = loop {
+            match rx.recv().await {
+                None => return,
+                Some(Cmd::Connect(target)) => break target,
+                Some(_) => {}
+            }
         };
 
         notify_sync_state(&shared, SyncState::Connecting);
         let mut backoff = BACKOFF_START;
+        // Alternate direct path / fallback relay: attempt 0 direct, 1
+        // fallback, 2 direct… so a lost direct path lands on the dedicated
+        // relay after one backoff and keeps probing for the direct path.
+        let mut attempt = 0u32;
         loop {
             let Some(strong) = shared.upgrade() else {
                 return;
             };
-            match connection(&strong, &mut rx, &url, &token).await {
+            let url = match (&target.fallback, attempt % 2) {
+                (Some(fallback), 1) => fallback.as_str(),
+                _ => target.url.as_str(),
+            };
+            match connection(&strong, &mut rx, url, &target.token).await {
                 ConnEnd::Shutdown => return,
                 ConnEnd::Suspend => {
                     notify_sync_state(&shared, SyncState::Disconnected);
@@ -80,16 +84,14 @@ pub(crate) async fn run(shared: Weak<Shared>, mut rx: mpsc::UnboundedReceiver<Cm
                     notify_sync_state(&shared, SyncState::Fatal { message });
                     break;
                 }
-                ConnEnd::Reconnect {
-                    url: new_url,
-                    token: new_token,
-                } => {
-                    url = new_url;
-                    token = new_token;
+                ConnEnd::Reconnect(next) => {
+                    target = next;
+                    attempt = 0;
                     notify_sync_state(&shared, SyncState::Connecting);
                 }
                 ConnEnd::Lost => {
                     drop(strong);
+                    attempt += 1;
                     tokio::select! {
                         _ = tokio::time::sleep(backoff) => {}
                         cmd = rx.recv() => match cmd {
@@ -98,9 +100,9 @@ pub(crate) async fn run(shared: Weak<Shared>, mut rx: mpsc::UnboundedReceiver<Cm
                                 notify_sync_state(&shared, SyncState::Disconnected);
                                 break;
                             }
-                            Some(Cmd::Connect { url: u, token: t }) => {
-                                url = u;
-                                token = t;
+                            Some(Cmd::Connect(next)) => {
+                                target = next;
+                                attempt = 0;
                             }
                             Some(_) => {}
                         },
@@ -149,9 +151,7 @@ async fn connection(
                 let effects = match cmd {
                     None => return ConnEnd::Shutdown,
                     Some(Cmd::Suspend) => return ConnEnd::Suspend,
-                    Some(Cmd::Connect { url, token }) => {
-                        return ConnEnd::Reconnect { url, token };
-                    }
+                    Some(Cmd::Connect(target)) => return ConnEnd::Reconnect(target),
                     // Not ready yet: drop it — the post-handshake enumeration
                     // of open notes covers every doc present in the map, and
                     // unsubscribed updates are re-derived on catch-up.

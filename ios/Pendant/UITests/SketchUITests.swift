@@ -119,4 +119,129 @@ final class SketchUITests: XCTestCase {
         XCTAssertTrue(
             canvas.waitForExistence(timeout: 5), "tapping the inline embed did not open the canvas")
     }
+
+    // Regression: the cached SketchModel reattaches to a fresh canvas on every
+    // open; strokes must repaint (and must NOT be diffed away as erased).
+    func testReopenKeepsStrokes() {
+        let app = launch()
+        waitConnected(app)
+
+        app.buttons["newNote"].tap()
+        app.buttons["sketchMenu"].tap()
+        app.buttons["newSketch"].tap()
+
+        let canvas = app.descendants(matching: .any)["sketchCanvas"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.3, dy: 0.35))
+            .press(
+                forDuration: 0.1,
+                thenDragTo: canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.5)),
+                withVelocity: .slow, thenHoldForDuration: 0.1)
+        waitStatus(app, contains: "strokes=1", timeout: 10)
+        app.buttons["sketchDone"].tap()
+
+        // Second open (cached model, new canvas): the stroke must repaint.
+        app.buttons["sketchMenu"].tap()
+        app.buttons["sketch-0"].tap()
+        waitStatus(app, contains: "strokes=1", timeout: 10)
+
+        // Draw on the reopened canvas: adds, never wipes the old stroke.
+        canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.3, dy: 0.6))
+            .press(
+                forDuration: 0.1,
+                thenDragTo: canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.7)),
+                withVelocity: .slow, thenHoldForDuration: 0.1)
+        waitStatus(app, contains: "strokes=2", timeout: 10)
+        app.buttons["sketchDone"].tap()
+
+        // Third open: both strokes still there.
+        app.buttons["sketchMenu"].tap()
+        app.buttons["sketch-0"].tap()
+        waitStatus(app, contains: "strokes=2", timeout: 10)
+    }
+
+    // The sidebar row mirrors the first markdown heading of the note.
+    func testSidebarTitleFollowsHeading() {
+        let app = launch()
+        waitConnected(app)
+
+        app.buttons["newNote"].tap()
+        let editor = app.textViews["editor"]
+        XCTAssertTrue(editor.waitForExistence(timeout: 5))
+        editor.tap()
+        editor.typeText("# Groceries\nmilk\n")
+
+        let row = app.staticTexts["Groceries"]
+        XCTAssertTrue(
+            row.waitForExistence(timeout: 5), "sidebar never showed the heading-derived title")
+    }
+
+    // Swipe-to-delete drops the note from the registry (and the sidebar).
+    func testDeleteNoteRemovesFromSidebar() {
+        let app = launch()
+        waitConnected(app)
+
+        app.buttons["newNote"].tap()
+        let editor = app.textViews["editor"]
+        XCTAssertTrue(editor.waitForExistence(timeout: 5))
+        editor.tap()
+        editor.typeText("# DeleteMe\n")
+
+        let row = app.staticTexts["DeleteMe"]
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
+        row.swipeLeft()
+        let delete = app.buttons["deleteNote"]
+        XCTAssertTrue(delete.waitForExistence(timeout: 3))
+        delete.tap()
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: row)
+        waitForExpectations(timeout: 5)
+    }
+
+    // Bulk delete: select mode picks several notes; deletion needs TWO
+    // confirmations, and cancelling the second one deletes nothing.
+    func testBulkDeleteDoubleConfirm() {
+        let app = launch()
+        waitConnected(app)
+
+        for name in ["BulkA", "BulkB"] {
+            app.buttons["newNote"].tap()
+            let editor = app.textViews["editor"]
+            XCTAssertTrue(editor.waitForExistence(timeout: 5))
+            editor.tap()
+            editor.typeText("# \(name)\n")
+            XCTAssertTrue(app.staticTexts[name].waitForExistence(timeout: 5))
+        }
+
+        app.buttons["selectNotes"].tap()
+        // "BulkA" can match both the sidebar row and detail-pane content;
+        // scope taps to the sidebar list.
+        let sidebar = app.collectionViews.firstMatch
+        sidebar.staticTexts["BulkA"].firstMatch.tap()
+        sidebar.staticTexts["BulkB"].firstMatch.tap()
+
+        // Back out at the second confirmation: nothing may be deleted.
+        app.buttons["bulkDelete"].tap()
+        XCTAssertTrue(app.alerts.buttons["delete"].waitForExistence(timeout: 3))
+        app.alerts.buttons["delete"].tap()
+        XCTAssertTrue(app.alerts.buttons["delete forever"].waitForExistence(timeout: 3))
+        app.alerts.buttons["cancel"].tap()
+        XCTAssertTrue(
+            sidebar.staticTexts["BulkA"].exists, "cancel at second confirm deleted notes")
+        XCTAssertTrue(
+            sidebar.staticTexts["BulkB"].exists, "cancel at second confirm deleted notes")
+
+        // Confirm both prompts: both notes gone from the sidebar.
+        app.buttons["bulkDelete"].tap()
+        XCTAssertTrue(app.alerts.buttons["delete"].waitForExistence(timeout: 3))
+        app.alerts.buttons["delete"].tap()
+        XCTAssertTrue(app.alerts.buttons["delete forever"].waitForExistence(timeout: 3))
+        app.alerts.buttons["delete forever"].tap()
+        expectation(
+            for: NSPredicate(format: "exists == false"),
+            evaluatedWith: sidebar.staticTexts["BulkA"])
+        expectation(
+            for: NSPredicate(format: "exists == false"),
+            evaluatedWith: sidebar.staticTexts["BulkB"])
+        waitForExpectations(timeout: 10)
+    }
 }

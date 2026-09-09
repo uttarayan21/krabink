@@ -62,6 +62,13 @@ final class SketchModel {
     func attach(_ canvas: PKCanvasView, overlay: UIView) {
         self.canvas = canvas
         self.overlay = overlay
+        // The model outlives its canvas (cached per note); a reattach gets a
+        // fresh blank PKCanvasView. Stale side-tables would make
+        // refreshFromCrdt skip repainting (ids already "match") and make
+        // drawingChanged read every CRDT stroke as a local erase.
+        ids = []
+        keyToId = [:]
+        remoteWet = [:]
         refreshFromCrdt()
     }
 

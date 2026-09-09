@@ -99,6 +99,26 @@ impl Docs {
         Ok(payload)
     }
 
+    /// Upsert this device into the synced registry (called on every
+    /// connect); returns the workspace payload for the wire.
+    pub fn register_device(
+        &mut self,
+        id: &str,
+        name: &str,
+        platform: &str,
+    ) -> pendant_core::Result<Vec<u8>> {
+        let before = self.workspace.version();
+        self.workspace.upsert_device(&pendant_core::DeviceMeta {
+            id: id.into(),
+            name: name.into(),
+            platform: platform.into(),
+            last_seen_ms: now_ms(),
+        })?;
+        let payload = self.workspace.export_updates_since(&before)?;
+        self.persist(DocKey::WORKSPACE, &payload)?;
+        Ok(payload)
+    }
+
     /// Keep the workspace registry's title/updated fresh for `id`.
     /// Returns a payload when something changed.
     pub fn refresh_meta(&mut self, id: NoteId) -> pendant_core::Result<Option<Vec<u8>>> {

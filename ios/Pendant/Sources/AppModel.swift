@@ -5,6 +5,7 @@
 import Foundation
 import Network
 import PendantCore
+import UIKit
 
 @Observable @MainActor
 final class AppModel {
@@ -32,7 +33,8 @@ final class AppModel {
         if let url = defaults.string(forKey: "serverURL"),
             let token = defaults.string(forKey: "token")
         {
-            applyServer(url: url, token: token)
+            applyServer(
+                url: url, token: token, fallback: defaults.string(forKey: "fallbackURL"))
         }
         // `-pairURI pendant://pair?…` takes the same path as a scanned QR;
         // exists so UI tests can exercise pairing without a camera.
@@ -61,7 +63,8 @@ final class AppModel {
         let defaults = UserDefaults.standard
         defaults.set(info.server, forKey: "serverURL")
         defaults.set(info.token, forKey: "token")
-        applyServer(url: info.server, token: info.token)
+        defaults.set(info.fallback, forKey: "fallbackURL")
+        applyServer(url: info.server, token: info.token, fallback: info.fallback)
         return true
     }
 
@@ -71,14 +74,31 @@ final class AppModel {
         guard let url = defaults.string(forKey: "serverURL"),
             let token = defaults.string(forKey: "token")
         else { return nil }
-        return buildPairUri(server: url, token: token)
+        return buildPairUri(
+            server: url, token: token, fallback: defaults.string(forKey: "fallbackURL"))
     }
 
-    private func applyServer(url: String, token: String) {
-        core.setSyncServer(url: url, token: token)
+    /// Direct path first, dedicated relay as fallback (see Core.setSyncServer).
+    private func applyServer(url: String, token: String, fallback: String?) {
+        core.setSyncServer(url: url, token: token, fallback: fallback)
         hasServer = true
         try? core.connect()
         syncState = "connecting"
+        // Announce this device in the synced registry so peers can list it.
+        try? core.registerDevice(
+            name: UIDevice.current.name, platform: UIDevice.current.model)
+    }
+
+    /// Registry row is gone everywhere once this syncs; note history stays
+    /// in local stores (GC is backlog).
+    func deleteNote(id: String) {
+        try? core.deleteNote(id: id)
+        open[id] = nil
+        notes = core.listNotes()
+    }
+
+    func devices() -> [DeviceInfo] {
+        core.listDevices()
     }
 
     /// Foreground / network-return: restart background sync.
@@ -95,16 +115,24 @@ final class AppModel {
     func createNote() -> String? {
         guard let session = try? core.createNote(title: "untitled") else { return nil }
         notes = core.listNotes()
-        let model = NoteModel(session: session)
-        open[model.id] = model
+        let model = adopt(NoteModel(session: session))
         return model.id
     }
 
     func note(for id: String) -> NoteModel? {
         if let model = open[id] { return model }
         guard let session = try? core.openNote(id: id) else { return nil }
-        let model = NoteModel(session: session)
-        open[id] = model
+        return adopt(NoteModel(session: session))
+    }
+
+    /// A local `setTitle` doesn't emit `notesChanged` (only network
+    /// workspace updates do), so the note list refreshes here.
+    private func adopt(_ model: NoteModel) -> NoteModel {
+        model.onTitleChanged = { [weak self] in
+            guard let self else { return }
+            notes = core.listNotes()
+        }
+        open[model.id] = model
         return model
     }
 }
@@ -119,7 +147,9 @@ final class NoteModel: Identifiable {
     var text: String
     var synced = false
     var sketchIds: [String] = []
+    var onTitleChanged: (() -> Void)?
     private var sketches: [String: SketchModel] = [:]
+    private var titleTask: Task<Void, Never>?
 
     init(session: NoteSession) {
         self.session = session
@@ -127,11 +157,61 @@ final class NoteModel: Identifiable {
         text = (try? session.text()) ?? ""
         sketchIds = (try? session.sketchIds()) ?? []
         session.setListener(listener: NoteEvents(model: self))
+        backfillEmbeds()
+        scheduleTitleSync()
     }
 
     /// Forward one local edit (unicode-scalar offsets) to the CRDT.
     func localEdit(at: UInt64, del: UInt64, insert: String) {
         try? session.applyTextEdit(at: at, del: del, insert: insert)
+        scheduleTitleSync()
+    }
+
+    // MARK: title derivation
+
+    /// Sidebar title mirrors the first markdown heading (or first non-blank
+    /// line) of the note.
+    static func derivedTitle(_ text: String) -> String {
+        for line in text.split(separator: "\n") {
+            let stripped = line.drop(while: { $0 == "#" })
+                .trimmingCharacters(in: .whitespaces)
+            if stripped.isEmpty { continue }
+            return String(stripped.prefix(64))
+        }
+        return "untitled"
+    }
+
+    /// Debounced: typing on the heading line would otherwise commit the
+    /// workspace doc on every keystroke.
+    func scheduleTitleSync() {
+        titleTask?.cancel()
+        titleTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            self?.syncTitle()
+        }
+    }
+
+    private func syncTitle() {
+        let derived = Self.derivedTitle((try? session.text()) ?? text)
+        let current = (try? session.title()) ?? nil
+        guard derived != current else { return }
+        try? session.setTitle(title: derived)
+        onTitleChanged?()
+    }
+
+    /// Splice an embed ref for any sketch the text doesn't mention — notes
+    /// from before embeds existed, or sketches a peer created without one.
+    private func backfillEmbeds() {
+        var current = (try? session.text()) ?? text
+        for sketchId in sketchIds where !current.contains("pendant://sketch/\(sketchId)") {
+            let embed = (current.isEmpty || current.hasSuffix("\n") ? "" : "\n")
+                + "![sketch](pendant://sketch/\(sketchId))\n"
+            try? session.applyTextEdit(
+                at: UInt64(current.unicodeScalars.count), del: 0, insert: embed)
+            current += embed
+        }
+        text = (try? session.text()) ?? text
     }
 
     func createSketch() -> String? {
@@ -221,6 +301,7 @@ private final class NoteEvents: NoteListener {
         Task { @MainActor [weak model] in
             guard let model else { return }
             model.text = (try? model.session.text()) ?? text
+            model.scheduleTitleSync()
         }
     }
 

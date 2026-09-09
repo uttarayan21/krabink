@@ -2,15 +2,11 @@ mod errors;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use clap::Parser;
 use errors::{Error, Result, ResultExt};
 use pendant_core::Store;
 use pendant_server::app_state;
-
-/// How often open docs are checkpointed to disk and idle ones unloaded.
-const MAINTAIN_EVERY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, clap::Parser)]
 #[clap(version, about = "pendant sync relay")]
@@ -94,19 +90,7 @@ async fn main() -> Result<()> {
 
     let state = app_state(store, config.tokens);
 
-    let maintenance = {
-        let docs = Arc::clone(&state.docs);
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(MAINTAIN_EVERY);
-            loop {
-                tick.tick().await;
-                let result = docs.lock().expect("doc registry poisoned").maintain(true);
-                if let Err(err) = result {
-                    tracing::error!(%err, "maintenance failed");
-                }
-            }
-        })
-    };
+    let maintenance = tokio::spawn(pendant_server::maintenance(Arc::clone(&state.docs)));
 
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
@@ -123,11 +107,7 @@ async fn main() -> Result<()> {
 
     maintenance.abort();
     // Final durable checkpoint before exit.
-    state
-        .docs
-        .lock()
-        .expect("doc registry poisoned")
-        .maintain(false)
+    pendant_server::checkpoint(&state)
         .change_context(Error)
         .attach("final checkpoint")?;
     Ok(())

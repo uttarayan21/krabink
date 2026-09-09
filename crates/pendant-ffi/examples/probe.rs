@@ -118,7 +118,7 @@ fn main() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let core = Core::new(dir.path().to_str().unwrap().into()).expect("core");
-    core.set_sync_server(args.server.clone(), args.token.clone());
+    core.set_sync_server(args.server.clone(), args.token.clone(), None);
     core.connect().expect("connect");
 
     let newest = wait_for("a note in the workspace", args.timeout, || {
