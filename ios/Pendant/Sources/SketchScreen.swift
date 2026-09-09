@@ -478,7 +478,9 @@ struct SketchCanvas: UIViewRepresentable {
         canvas.delegate = context.coordinator
         canvas.isAccessibilityElement = true
         canvas.accessibilityIdentifier = "sketchCanvas"
-        canvas.backgroundColor = .white
+        // Follow the system appearance like PencilKit's default did (black
+        // in dark mode); the ink view over it is transparent.
+        canvas.backgroundColor = .systemBackground
 
         // All ink (committed + remote wet) lives in content coordinates on
         // top of PencilKit's content view (which paints opaquely, so nothing
