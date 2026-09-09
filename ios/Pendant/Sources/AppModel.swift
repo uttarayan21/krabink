@@ -334,6 +334,11 @@ final class NoteModel: Identifiable {
         guard let sketch = wetStrokeSketch.removeValue(forKey: stroke) else { return }
         sketches[sketch]?.remoteWetEnd(stroke: stroke)
     }
+
+    func wetCancel(stroke: String) {
+        guard let sketch = wetStrokeSketch.removeValue(forKey: stroke) else { return }
+        sketches[sketch]?.remoteWetCancel(stroke: stroke)
+    }
 }
 
 // Nonisolated bridges: uniffi calls these from the Rust network thread.
@@ -395,5 +400,9 @@ private final class NoteEvents: NoteListener {
 
     func wetEnd(stroke: String) {
         Task { @MainActor [weak model] in model?.wetEnd(stroke: stroke) }
+    }
+
+    func wetCancel(stroke: String) {
+        Task { @MainActor [weak model] in model?.wetCancel(stroke: stroke) }
     }
 }

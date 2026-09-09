@@ -93,6 +93,8 @@ impl NoteListener for RecNote {
             .push(format!("points:{stroke}:{}", points.len()));
     }
 
+    fn wet_cancel(&self, _stroke: String) {}
+
     fn wet_end(&self, stroke: String) {
         self.wet.lock().unwrap().push(format!("end:{stroke}"));
     }

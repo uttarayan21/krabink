@@ -109,13 +109,29 @@ final class SketchModel {
     }
 
     /// Pen-up/cancel: flush the tail and hand the id to the upcoming commit.
-    /// `finishStroke` (in `commit`) sends the wet End frame.
+    /// `finishStroke` (in `commit`) sends the wet End frame. If no stroke
+    /// lands (the pen dragged the ruler, not ink), receivers get a Cancel so
+    /// the provisional ink does not linger as a phantom stroke.
     func penEnded(cancelled: Bool) {
         flushTask?.cancel()
         flushTask = nil
         flushWet()
-        pendingCommitId = cancelled ? nil : liveStrokeId
+        guard let id = liveStrokeId else { return }
         liveStrokeId = nil
+        if cancelled {
+            pendingCommitId = nil
+            try? session.cancelStroke(stroke: id)
+            return
+        }
+        pendingCommitId = id
+        // PencilKit commits the stroke on the same touch-up; anything still
+        // pending shortly after was never a stroke.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(150))
+            guard let self, self.pendingCommitId == id else { return }
+            self.pendingCommitId = nil
+            try? self.session.cancelStroke(stroke: id)
+        }
     }
 
     private func buffer(_ point: CGPoint, force: CGFloat) {
@@ -146,6 +162,12 @@ final class SketchModel {
         wetRecv += 1
         guard let wet = remoteWet[stroke] else { return }
         wet.append(points)
+    }
+
+    /// Sender says no stroke is coming: drop the overlay right away.
+    func remoteWetCancel(stroke: String) {
+        guard let wet = remoteWet.removeValue(forKey: stroke) else { return }
+        wet.layer.removeFromSuperlayer()
     }
 
     func remoteWetEnd(stroke: String) {

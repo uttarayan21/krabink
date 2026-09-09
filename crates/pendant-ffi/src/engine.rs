@@ -64,6 +64,8 @@ pub trait NoteListener: Send + Sync {
     /// pen — latency telemetry only, meaningless across skewed clocks.
     fn wet_points(&self, stroke: String, sent_ms: u64, points: Vec<WetPoint>);
     fn wet_end(&self, stroke: String);
+    /// No stroke will follow: drop the provisional ink immediately.
+    fn wet_cancel(&self, stroke: String);
 }
 
 pub(crate) struct OpenNote {
@@ -593,6 +595,16 @@ impl NoteSession {
             stroke: stroke_id,
             sent_ms: now_ms(),
         })
+    }
+
+    /// The wet stream opened by [`Self::begin_stroke`] ends without a
+    /// stroke (the pen moved a ruler, not ink): tell receivers to drop the
+    /// provisional ink immediately.
+    pub fn cancel_stroke(&self, stroke: String) -> Result<()> {
+        let stroke_id: pcore::StrokeId = stroke
+            .parse()
+            .map_err(|_| PendantError::MalformedId { id: stroke })?;
+        self.send_wet(pcore::WetInk::Cancel { stroke: stroke_id })
     }
 
     pub fn remove_stroke(&self, sketch: String, stroke: String) -> Result<()> {

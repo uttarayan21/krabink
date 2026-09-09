@@ -52,6 +52,7 @@ impl NoteListener for Recorder {
         wet.points += p.len();
         eprintln!("wet batch: points={} latency_ms={}", p.len(), latency);
     }
+    fn wet_cancel(&self, _stroke: String) {}
     fn wet_end(&self, _s: String) {
         self.wet.lock().unwrap().ends += 1;
     }

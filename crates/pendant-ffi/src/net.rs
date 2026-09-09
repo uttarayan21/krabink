@@ -451,6 +451,7 @@ fn dispatch_wet(shared: &Shared, doc: DocKey, payload: &[u8]) {
                 .collect(),
         ),
         WetInk::End { stroke, .. } => listener.wet_end(stroke.to_string()),
+        WetInk::Cancel { stroke } => listener.wet_cancel(stroke.to_string()),
     }
 }
 

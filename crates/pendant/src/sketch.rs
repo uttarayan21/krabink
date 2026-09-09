@@ -429,6 +429,12 @@ fn apply_wet_ink(
                 }
                 report_latency(&mut latency);
             }
+            // No stroke is coming (ruler drag, tool fiddling): drop it now.
+            WetInk::Cancel { stroke } => {
+                if let Some(wet) = scenes.wet.remove(&stroke) {
+                    commands.entity(wet.entity).despawn();
+                }
+            }
         }
     }
 
