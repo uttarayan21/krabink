@@ -242,6 +242,10 @@ mod tests {
         assert_eq!(a.devices()[0].id, "dev-a");
 
         // Removal syncs; removing an unknown id is a no-op, not an error.
+        // Bring b up to date first: a delete concurrent with a's re-upsert
+        // above would resolve by peer id, which is random per doc.
+        b.import_update(&a.export_updates_since(&b.version()).unwrap())
+            .unwrap();
         b.remove_device("dev-a").unwrap();
         b.remove_device("nope").unwrap();
         a.import_update(&b.export_updates_since(&a.version()).unwrap())
