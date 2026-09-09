@@ -28,6 +28,7 @@ bevy = { version = "0.19", features = ["wayland"] }
 bevy_egui.workspace = true
 egui_commonmark.workspace = true
 directories.workspace = true
+qrcode = { version = "0.14", default-features = false }
 futures.workspace = true
 serde.workspace = true
 tokio.workspace = true

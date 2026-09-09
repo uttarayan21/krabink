@@ -32,10 +32,12 @@ final class AppModel {
         if let url = defaults.string(forKey: "serverURL"),
             let token = defaults.string(forKey: "token")
         {
-            core.setSyncServer(url: url, token: token)
-            hasServer = true
-            try? core.connect()
-            syncState = "connecting"
+            applyServer(url: url, token: token)
+        }
+        // `-pairURI pendant://pair?…` takes the same path as a scanned QR;
+        // exists so UI tests can exercise pairing without a camera.
+        if let uri = defaults.string(forKey: "pairURI") {
+            _ = adoptPair(uri: uri)
         }
 
         // Reconnect when a usable network path returns (Wi-Fi handoff, VPN,
@@ -49,6 +51,34 @@ final class AppModel {
             }
         }
         pathMonitor.start(queue: .global(qos: .utility))
+    }
+
+    /// Adopt sync coordinates from a `pendant://pair` URI (QR scan, deep
+    /// link, or `-pairURI` launch argument). Persists them so the next
+    /// launch reconnects without re-pairing.
+    func adoptPair(uri: String) -> Bool {
+        guard let info = parsePairUri(uri: uri) else { return false }
+        let defaults = UserDefaults.standard
+        defaults.set(info.server, forKey: "serverURL")
+        defaults.set(info.token, forKey: "token")
+        applyServer(url: info.server, token: info.token)
+        return true
+    }
+
+    /// The URI this device shows as a QR code; nil while offline.
+    var pairURI: String? {
+        let defaults = UserDefaults.standard
+        guard let url = defaults.string(forKey: "serverURL"),
+            let token = defaults.string(forKey: "token")
+        else { return nil }
+        return buildPairUri(server: url, token: token)
+    }
+
+    private func applyServer(url: String, token: String) {
+        core.setSyncServer(url: url, token: token)
+        hasServer = true
+        try? core.connect()
+        syncState = "connecting"
     }
 
     /// Foreground / network-return: restart background sync.

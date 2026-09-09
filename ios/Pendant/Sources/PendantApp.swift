@@ -16,6 +16,10 @@ struct PendantApp: App {
                 SpikeScreen()
             } else {
                 ContentView(model: model)
+                    .onOpenURL { url in
+                        // Scanned pairing QR / deep link: adopt server+token.
+                        _ = model.adoptPair(uri: url.absoluteString)
+                    }
             }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -39,6 +43,7 @@ struct ContentView: View {
     @State private var selection: String?
     @State private var openSketch: SketchRef?
     @State private var preview = false
+    @State private var showPair = false
 
     var body: some View {
         NavigationSplitView {
@@ -55,6 +60,21 @@ struct ContentView: View {
                         Image(systemName: "square.and.pencil")
                     }
                     .accessibilityIdentifier("newNote")
+                }
+                if model.pairURI != nil {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            showPair = true
+                        } label: {
+                            Image(systemName: "qrcode")
+                        }
+                        .accessibilityIdentifier("pairDevice")
+                    }
+                }
+            }
+            .sheet(isPresented: $showPair) {
+                if let uri = model.pairURI {
+                    PairScreen(uri: uri)
                 }
             }
             .safeAreaInset(edge: .bottom) {

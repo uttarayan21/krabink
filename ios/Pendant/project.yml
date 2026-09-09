@@ -17,9 +17,18 @@ targets:
       - Sources
     dependencies:
       - package: PendantCore
+    # Explicit Info.plist (instead of GENERATE_INFOPLIST_FILE) because the
+    # pairing QR flow registers the pendant:// URL scheme, which has no
+    # INFOPLIST_KEY_ build setting. Xcode still merges the INFOPLIST_KEY_
+    # settings below into the final plist.
+    info:
+      path: Info.plist
+      properties:
+        CFBundleURLTypes:
+          - CFBundleURLName: dev.darksailor.pendant.pair
+            CFBundleURLSchemes: [pendant]
     settings:
       base:
-        GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: dev.darksailor.pendant
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         # iPad-first, but runs on iPhone too for cheap simulator checks.
