@@ -156,6 +156,28 @@ impl From<pcore::Stroke> for Stroke {
     }
 }
 
+/// Sync coordinates carried by a `pendant://pair` URI (QR pairing).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PairInfo {
+    pub server: String,
+    pub token: String,
+}
+
+/// Build the pairing URI a client renders as a QR code.
+#[uniffi::export]
+pub fn build_pair_uri(server: String, token: String) -> String {
+    pcore::PairInfo { server, token }.to_uri()
+}
+
+/// Parse a scanned/opened pairing URI; `None` when it is not one of ours.
+#[uniffi::export]
+pub fn parse_pair_uri(uri: String) -> Option<PairInfo> {
+    pcore::PairInfo::parse(&uri).map(|p| PairInfo {
+        server: p.server,
+        token: p.token,
+    })
+}
+
 /// Entry in the note registry (the workspace doc).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct NoteInfo {

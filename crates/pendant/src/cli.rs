@@ -24,6 +24,12 @@ pub enum SubCommand {
     /// Generate shell completions.
     #[clap(name = "completions")]
     Completions { shell: clap_complete::Shell },
+    /// Adopt sync settings from a `pendant://pair` URI (QR pairing) by
+    /// writing them to config.toml.
+    Pair {
+        /// URI shown next to the QR code on the sharing device.
+        uri: String,
+    },
     /// Stream synthetic 120Hz pen strokes through the relay (latency rig).
     Replay {
         /// Sync server url, e.g. ws://127.0.0.1:8722/ws.

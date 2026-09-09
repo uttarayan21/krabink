@@ -7,6 +7,7 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use pendant_core::{DocKey, NoteId};
 
 use crate::docs::Docs;
+use crate::pairing::PairShare;
 use crate::sync::{LocalCommit, SubscribeNeeded};
 
 /// When set, the newest note auto-opens as the library changes (replay rig).
@@ -63,6 +64,10 @@ fn splice_of(old: &str, new: &str) -> Option<(usize, usize, String)> {
     ))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "bevy system; each param is a distinct ECS resource"
+)]
 fn editor_ui(
     mut contexts: EguiContexts,
     mut docs: ResMut<Docs>,
@@ -70,9 +75,11 @@ fn editor_ui(
     mut markdown: NonSendMut<MarkdownCache>,
     mut commits: MessageWriter<LocalCommit>,
     mut subscribes: MessageWriter<SubscribeNeeded>,
+    mut pair: ResMut<PairShare>,
     follow: Res<FollowLatest>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
+    pair.window(ctx);
 
     if follow.0
         && let Some(newest) = docs.workspace.notes().first().map(|n| n.id)
@@ -130,6 +137,9 @@ fn editor_ui(
                     }
                     Err(err) => tracing::error!(%err, "create note failed"),
                 }
+            }
+            if pair.info.is_some() && ui.button("⧉ pair device").clicked() {
+                pair.open = !pair.open;
             }
             ui.separator();
             for meta in docs.workspace.notes() {

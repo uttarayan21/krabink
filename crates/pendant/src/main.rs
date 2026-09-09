@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod docs;
 mod errors;
+mod pairing;
 mod replay;
 mod sketch;
 mod sync;
@@ -33,6 +34,7 @@ fn main() -> Result<()> {
             token,
             strokes,
         }),
+        Some(cli::SubCommand::Pair { uri }) => config::adopt_pair(&uri),
         None => run_app(args),
     }
 }
@@ -67,6 +69,12 @@ fn run_app(args: cli::Cli) -> Result<()> {
         .add_plugins((SyncPlugin, EditorUiPlugin, crate::sketch::SketchPlugin))
         .insert_resource(docs)
         .insert_resource(transport)
+        .insert_resource(pairing::PairShare::new(config.server.clone().map(
+            |server| pendant_core::PairInfo {
+                server,
+                token: config.token.clone(),
+            },
+        )))
         .insert_resource(crate::ui::FollowLatest(args.follow_latest))
         .add_systems(Startup, setup)
         .run();

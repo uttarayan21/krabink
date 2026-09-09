@@ -4,11 +4,11 @@
 
 use std::path::{Path, PathBuf};
 
-use pendant_core::DeviceId;
+use pendant_core::{DeviceId, PairInfo};
 
 use crate::errors::{Error, Report, Result, ResultExt};
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct FileConfig {
     server: Option<String>,
     token: Option<String>,
@@ -45,6 +45,30 @@ impl RuntimeConfig {
             token: token.or(file.token).unwrap_or_default(),
         })
     }
+}
+
+/// `pendant pair <uri>`: persist the pairing URI's server + token to
+/// config.toml so the next launch syncs against it.
+pub fn adopt_pair(uri: &str) -> Result<()> {
+    let info = PairInfo::parse(uri)
+        .ok_or_else(|| Report::new(Error).attach("not a pendant://pair URI"))?;
+    let dirs = directories::ProjectDirs::from("dev", "darksailor", "pendant")
+        .ok_or_else(|| Report::new(Error).attach("no home directory"))?;
+    let config_dir = dirs.config_dir();
+    std::fs::create_dir_all(config_dir)
+        .change_context(Error)
+        .attach_with(|| format!("creating {}", config_dir.display()))?;
+    let path = config_dir.join("config.toml");
+    let raw = toml::to_string_pretty(&FileConfig {
+        server: Some(info.server.clone()),
+        token: Some(info.token),
+    })
+    .change_context(Error)?;
+    std::fs::write(&path, raw)
+        .change_context(Error)
+        .attach_with(|| format!("writing {}", path.display()))?;
+    println!("paired: {} -> {}", info.server, path.display());
+    Ok(())
 }
 
 fn read_config(config_dir: &Path) -> Result<FileConfig> {
