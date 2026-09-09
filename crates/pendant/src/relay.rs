@@ -169,7 +169,7 @@ fn candidate_ips() -> Vec<Ipv4Addr> {
     let mut ips: Vec<Ipv4Addr> = if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
-        .filter(|iface| !iface.is_loopback())
+        .filter(|iface| !iface.is_loopback() && !is_virtual(&iface.name))
         .filter_map(|iface| match iface.addr {
             if_addrs::IfAddr::V4(v4) => Some(v4.ip),
             if_addrs::IfAddr::V6(_) => None,
@@ -179,6 +179,14 @@ fn candidate_ips() -> Vec<Ipv4Addr> {
     ips.sort_by_key(|ip| (rank(ip), ip.octets()));
     ips.dedup();
     ips
+}
+
+/// Container/VM bridges nobody pairs through; they only add dead
+/// candidates to the QR.
+fn is_virtual(name: &str) -> bool {
+    ["docker", "virbr", "br-", "veth", "lxc", "vmnet", "bridge"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 fn rank(ip: &Ipv4Addr) -> u8 {
