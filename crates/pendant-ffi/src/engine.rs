@@ -13,9 +13,7 @@ use pendant_core::{DeviceId, DocKey, Flush, NoteId, NoteMeta, SketchId, Store, W
 use tokio::sync::mpsc;
 
 use crate::net::{self, Cmd};
-use crate::types::{
-    DeviceInfo, NoteInfo, Stroke, StrokePoint, SyncState, Tool, WetPoint, rgba_from_u32,
-};
+use crate::types::{DeviceInfo, NoteInfo, Stroke, SyncState, Tool, WetPoint, rgba_from_u32};
 
 /// Errors crossing the FFI boundary. Flattened to message-carrying variants;
 /// Swift rarely needs more than "which kind" + a human-readable cause.
@@ -581,20 +579,31 @@ impl NoteSession {
             stroke.id.parse().map_err(|_| PendantError::MalformedId {
                 id: stroke.id.clone(),
             })?;
-        let committed = pcore::Stroke {
-            id: stroke_id,
-            tool: stroke.tool.into(),
-            color: rgba_from_u32(stroke.color),
-            base_width: stroke.base_width,
-            kind: stroke.kind.into(),
-            points: stroke.points.into_iter().map(StrokePoint::into).collect(),
-            created_ms: stroke.created_ms,
-        };
+        let committed = pcore::Stroke::from(stroke);
         self.commit(Flush::Immediate, |doc| doc.add_stroke(sketch, &committed))?;
         self.send_wet(pcore::WetInk::End {
             stroke: stroke_id,
             sent_ms: now_ms(),
         })
+    }
+
+    /// Eraser sample: remove every stroke whose ink a circle of `radius` at
+    /// (`x`, `y`) touches; returns their ids so the view can drop them. The
+    /// hit test lives in the core so erasing matches on every platform.
+    pub fn erase_at(&self, sketch: String, x: f32, y: f32, radius: f32) -> Result<Vec<String>> {
+        let sketch_id = self.parse_sketch(&sketch)?;
+        let hit: Vec<pcore::StrokeId> = self.read(|doc| {
+            Ok(doc
+                .strokes(sketch_id)?
+                .iter()
+                .filter(|s| pcore::hits(&pcore::flatten_stroke(s), s.base_width, x, y, radius))
+                .map(|s| s.id)
+                .collect())
+        })?;
+        for id in &hit {
+            self.commit(Flush::Immediate, |doc| doc.remove_stroke(sketch_id, *id))?;
+        }
+        Ok(hit.iter().map(ToString::to_string).collect())
     }
 
     /// The wet stream opened by [`Self::begin_stroke`] ends without a

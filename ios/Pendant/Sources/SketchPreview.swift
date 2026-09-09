@@ -109,8 +109,9 @@ struct SketchPreview: UIViewRepresentable {
                 ])
         }
 
-        /// Render committed strokes to a bounded thumbnail (PencilKit draws
-        /// them identically to the canvas). Empty sketch → a placeholder box.
+        /// Render committed strokes to a bounded thumbnail from the core's
+        /// ribbon triangles — the same ink the canvas and the desktop show.
+        /// Empty sketch → a placeholder box.
         private func thumbnail(id: String, model: NoteModel) -> UIImage {
             let strokes = (try? model.session.strokes(sketch: id)) ?? []
             if let cached = thumbCache[id], cached.count == strokes.count {
@@ -121,10 +122,24 @@ struct SketchPreview: UIViewRepresentable {
             if strokes.isEmpty {
                 image = placeholder(size: CGSize(width: maxSide, height: 120))
             } else {
-                let drawing = PKDrawing(strokes: strokes.map(StrokeCodec.decode))
-                let bounds = drawing.bounds.insetBy(dx: -8, dy: -8)
-                let scale = min(1, maxSide / max(bounds.width, bounds.height, 1))
-                let rendered = drawing.image(from: bounds, scale: max(scale, 0.1))
+                let shapes = strokes.map { stroke in
+                    (InkView.path(strokeTriangles(stroke: stroke)), StrokeCodec.unpack(stroke.color))
+                }
+                let bounds = shapes
+                    .reduce(CGRect.null) { $0.union($1.0.boundingBox) }
+                    .insetBy(dx: -8, dy: -8)
+                let scale = max(0.1, min(1, maxSide / max(bounds.width, bounds.height, 1)))
+                let size = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+                let rendered = UIGraphicsImageRenderer(size: size).image { ctx in
+                    let cg = ctx.cgContext
+                    cg.scaleBy(x: scale, y: scale)
+                    cg.translateBy(x: -bounds.minX, y: -bounds.minY)
+                    for (path, color) in shapes {
+                        cg.addPath(path)
+                        cg.setFillColor(color.cgColor)
+                        cg.fillPath(using: .winding)
+                    }
+                }
                 image = framed(rendered)
             }
             thumbCache[id] = (strokes.count, image)

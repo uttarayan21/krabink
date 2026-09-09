@@ -107,16 +107,22 @@ pub struct RibbonMesh {
     pub indices: Vec<u32>,
 }
 
+/// Half the rendered width at `p`: the point's own `size.w` when present
+/// (PencilKit-authored), otherwise `base_width * force`.
+fn half_width(p: &StrokePoint, base_width: f32) -> f32 {
+    match p.size {
+        Some(s) => (s.w / 2.0).max(0.05),
+        None => (base_width * p.force.clamp(MIN_FORCE, 1.0) / 2.0).max(0.05),
+    }
+}
+
 /// Tessellate a flattened polyline into a variable-width ribbon; width per
 /// point is the point's own `size.w` when present (PencilKit-authored),
 /// otherwise `base_width * force`. A single point (or all-coincident points)
 /// becomes a small quad so dots still render.
 pub fn ribbon(points: &[StrokePoint], base_width: f32) -> RibbonMesh {
     let pts = dedupe(points);
-    let half = |p: &StrokePoint| match p.size {
-        Some(s) => (s.w / 2.0).max(0.05),
-        None => (base_width * p.force.clamp(MIN_FORCE, 1.0) / 2.0).max(0.05),
-    };
+    let half = |p: &StrokePoint| half_width(p, base_width);
 
     match pts.as_slice() {
         [] => RibbonMesh {
@@ -155,6 +161,53 @@ pub fn ribbon(points: &[StrokePoint], base_width: f32) -> RibbonMesh {
             }
             RibbonMesh { positions, indices }
         }
+    }
+}
+
+/// The ribbon as a flat list of triangles (three `[x, y]` per triangle),
+/// every triangle wound the same way. Renderers that fill a path with the
+/// non-zero rule (CoreGraphics, SVG, Skia) get exactly the mesh's coverage:
+/// same-winding overlaps add up instead of cancelling into holes.
+pub fn ribbon_triangles(points: &[StrokePoint], base_width: f32) -> Vec<[f32; 2]> {
+    let mesh = ribbon(points, base_width);
+    let mut out = Vec::with_capacity(mesh.indices.len());
+    for tri in mesh.indices.as_chunks::<3>().0 {
+        let (a, b, c) = (
+            mesh.positions[tri[0] as usize],
+            mesh.positions[tri[1] as usize],
+            mesh.positions[tri[2] as usize],
+        );
+        let twice_area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        if twice_area >= 0.0 {
+            out.extend([a, b, c]);
+        } else {
+            out.extend([a, c, b]);
+        }
+    }
+    out
+}
+
+/// Whole-stroke hit test: does a circle of `radius` at (`x`, `y`) touch the
+/// ink of this flattened polyline? Used by the eraser on every platform so
+/// erasing behaves the same everywhere.
+pub fn hits(points: &[StrokePoint], base_width: f32, x: f32, y: f32, radius: f32) -> bool {
+    let pts = dedupe(points);
+    let within = |d2: f32, reach: f32| d2 <= reach * reach;
+    match pts.as_slice() {
+        [] => false,
+        [p] => within(
+            (p.x - x).powi(2) + (p.y - y).powi(2),
+            radius + half_width(p, base_width),
+        ),
+        pts => pts.windows(2).any(|w| {
+            let (a, b) = (&w[0], &w[1]);
+            let (abx, aby) = (b.x - a.x, b.y - a.y);
+            let len2 = (abx * abx + aby * aby).max(f32::EPSILON);
+            let t = (((x - a.x) * abx + (y - a.y) * aby) / len2).clamp(0.0, 1.0);
+            let (cx, cy) = (a.x + t * abx, a.y + t * aby);
+            let reach = radius + half_width(a, base_width).max(half_width(b, base_width));
+            within((cx - x).powi(2) + (cy - y).powi(2), reach)
+        }),
     }
 }
 
@@ -287,5 +340,39 @@ mod tests {
     fn empty_input_is_empty() {
         let mesh = ribbon(&[], 2.0);
         assert!(mesh.positions.is_empty() && mesh.indices.is_empty());
+    }
+
+    #[test]
+    fn triangles_all_wound_the_same_way() {
+        // A sharp hairpin folds the ribbon; the strip's triangles flip.
+        let pts = [
+            fpt(0.0, 0.0, 1.0),
+            fpt(10.0, 0.0, 1.0),
+            fpt(10.0, 0.5, 1.0),
+            fpt(0.0, 1.0, 1.0),
+        ];
+        let tris = ribbon_triangles(&pts, 4.0);
+        assert_eq!(tris.len(), ribbon(&pts, 4.0).indices.len());
+        for tri in tris.as_chunks::<3>().0 {
+            let (a, b, c) = (tri[0], tri[1], tri[2]);
+            let twice_area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+            assert!(twice_area >= 0.0, "clockwise triangle {tri:?}");
+        }
+    }
+
+    #[test]
+    fn hit_test_respects_width_and_radius() {
+        let line = [fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0)];
+        // Ink is 2 wide (half = 1). 0.5 away with no radius: hit.
+        assert!(hits(&line, 2.0, 5.0, 0.5, 0.0));
+        // 3 away: miss with radius 1, hit with radius 2.5.
+        assert!(!hits(&line, 2.0, 5.0, 3.0, 1.0));
+        assert!(hits(&line, 2.0, 5.0, 3.0, 2.5));
+        // Beyond the endpoint along the line: distance is to the cap.
+        assert!(!hits(&line, 2.0, 13.0, 0.0, 1.0));
+        assert!(hits(&line, 2.0, 12.5, 0.0, 2.0));
+        // A dot.
+        assert!(hits(&[fpt(3.0, 3.0, 1.0)], 2.0, 3.5, 3.0, 0.0));
+        assert!(!hits(&[], 2.0, 0.0, 0.0, 100.0));
     }
 }

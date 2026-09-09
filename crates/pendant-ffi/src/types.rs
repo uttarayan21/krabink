@@ -142,6 +142,60 @@ pub struct Stroke {
     pub created_ms: u64,
 }
 
+impl From<Stroke> for pcore::Stroke {
+    fn from(s: Stroke) -> Self {
+        Self {
+            id: s.id.parse().unwrap_or_else(|_| pcore::StrokeId::new()),
+            tool: s.tool.into(),
+            color: rgba_from_u32(s.color),
+            base_width: s.base_width,
+            kind: s.kind.into(),
+            points: s.points.into_iter().map(Into::into).collect(),
+            created_ms: s.created_ms,
+        }
+    }
+}
+
+/// Renderers fall back to this width for wet ink whose points carry none.
+const WET_WIDTH_FALLBACK: f32 = 2.0;
+
+/// The committed stroke's ink as consistently wound triangles, flat
+/// `[x0, y0, x1, y1, x2, y2, …]` in canvas units. Fill with the non-zero
+/// rule. This is the desktop's exact geometry, so both platforms draw the
+/// same ink.
+#[uniffi::export]
+pub fn stroke_triangles(stroke: Stroke) -> Vec<f32> {
+    let stroke = pcore::Stroke::from(stroke);
+    let flat = pcore::flatten_stroke(&stroke);
+    flatten_xy(pcore::ribbon_triangles(&flat, stroke.base_width))
+}
+
+/// Provisional (wet) ink for the points received so far, same geometry
+/// as [`stroke_triangles`].
+#[uniffi::export]
+pub fn wet_triangles(points: Vec<WetPoint>, base_width: f32) -> Vec<f32> {
+    let flat: Vec<pcore::StrokePoint> = points.iter().map(wet_to_stroke_point).collect();
+    flatten_xy(pcore::ribbon_triangles(
+        &flat,
+        base_width.max(WET_WIDTH_FALLBACK),
+    ))
+}
+
+pub(crate) fn wet_to_stroke_point(p: &WetPoint) -> pcore::StrokePoint {
+    pcore::StrokePoint {
+        x: p.x,
+        y: p.y,
+        force: p.force,
+        t_ms: 0,
+        tilt: None,
+        size: p.width.map(|w| pcore::PointSize { w, h: w }),
+    }
+}
+
+fn flatten_xy(tris: Vec<[f32; 2]>) -> Vec<f32> {
+    tris.into_iter().flatten().collect()
+}
+
 impl From<pcore::Stroke> for Stroke {
     fn from(s: pcore::Stroke) -> Self {
         Self {
