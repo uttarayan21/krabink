@@ -18,8 +18,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::TextureUsages;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, EguiUserTextures, egui};
 use pendant_core::{
-    DocKey, PointSize, Rgba, SKETCH_URI_PREFIX, SketchId, StrokeId, StrokePoint, WetInk, WetPoint,
-    flatten_stroke, ribbon,
+    DocKey, PointSize, Rgba, SKETCH_URI_PREFIX, SketchId, StrokeId, StrokePoint, Tilt, Tool,
+    WetInk, WetPoint, flatten_stroke, ribbon_for,
 };
 
 use crate::docs::{Docs, now_ms};
@@ -48,6 +48,7 @@ struct WetStroke {
     entity: Option<Entity>,
     mesh: Option<Handle<Mesh>>,
     layer: usize,
+    tool: Tool,
     color: Rgba,
     base_width: f32,
     points: Vec<WetPoint>,
@@ -224,7 +225,7 @@ fn sync_sketch_scenes(
                 continue;
             }
             let flat = flatten_stroke(stroke);
-            let entity = ribbon_mesh(&flat, stroke.base_width).map(|mesh| {
+            let entity = ribbon_mesh(stroke.tool, &flat, stroke.base_width).map(|mesh| {
                 commands
                     .spawn((
                         Mesh2d(meshes.add(mesh)),
@@ -326,8 +327,8 @@ fn color_of(rgba: Rgba) -> ColorMaterial {
 /// `None` when there is nothing to draw: bevy's mesh allocator never
 /// allocates a zero-vertex mesh but still tries to upload it, logging a
 /// "Use-after-free" error every frame the mesh is extracted.
-fn ribbon_mesh(points: &[StrokePoint], base_width: f32) -> Option<Mesh> {
-    let ribbon = ribbon(points, base_width);
+fn ribbon_mesh(tool: Tool, points: &[StrokePoint], base_width: f32) -> Option<Mesh> {
+    let ribbon = ribbon_for(tool, points, base_width);
     if ribbon.positions.is_empty() {
         return None;
     }
@@ -373,9 +374,9 @@ fn apply_wet_ink(
             WetInk::Begin {
                 sketch,
                 stroke,
+                tool,
                 color,
                 base_width,
-                ..
             } => {
                 let Some(layer) = scenes.scenes.get(&sketch).map(|s| s.layer) else {
                     continue; // sketch not on screen yet; CRDT commit will cover it
@@ -386,6 +387,7 @@ fn apply_wet_ink(
                         entity: None,
                         mesh: None,
                         layer,
+                        tool,
                         color,
                         base_width,
                         points: Vec::new(),
@@ -420,11 +422,17 @@ fn apply_wet_ink(
                         y: p.y,
                         force: p.force,
                         t_ms: 0,
-                        tilt: None,
+                        tilt: p.nib.map(|angle| Tilt {
+                            azimuth: angle,
+                            altitude: 0.0,
+                            roll: 0.0,
+                        }),
                         size: p.width.map(|w| PointSize { w, h: w }),
                     })
                     .collect();
-                let Some(mesh) = ribbon_mesh(&flat, wet.base_width.max(WET_WIDTH_FALLBACK)) else {
+                let Some(mesh) =
+                    ribbon_mesh(wet.tool, &flat, wet.base_width.max(WET_WIDTH_FALLBACK))
+                else {
                     continue; // nothing drawable yet
                 };
                 match &wet.mesh {

@@ -321,6 +321,7 @@ async fn stream_stroke(
                     y: p.y,
                     force: p.force,
                     width: None,
+                    nib: None,
                 })
                 .collect(),
         }

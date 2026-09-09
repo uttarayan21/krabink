@@ -29,6 +29,31 @@ private let wetBufferCap = 480
 /// (same as the desktop).
 private let wetLinger: Duration = .seconds(5)
 
+/// One raw pen sample from the observer: location plus the full pen
+/// orientation. Barrel roll is Apple Pencil Pro only (iOS 17.5+), 0 otherwise.
+struct PenSample {
+    var location: CGPoint
+    var force: CGFloat
+    var azimuth: CGFloat
+    var altitude: CGFloat
+    var roll: CGFloat
+
+    /// Where a flat nib points on the canvas.
+    var nib: CGFloat { azimuth + roll }
+
+    init(_ touch: UITouch, in view: UIView) {
+        location = touch.location(in: view)
+        force = max(touch.force, 0.3)
+        azimuth = touch.azimuthAngle(in: view)
+        altitude = touch.altitudeAngle
+        if #available(iOS 17.5, *) {
+            roll = touch.rollAngle
+        } else {
+            roll = 0
+        }
+    }
+}
+
 @Observable @MainActor
 final class SketchModel {
     let session: NoteSession
@@ -52,6 +77,9 @@ final class SketchModel {
     private var liveStrokeId: String?
     private var liveSeq: UInt32 = 0
     private var wetBuffer: [WetPoint] = []
+    /// Every sample of the live stroke, for roll lookup at commit.
+    private var liveSamples: [PenSample] = []
+    private var liveTool: Tool = .pen
     private var flushTask: Task<Void, Never>?
     /// Set at pen-up; `commit` consumes it so the committed stroke keeps the
     /// id receivers already saw on the wet channel.
@@ -88,24 +116,26 @@ final class SketchModel {
 
     /// Pen-down: an inking tool opens the wet stream, the eraser starts
     /// hit-testing. Other tools (lasso, ruler handling) are PencilKit's own.
-    func penBegan(at point: CGPoint, force: CGFloat) {
+    func penBegan(_ sample: PenSample) {
         guard let canvas else { return }
         if canvas.tool is PKEraserTool {
             erasing = true
-            erase(at: point)
+            erase(at: sample.location)
             return
         }
         guard let tool = canvas.tool as? PKInkingTool else { return }
         liveSeq = 0
         wetBuffer = []
+        liveSamples = []
+        liveTool = StrokeCodec.tool(tool.inkType)
         liveStrokeId = try? session.beginStroke(
             sketch: sketchId,
-            tool: StrokeCodec.tool(tool.inkType),
+            tool: liveTool,
             color: StrokeCodec.pack(tool.color),
             baseWidth: Float(tool.width))
         NSLog("IM4 wet begin id=%@", liveStrokeId ?? "FAILED")
         guard liveStrokeId != nil else { return }
-        buffer(point, force: force)
+        buffer(sample)
         flushTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: wetFlushInterval)
@@ -114,13 +144,13 @@ final class SketchModel {
         }
     }
 
-    func penMoved(_ samples: [(CGPoint, CGFloat)]) {
+    func penMoved(_ samples: [PenSample]) {
         if erasing {
-            for (point, _) in samples { erase(at: point) }
+            for sample in samples { erase(at: sample.location) }
             return
         }
         guard liveStrokeId != nil else { return }
-        for (point, force) in samples { buffer(point, force: force) }
+        for sample in samples { buffer(sample) }
     }
 
     /// Pen-up/cancel: flush the tail and hand the id to the upcoming commit.
@@ -153,10 +183,14 @@ final class SketchModel {
         }
     }
 
-    private func buffer(_ point: CGPoint, force: CGFloat) {
+    private func buffer(_ sample: PenSample) {
+        liveSamples.append(sample)
         if wetBuffer.count >= wetBufferCap { wetBuffer.removeFirst() }
         wetBuffer.append(
-            WetPoint(x: Float(point.x), y: Float(point.y), force: Float(force), width: nil))
+            WetPoint(
+                x: Float(sample.location.x), y: Float(sample.location.y),
+                force: Float(sample.force), width: nil,
+                nib: liveTool == .brush ? Float(sample.nib) : nil))
     }
 
     private func flushWet() {
@@ -193,7 +227,7 @@ final class SketchModel {
     func remoteWetBegin(stroke: String, tool: Tool, color: UInt32, baseWidth: Float) {
         guard let ink else { return }
         remoteWet[stroke]?.layer.removeFromSuperlayer()
-        let wet = WetLayer(color: StrokeCodec.unpack(color), baseWidth: baseWidth)
+        let wet = WetLayer(color: StrokeCodec.unpack(color), tool: tool, baseWidth: baseWidth)
         ink.addWet(wet.layer)
         remoteWet[stroke] = wet
     }
@@ -276,7 +310,8 @@ final class SketchModel {
             else { return }
             id = fresh
         }
-        let encoded = StrokeCodec.encode(stroke, id: id)
+        let encoded = StrokeCodec.encode(stroke, id: id, samples: liveSamples)
+        liveSamples = []
         try? session.finishStroke(sketch: sketchId, stroke: encoded)
         ink?.show(encoded, z: ids.count)
         ids.append(id)
@@ -389,10 +424,12 @@ final class InkView: UIView {
 @MainActor
 final class WetLayer {
     let layer = CAShapeLayer()
+    private let tool: Tool
     private let baseWidth: Float
     private var points: [WetPoint] = []
 
-    init(color: UIColor, baseWidth: Float) {
+    init(color: UIColor, tool: Tool, baseWidth: Float) {
+        self.tool = tool
         self.baseWidth = baseWidth
         layer.fillColor = color.cgColor
         layer.strokeColor = nil
@@ -401,7 +438,7 @@ final class WetLayer {
 
     func append(_ batch: [WetPoint]) {
         points.append(contentsOf: batch)
-        layer.path = InkView.path(wetTriangles(points: points, baseWidth: baseWidth))
+        layer.path = InkView.path(wetTriangles(points: points, tool: tool, baseWidth: baseWidth))
     }
 }
 
@@ -460,11 +497,10 @@ struct SketchCanvas: UIViewRepresentable {
             switch phase {
             case .began:
                 model.penState(down: true)
-                model.penBegan(at: touch.location(in: canvas), force: max(touch.force, 0.3))
+                model.penBegan(PenSample(touch, in: canvas))
             case .moved:
                 let coalesced = event.coalescedTouches(for: touch) ?? [touch]
-                model.penMoved(
-                    coalesced.map { ($0.location(in: canvas), max($0.force, 0.3)) })
+                model.penMoved(coalesced.map { PenSample($0, in: canvas) })
             case .ended:
                 model.penState(down: false)
                 model.penEnded(cancelled: false)

@@ -18,6 +18,8 @@ pub struct WetPoint {
     /// Rendered line width at this sample, canvas units. `None` → receivers
     /// fall back to `base_width * force`.
     pub width: Option<f32>,
+    /// Flat-nib orientation (azimuth + roll, radians) for nib tools.
+    pub nib: Option<f32>,
 }
 
 /// A wet-ink event. `Begin` → `Points`* → `End`, keyed by the stroke id the
@@ -78,12 +80,14 @@ mod tests {
                     y: -2.0,
                     force: 0.5,
                     width: Some(3.25),
+                    nib: Some(1.2),
                 },
                 WetPoint {
                     x: 2.5,
                     y: -1.0,
                     force: 0.75,
                     width: None,
+                    nib: None,
                 },
             ],
         };

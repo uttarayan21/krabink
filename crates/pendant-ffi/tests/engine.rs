@@ -237,12 +237,14 @@ fn two_cores_converge_through_relay() {
                     y: 0.0,
                     force: 0.5,
                     width: None,
+                    nib: None,
                 },
                 WetPoint {
                     x: 3.0,
                     y: 1.0,
                     force: 0.6,
                     width: None,
+                    nib: None,
                 },
             ],
         )

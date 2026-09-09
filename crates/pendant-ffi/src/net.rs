@@ -447,6 +447,7 @@ fn dispatch_wet(shared: &Shared, doc: DocKey, payload: &[u8]) {
                     y: p.y,
                     force: p.force,
                     width: p.width,
+                    nib: p.nib,
                 })
                 .collect(),
         ),

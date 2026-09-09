@@ -4,7 +4,7 @@
 //! rendering needs the evaluated curve. Polyline-sampled strokes pass through
 //! unchanged.
 
-use crate::stroke::{PointKind, Stroke, StrokePoint};
+use crate::stroke::{PointKind, Stroke, StrokePoint, Tool};
 
 /// Curve samples evaluated per spline segment. 8 keeps a typical pen segment
 /// (a few canvas units long) visually smooth at 1:1 zoom.
@@ -116,6 +116,68 @@ fn half_width(p: &StrokePoint, base_width: f32) -> f32 {
     }
 }
 
+/// Thinnest a flat nib gets when dragged along its own length, as a
+/// fraction of `base_width`.
+const NIB_MIN_FRACTION: f32 = 0.08;
+
+/// Tessellate for `tool`: round tools offset across the direction of
+/// motion ([`ribbon`]); a nib tool offsets along the nib's own orientation
+/// ([`nib_ribbon`]), which is what makes calligraphic strokes thick across
+/// the nib and thin along it.
+pub fn ribbon_for(tool: Tool, points: &[StrokePoint], base_width: f32) -> RibbonMesh {
+    if tool.has_nib() {
+        nib_ribbon(points, base_width)
+    } else {
+        ribbon(points, base_width)
+    }
+}
+
+/// Flat-nib tessellation: each point becomes the two ends of a `base_width`
+/// long nib turned to `tilt.nib_angle()` (azimuth + barrel roll). Points
+/// without orientation fall back to the motion normal, so a stroke from a
+/// pen that cannot report roll still renders.
+pub fn nib_ribbon(points: &[StrokePoint], base_width: f32) -> RibbonMesh {
+    let pts = dedupe(points);
+    let half = (base_width / 2.0).max(0.05);
+    let floor = (base_width * NIB_MIN_FRACTION / 2.0).max(0.05);
+    if pts.len() < 2 {
+        return ribbon(&pts, base_width);
+    }
+    let mut positions = Vec::with_capacity(pts.len() * 2);
+    for (i, p) in pts.iter().enumerate() {
+        let prev = &pts[i.saturating_sub(1)];
+        let next = &pts[(i + 1).min(pts.len() - 1)];
+        let (dx, dy) = (next.x - prev.x, next.y - prev.y);
+        let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
+        let (nx, ny) = (-dy / len, dx / len);
+        let (ox, oy) = match p.tilt {
+            Some(tilt) => {
+                let angle = tilt.nib_angle();
+                let (ux, uy) = (angle.cos(), angle.sin());
+                // Keep the nib's side that faces the motion normal first so
+                // the strip never twists when the nib crosses the path.
+                let side = if ux * nx + uy * ny < 0.0 { -1.0 } else { 1.0 };
+                // Guarantee a minimum thickness across the path.
+                let across = (ux * nx + uy * ny).abs() * half;
+                if across < floor {
+                    (nx * floor, ny * floor)
+                } else {
+                    (ux * half * side, uy * half * side)
+                }
+            }
+            None => (nx * half, ny * half),
+        };
+        positions.push([p.x + ox, p.y + oy]);
+        positions.push([p.x - ox, p.y - oy]);
+    }
+    let mut indices = Vec::with_capacity((pts.len() - 1) * 6);
+    for i in 0..pts.len() as u32 - 1 {
+        let base = i * 2;
+        indices.extend([base, base + 1, base + 2, base + 2, base + 1, base + 3]);
+    }
+    RibbonMesh { positions, indices }
+}
+
 /// Tessellate a flattened polyline into a variable-width ribbon; width per
 /// point is the point's own `size.w` when present (PencilKit-authored),
 /// otherwise `base_width * force`. A single point (or all-coincident points)
@@ -168,8 +230,8 @@ pub fn ribbon(points: &[StrokePoint], base_width: f32) -> RibbonMesh {
 /// every triangle wound the same way. Renderers that fill a path with the
 /// non-zero rule (CoreGraphics, SVG, Skia) get exactly the mesh's coverage:
 /// same-winding overlaps add up instead of cancelling into holes.
-pub fn ribbon_triangles(points: &[StrokePoint], base_width: f32) -> Vec<[f32; 2]> {
-    let mesh = ribbon(points, base_width);
+pub fn ribbon_triangles(tool: Tool, points: &[StrokePoint], base_width: f32) -> Vec<[f32; 2]> {
+    let mesh = ribbon_for(tool, points, base_width);
     let mut out = Vec::with_capacity(mesh.indices.len());
     for tri in mesh.indices.as_chunks::<3>().0 {
         let (a, b, c) = (
@@ -351,13 +413,64 @@ mod tests {
             fpt(10.0, 0.5, 1.0),
             fpt(0.0, 1.0, 1.0),
         ];
-        let tris = ribbon_triangles(&pts, 4.0);
+        let tris = ribbon_triangles(Tool::Pen, &pts, 4.0);
         assert_eq!(tris.len(), ribbon(&pts, 4.0).indices.len());
         for tri in tris.as_chunks::<3>().0 {
             let (a, b, c) = (tri[0], tri[1], tri[2]);
             let twice_area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
             assert!(twice_area >= 0.0, "clockwise triangle {tri:?}");
         }
+    }
+
+    #[test]
+    fn nib_width_follows_orientation() {
+        use crate::stroke::Tilt;
+        let with_nib = |x: f32, angle: f32| StrokePoint {
+            tilt: Some(Tilt {
+                azimuth: angle,
+                altitude: 0.5,
+                roll: 0.0,
+            }),
+            ..fpt(x, 0.0, 1.0)
+        };
+        let half_pi = core::f32::consts::FRAC_PI_2;
+        // Nib across the motion (pointing +y on a horizontal stroke): full width.
+        let across = nib_ribbon(&[with_nib(0.0, half_pi), with_nib(10.0, half_pi)], 8.0);
+        let w = (across.positions[0][1] - across.positions[1][1]).abs();
+        assert!((w - 8.0).abs() < 1e-3, "across width {w}");
+        // Nib along the motion: only the thin floor remains.
+        let along = nib_ribbon(&[with_nib(0.0, 0.0), with_nib(10.0, 0.0)], 8.0);
+        let w = (along.positions[0][1] - along.positions[1][1]).abs();
+        assert!((w - 8.0 * NIB_MIN_FRACTION).abs() < 1e-3, "along width {w}");
+        // Roll turns the nib: azimuth 0 rolled by π/2 is across again.
+        let rolled = nib_ribbon(
+            &[
+                StrokePoint {
+                    tilt: Some(Tilt {
+                        azimuth: 0.0,
+                        altitude: 0.5,
+                        roll: half_pi,
+                    }),
+                    ..fpt(0.0, 0.0, 1.0)
+                },
+                StrokePoint {
+                    tilt: Some(Tilt {
+                        azimuth: 0.0,
+                        altitude: 0.5,
+                        roll: half_pi,
+                    }),
+                    ..fpt(10.0, 0.0, 1.0)
+                },
+            ],
+            8.0,
+        );
+        let w = (rolled.positions[0][1] - rolled.positions[1][1]).abs();
+        assert!((w - 8.0).abs() < 1e-3, "rolled width {w}");
+        // Round tools ignore the nib entirely.
+        assert_eq!(
+            ribbon_for(Tool::Pen, &[with_nib(0.0, 0.0), with_nib(10.0, 0.0)], 8.0).positions,
+            ribbon(&[fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0)], 8.0).positions
+        );
     }
 
     #[test]

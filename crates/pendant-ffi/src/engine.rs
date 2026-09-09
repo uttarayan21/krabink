@@ -565,6 +565,7 @@ impl NoteSession {
                     y: p.y,
                     force: p.force,
                     width: p.width,
+                    nib: p.nib,
                 })
                 .collect(),
         })

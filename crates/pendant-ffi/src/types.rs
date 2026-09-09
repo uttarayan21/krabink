@@ -8,6 +8,8 @@ pub enum Tool {
     Pen,
     Marker,
     Monoline,
+    /// Flat calligraphy nib oriented by azimuth + barrel roll.
+    Brush,
 }
 
 impl From<Tool> for pcore::Tool {
@@ -16,6 +18,7 @@ impl From<Tool> for pcore::Tool {
             Tool::Pen => Self::Pen,
             Tool::Marker => Self::Marker,
             Tool::Monoline => Self::Monoline,
+            Tool::Brush => Self::Brush,
         }
     }
 }
@@ -26,6 +29,7 @@ impl From<pcore::Tool> for Tool {
             pcore::Tool::Pen => Self::Pen,
             pcore::Tool::Marker => Self::Marker,
             pcore::Tool::Monoline => Self::Monoline,
+            pcore::Tool::Brush => Self::Brush,
         }
     }
 }
@@ -60,6 +64,8 @@ pub struct Tilt {
     pub azimuth: f32,
     /// Radians, 0 (flat) .. π/2 (perpendicular).
     pub altitude: f32,
+    /// Barrel roll, radians -π..π (Apple Pencil Pro); 0 when unknown.
+    pub roll: f32,
 }
 
 /// Rendered point size in canvas units (PencilKit `PKStrokePoint.size`).
@@ -91,6 +97,7 @@ impl From<StrokePoint> for pcore::StrokePoint {
             force: p.force,
             t_ms: p.t_ms,
             tilt: p.tilt.map(|t| pcore::Tilt {
+                roll: t.roll,
                 azimuth: t.azimuth,
                 altitude: t.altitude,
             }),
@@ -107,6 +114,7 @@ impl From<pcore::StrokePoint> for StrokePoint {
             force: p.force,
             t_ms: p.t_ms,
             tilt: p.tilt.map(|t| Tilt {
+                roll: t.roll,
                 azimuth: t.azimuth,
                 altitude: t.altitude,
             }),
@@ -124,6 +132,8 @@ pub struct WetPoint {
     /// Rendered line width at this sample; receivers fall back to
     /// `base_width * force` when absent.
     pub width: Option<f32>,
+    /// Flat-nib orientation (azimuth + roll, radians) for nib tools.
+    pub nib: Option<f32>,
 }
 
 /// A finished stroke, as stored in the CRDT.
@@ -167,15 +177,20 @@ const WET_WIDTH_FALLBACK: f32 = 2.0;
 pub fn stroke_triangles(stroke: Stroke) -> Vec<f32> {
     let stroke = pcore::Stroke::from(stroke);
     let flat = pcore::flatten_stroke(&stroke);
-    flatten_xy(pcore::ribbon_triangles(&flat, stroke.base_width))
+    flatten_xy(pcore::ribbon_triangles(
+        stroke.tool,
+        &flat,
+        stroke.base_width,
+    ))
 }
 
 /// Provisional (wet) ink for the points received so far, same geometry
 /// as [`stroke_triangles`].
 #[uniffi::export]
-pub fn wet_triangles(points: Vec<WetPoint>, base_width: f32) -> Vec<f32> {
+pub fn wet_triangles(points: Vec<WetPoint>, tool: Tool, base_width: f32) -> Vec<f32> {
     let flat: Vec<pcore::StrokePoint> = points.iter().map(wet_to_stroke_point).collect();
     flatten_xy(pcore::ribbon_triangles(
+        tool.into(),
         &flat,
         base_width.max(WET_WIDTH_FALLBACK),
     ))
@@ -187,7 +202,13 @@ pub(crate) fn wet_to_stroke_point(p: &WetPoint) -> pcore::StrokePoint {
         y: p.y,
         force: p.force,
         t_ms: 0,
-        tilt: None,
+        // Wet samples carry only the nib orientation; that is all a nib
+        // tool needs to render.
+        tilt: p.nib.map(|angle| pcore::Tilt {
+            azimuth: angle,
+            altitude: 0.0,
+            roll: 0.0,
+        }),
         size: p.width.map(|w| pcore::PointSize { w, h: w }),
     }
 }
