@@ -1,0 +1,156 @@
+# Pendant sync architecture
+
+How a desktop, an iPad, and the relays fit together. Source of truth:
+`crates/pendant/src/{relay,sync}.rs`, `crates/pendant-server/src/relay.rs`,
+`crates/pendant-ffi/src/net.rs`, `crates/pendant-core/src/{sync,pair}.rs`.
+
+## 1. Topology: two desktops, two iPads, one dedicated relay
+
+```mermaid
+flowchart TB
+    subgraph LAN_A["Home LAN"]
+        direction TB
+        subgraph DA["Desktop A (pendant, Bevy)"]
+            direction LR
+            DA_docs["Docs\nLoro CRDT + redb"]
+            DA_sync["SyncTransport\nlinks[0] = local relay\nlinks[1] = dedicated relay\nbridges updates across links"]
+            DA_relay["EmbeddedRelay\npendant-server router\nws://0.0.0.0:8722/ws\nrelay.redb + relay_token"]
+            DA_docs <--> DA_sync
+            DA_sync -- "ws://127.0.0.1:8722/ws" --> DA_relay
+        end
+        IPAD_A["iPad A (Swift + pendant-ffi)\nserver = ws://192.168.0.x:8722/ws\nfallback = wss://relay.example/ws"]
+        IPAD_A -- "direct (attempt 0,2,4…)" --> DA_relay
+    end
+
+    subgraph WAN["Internet"]
+        DR["Dedicated relay\n(pendant-server, systemd/container)\nwss://relay.example/ws\nown redb, same bearer token"]
+    end
+
+    subgraph LAN_B["Office LAN"]
+        subgraph DB["Desktop B (pendant)"]
+            DB_relay["EmbeddedRelay :8722"]
+            DB_sync["SyncTransport\n2 links, bridges"]
+            DB_sync --> DB_relay
+        end
+        IPAD_B["iPad B"]
+        IPAD_B -- direct --> DB_relay
+    end
+
+    DA_sync -- "link[1]" --> DR
+    DB_sync -- "link[1]" --> DR
+    IPAD_A -. "fallback (attempt 1,3,5…)\nonly while direct fails" .-> DR
+    IPAD_B -. fallback .-> DR
+```
+
+Rules the diagram encodes:
+
+- **Every desktop is a relay.** `EmbeddedRelay::start` binds `0.0.0.0:8722`
+  (ephemeral port if taken), serves the same axum router as the standalone
+  `pendant-server`, and keeps its own `relay.redb` plus a per-install
+  `relay_token`. The desktop connects to itself over loopback as link 0.
+- **Dedicated relay is optional and shared.** `server`/`token` in
+  `config.toml` (or `--server`) become link 1. It is the only thing two LANs
+  have in common, so it is what makes Desktop A and Desktop B converge.
+- **iPad never bridges.** It holds one socket at a time and alternates
+  direct / fallback per reconnect attempt (`net.rs`), so a lost LAN path
+  lands on the dedicated relay after one backoff and keeps probing LAN.
+- **One token, both doors.** The embedded relay accepts its own
+  `relay_token` and the config `token`; the pair URI carries whichever the
+  desktop chose (`RuntimeConfig::pair_token`).
+
+## 2. Pairing flow
+
+```mermaid
+sequenceDiagram
+    participant D as Desktop (settings window)
+    participant P as iPad (ScanScreen)
+    D->>D: build PairInfo { server: ws://<lan-ip>:8722/ws, token, fallback: <dedicated> }
+    D->>D: render QR of pendant://pair?server=…&token=…&fallback=…
+    P->>D: scan QR (camera)
+    P->>P: parse_pair_uri, persist serverURL / fallbackURL / token (UserDefaults)
+    P->>P: setSyncServer(url, token, fallback) restarts net task
+    P->>D: WS connect + Hello{device, token}
+    D-->>P: DocList
+    Note over D,P: both device rows now appear in the WorkspaceDoc device registry
+```
+
+`fallback=` is ignored by older parsers, so pre-fallback iPads still pair to
+the direct path only.
+
+## 3. One update, end to end (iPad A stroke reaches iPad B)
+
+```mermaid
+sequenceDiagram
+    participant IA as iPad A
+    participant RA as Desktop A embedded relay
+    participant SA as Desktop A SyncTransport
+    participant DR as Dedicated relay
+    participant SB as Desktop B SyncTransport
+    participant RB as Desktop B embedded relay
+    participant IB as iPad B
+
+    IA->>RA: Update{doc, payload}
+    RA->>RA: import into relay doc, checkpoint later
+    RA-->>SA: Update (link 0 inbound)
+    SA->>SA: import into Docs, queue in `bridged`
+    SA->>DR: local_update on link 1 (bridge step 4)
+    DR-->>SB: Update
+    SB->>SB: import, queue in `bridged`
+    SB->>RB: local_update on link 0
+    RB-->>IB: Update
+```
+
+- Bridge rule (`drive_sync` step 4): any `ServerMsg::Update` or catch-up
+  received on link *i* is re-sent with `session.local_update` on every other
+  link. Loro imports are idempotent, so the originating relay drops the echo.
+- Local edits on a desktop go out on **all** links at once (step 1), no
+  bridging needed.
+- Subscriptions are per link: opening a note subscribes on every ready link
+  with that link's own version vector, so catch-up is correct per relay.
+
+## 4. Per-process layering
+
+```mermaid
+flowchart LR
+    subgraph core["pendant-core (sans-io)"]
+        CS["ClientSession\nHello / Subscribe / Update / Ephemeral"]
+        SS["ServerSession\nBroadcast / Disconnect effects"]
+        WS["WorkspaceDoc\nnotes + device registry"]
+        PAIR["pair.rs\nPairInfo <-> pendant://pair URI"]
+    end
+    subgraph desktop["pendant (desktop bin)"]
+        BEVY["Bevy app: ui, sketch, docs"]
+        SYNC["sync.rs: N links, tokio task per WS"]
+        RELAY["relay.rs: EmbeddedRelay"]
+        BEVY --> SYNC --> CS
+        RELAY --> SRV
+    end
+    subgraph server["pendant-server (lib + bin)"]
+        SRV["axum router /ws\nbearer auth, redb DocProvider"]
+        SRV --> SS
+    end
+    subgraph ios["iPad"]
+        SWIFT["SwiftUI: AppModel, Settings, Scan, Sketch"]
+        FFI["pendant-ffi (UniFFI)\nengine.rs + net.rs single-socket task"]
+        SWIFT --> FFI --> CS
+    end
+```
+
+## 5. Failure modes and what happens
+
+| Situation | Behaviour |
+|---|---|
+| iPad leaves LAN, dedicated relay configured | Next reconnect attempt is odd, so it targets the fallback. Back on LAN, the following even attempt probes direct again. |
+| iPad leaves LAN, no dedicated relay | Backoff loop against direct only, 500 ms to 30 s. Edits queue locally in the CRDT. |
+| Desktop offline | Its embedded relay is gone. iPads on that LAN converge only via the dedicated relay; on desktop restart, link 0 and link 1 both catch up and the desktop re-bridges. |
+| Dedicated relay down | Each LAN keeps working through its desktop's relay. Cross-LAN convergence resumes when link 1 reconnects. |
+| Port 8722 busy | Embedded relay binds an ephemeral port; QR advertises the real one. |
+| Two desktops, no dedicated relay | Two islands. Nothing bridges them. |
+
+## Not covered by bridging
+
+- **Wet ink (`Ephemeral`)** is forwarded only within the relay it arrived
+  on. A stroke in progress is visible to peers on the same relay, not across
+  the bridge. Committed strokes (CRDT updates) do cross.
+- **Device removal** is a `WorkspaceDoc` CRDT edit, so it propagates like
+  any other update.
