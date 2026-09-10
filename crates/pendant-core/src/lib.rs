@@ -16,6 +16,7 @@
 //! ```
 
 mod brush;
+mod element;
 mod export;
 mod geom;
 mod ids;
@@ -30,9 +31,10 @@ mod wetink;
 mod workspace;
 
 pub use brush::{BrushModeler, BrushParams, RawSample};
-pub use export::{ExportAsset, ExportBundle, SKETCH_URI_PREFIX, strokes_to_svg};
+pub use element::{Binding, Element, ShapeElement, Style};
+pub use export::{ExportAsset, ExportBundle, SKETCH_URI_PREFIX, elements_to_svg};
 pub use geom::{DEFAULT_TOLERANCE, StrokeMesh, hits, stroke_mesh};
-pub use ids::{DeviceId, NoteId, SketchId, StrokeId};
+pub use ids::{DeviceId, ElementId, NoteId, SketchId, StrokeId};
 pub use note::NoteDoc;
 pub use pair::PairInfo;
 pub use shape::{Recognition, RecognizerParams, Shape, recognize, recognize_with};

@@ -554,7 +554,7 @@ fn sketch_counts(
     doc.sketch_ids()
         .into_iter()
         .map(|sketch| {
-            let count = doc.strokes(sketch).map(|s| s.len()).unwrap_or(0);
+            let count = doc.elements(sketch).map(|s| s.len()).unwrap_or(0);
             (sketch, count)
         })
         .collect()
