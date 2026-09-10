@@ -342,3 +342,19 @@ circle with 8 % missing already has a 0.18·diag gap. Changes:
 - `-recordStrokes 1` also prints each stroke to the console, and the corpus
   accepts `# kind: modeled` files, so device strokes can be captured from an
   attached `devicectl --console` and replayed without the brush model.
+
+### Anchoring to the pen (same day)
+
+Every snapped shape now passes through where the pen landed and where it is
+held (`Shape::anchored`): a rectangle moves the side each point is nearest
+to (both sides when within 8 % of the short side of a corner), an ellipse
+keeps its fitted size and angle and slides its center (two points at least a
+radius apart pin it via the unit-circle intersection; closer points, the
+normal start-and-hold case, anchor their midpoint since a small radial
+mismatch would otherwise demand a large slide). Moves beyond 30 % of the
+shape's size are refused and the fit stands. An axis-snapped rectangle drawn
+a few degrees off therefore keeps its pen corner and absorbs the rotation in
+its far sides. Two recognizer rules changed on the way: the ellipse
+soft-corner pre-check is gone (the radial and straight-run tests already
+separate a pointed ellipse from a D or a lens), and corner candidates within
+one straw window merge (a pointed tip could seed two).

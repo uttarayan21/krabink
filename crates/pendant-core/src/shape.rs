@@ -189,6 +189,145 @@ impl Shape {
     }
 }
 
+/// A pen point this close to a rectangle corner, as a fraction of the
+/// shorter side, pins both of the corner's sides.
+const CORNER_REACH: f32 = 0.08;
+/// Pen points closer than this fraction of the shape's shorter dimension
+/// (a loop's start and hold, typically) anchor as one point at their
+/// midpoint: two points at slightly different radii cannot both lie on
+/// the outline without a large move.
+const NEAR_PENS: f32 = 0.15;
+/// The largest shift anchoring may apply, as a fraction of the shape's
+/// size; beyond it the fit and the pen disagree and the fit stands.
+const ANCHOR_LIMIT: f32 = 0.3;
+
+impl Shape {
+    /// The shape moved the least that makes its outline pass through
+    /// where the pen landed and where it is held. A line simply runs
+    /// between them and an arrow's tail sits on whichever it was drawn
+    /// from; a rectangle moves the side (or corner) each point is nearest
+    /// to; an ellipse keeps its size and angle and shifts its center. The
+    /// shape is returned unchanged when that would need a large move.
+    fn anchored(self, pen_down: P, pen_now: P) -> Self {
+        match self {
+            Self::Line { .. } => Self::Line {
+                a: pen_down,
+                b: pen_now,
+            },
+            Self::Arrow { a, b } => Self::Arrow {
+                a: if dist(a, pen_down) <= dist(a, pen_now) {
+                    pen_down
+                } else {
+                    pen_now
+                },
+                b,
+            },
+            Self::Rect {
+                center,
+                size,
+                angle,
+            } => anchor_rect(center, size, angle, &pen_points(pen_down, pen_now, size))
+                .unwrap_or(self),
+            Self::Ellipse {
+                center,
+                radii,
+                angle,
+            } => anchor_ellipse(center, radii, angle, &pen_points(pen_down, pen_now, radii))
+                .unwrap_or(self),
+        }
+    }
+}
+
+/// Both pen points, or their midpoint alone when they are close.
+fn pen_points(pen_down: P, pen_now: P, extent: P) -> Vec<P> {
+    if dist(pen_down, pen_now) <= NEAR_PENS * extent[0].min(extent[1]) {
+        vec![mid(pen_down, pen_now)]
+    } else {
+        vec![pen_down, pen_now]
+    }
+}
+
+fn anchor_rect(center: P, size: P, angle: f32, pens: &[P]) -> Option<Shape> {
+    // Extents in the rectangle's own frame, relative to its center.
+    let (mut lo, mut hi) = (
+        [-size[0] / 2.0, -size[1] / 2.0],
+        [size[0] / 2.0, size[1] / 2.0],
+    );
+    let reach = CORNER_REACH * size[0].min(size[1]);
+    let limit = ANCHOR_LIMIT * size[0].min(size[1]);
+    for &pen in pens {
+        let q = rotate(sub(pen, center), -angle);
+        let to_x = [(q[0] - lo[0]).abs(), (hi[0] - q[0]).abs()];
+        let to_y = [(q[1] - lo[1]).abs(), (hi[1] - q[1]).abs()];
+        let (nearest_x, nearest_y) = (to_x[0].min(to_x[1]), to_y[0].min(to_y[1]));
+        if nearest_x.min(nearest_y) > limit {
+            return None;
+        }
+        let corner = nearest_x <= reach && nearest_y <= reach;
+        if corner || nearest_x <= nearest_y {
+            if to_x[0] <= to_x[1] {
+                lo[0] = q[0];
+            } else {
+                hi[0] = q[0];
+            }
+        }
+        if corner || nearest_y < nearest_x {
+            if to_y[0] <= to_y[1] {
+                lo[1] = q[1];
+            } else {
+                hi[1] = q[1];
+            }
+        }
+    }
+    let size = sub(hi, lo);
+    (size[0] > 0.0 && size[1] > 0.0).then(|| Shape::Rect {
+        center: add(center, rotate(mid(lo, hi), angle)),
+        size,
+        angle,
+    })
+}
+
+fn anchor_ellipse(center: P, radii: P, angle: f32, pens: &[P]) -> Option<Shape> {
+    // In the frame where the ellipse is the unit circle, a center that
+    // puts both pen points on the outline is an intersection of the unit
+    // circles around them; take the one nearest the fitted center.
+    let unit = |p: P| {
+        let q = rotate(sub(p, center), -angle);
+        [q[0] / radii[0], q[1] / radii[1]]
+    };
+    let (p1, p2) = (unit(*pens.first()?), unit(*pens.last()?));
+    let d = dist(p1, p2);
+    // Two points less than a radius apart pin the center badly (a small
+    // radial mismatch demands a large slide), so anchor their midpoint.
+    let shift = if d < 1.0 {
+        let q = mid(p1, p2);
+        let r = norm(q);
+        if r <= f32::EPSILON {
+            return None;
+        }
+        scale(q, 1.0 - 1.0 / r)
+    } else if d <= 2.0 {
+        let m = mid(p1, p2);
+        let h = (1.0 - (d / 2.0).powi(2)).max(0.0).sqrt();
+        let n = scale([p1[1] - p2[1], p2[0] - p1[0]], 1.0 / d);
+        let (c1, c2) = (add(m, scale(n, h)), sub(m, scale(n, h)));
+        if norm(c1) <= norm(c2) { c1 } else { c2 }
+    } else {
+        return None;
+    };
+    if norm(shift) > ANCHOR_LIMIT {
+        return None;
+    }
+    Some(Shape::Ellipse {
+        center: add(
+            center,
+            rotate([shift[0] * radii[0], shift[1] * radii[1]], angle),
+        ),
+        radii,
+        angle,
+    })
+}
+
 fn rect_corners(center: P, size: P, angle: f32) -> [P; 4] {
     let (hw, hh) = (size[0] / 2.0, size[1] / 2.0);
     [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(|p| add(center, rotate(p, angle)))
@@ -251,8 +390,6 @@ pub struct RecognizerParams {
     pub ellipse_turn_tolerance: f32,
     /// Ellipse: longest straight run as a fraction of the ring's length.
     pub ellipse_max_straight: f32,
-    /// Ellipse: a corner turning at least this much rules the ring out.
-    pub ellipse_soft_corner: f32,
     /// Radii within this fraction of each other make a circle.
     pub circle_tolerance: f32,
     /// Rect: shortest side as a fraction of `diag`.
@@ -300,7 +437,6 @@ impl Default for RecognizerParams {
             ellipse_radial_error: 0.10,
             ellipse_turn_tolerance: 0.5,
             ellipse_max_straight: 0.30,
-            ellipse_soft_corner: 70.0_f32.to_radians(),
             circle_tolerance: 0.10,
             rect_min_side: 0.15,
             rect_corner_tolerance: 20.0_f32.to_radians(),
@@ -352,23 +488,7 @@ pub fn recognize_with(points: &[StrokePoint], params: &RecognizerParams) -> Opti
         None => classify_open(&r, len, params),
     };
     let (shape, worst) = fit?;
-    // A line runs exactly from where the pen landed to where it is held;
-    // an arrow's tail does the same at whichever end it was drawn from.
-    let shape = match shape {
-        Shape::Line { .. } => Shape::Line {
-            a: pen_down,
-            b: pen_now,
-        },
-        Shape::Arrow { a, b } => Shape::Arrow {
-            a: if dist(a, pen_down) <= dist(a, pen_now) {
-                pen_down
-            } else {
-                pen_now
-            },
-            b,
-        },
-        other => other,
-    };
+    let shape = shape.anchored(pen_down, pen_now);
     let confidence = 1.0 - worst;
     (confidence >= params.min_confidence && shape.is_finite())
         .then_some(Recognition { shape, confidence })
@@ -705,8 +825,9 @@ fn refine(
             }
         }
 
-        // Merge near: keep the sharper of two corners within two samples;
-        // an open path's ends always win.
+        // Merge near: keep the sharper of two corners within a straw
+        // window of each other (one bend can seed two candidates); an open
+        // path's ends always win.
         let mut i = 0;
         while m(&corners) >= 2 && i < m(&corners) {
             let j = (i + 1) % m(&corners);
@@ -718,7 +839,7 @@ fn refine(
                 Closed::Yes => (b + n - a) % n,
                 Closed::No => b - a,
             };
-            if gap >= 2 {
+            if gap > w {
                 i += 1;
                 continue;
             }
@@ -1036,11 +1157,9 @@ fn fit_ellipse(
     diag: f32,
     params: &RecognizerParams,
 ) -> Option<(Shape, f32)> {
-    if corners.len() > 2
-        || corners.iter().any(|&i| {
-            turn_at(ring, i, params.straw_window, Closed::Yes) >= params.ellipse_soft_corner
-        })
-    {
+    // Up to two corners may be the tips of a pointed ellipse; the radial
+    // fit and the straight-run test below tell those from a D or a lens.
+    if corners.len() > 2 {
         return None;
     }
     let (mean, mut angle) = pca(ring)?;
@@ -1375,8 +1494,10 @@ mod tests {
                 size: s,
                 angle: a,
             } => {
-                assert!(near(c, center, 4.0), "center {c:?} vs {center:?}");
-                assert!(near(s, size, 8.0), "size {s:?} vs {size:?}");
+                // Anchoring to the pen points moves sides by the jitter
+                // and, for an axis-snapped rect, by the rotation removed.
+                assert!(near(c, center, 6.0), "center {c:?} vs {center:?}");
+                assert!(near(s, size, 10.0), "size {s:?} vs {size:?}");
                 assert!(
                     angle_diff(a, angle, FRAC_PI_2) <= 3.0_f32.to_radians(),
                     "angle {} vs {}",
@@ -1468,7 +1589,12 @@ mod tests {
             [78.0, 78.0],
             0.0,
         );
-        assert!(matches!(rec.shape, Shape::Rect { size, .. } if size[0] == size[1]));
+        // Squared before anchoring; the pen points then move a side or two.
+        assert!(
+            matches!(rec.shape, Shape::Rect { size, .. } if (size[0] - size[1]).abs() <= 3.0),
+            "{:?}",
+            rec.shape
+        );
     }
 
     #[test]
@@ -1599,6 +1725,68 @@ mod tests {
                 )
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// Distance from `p` to the closest point of the outline polyline.
+    fn outline_distance(shape: &Shape, p: P) -> f32 {
+        let out = shape.outline();
+        out.windows(2)
+            .map(|w| segment_distance2([w[0].x, w[0].y], [w[1].x, w[1].y], p).sqrt())
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    #[test]
+    fn every_shape_passes_through_the_pen_points() {
+        let cases: Vec<(&str, Vec<P>)> = vec![
+            (
+                "rect mid-side",
+                loop_path(&rect_ring(100.0, 60.0), 0.125, 0.15),
+            ),
+            (
+                "rect corner",
+                loop_path(&rect_ring(100.0, 60.0), 0.3125, 0.0),
+            ),
+            (
+                "rect rotated",
+                transform(
+                    &loop_path(&rect_ring(100.0, 60.0), 0.0, 0.03),
+                    0.4,
+                    [50.0, 50.0],
+                ),
+            ),
+            ("ellipse", loop_path(&ellipse_ring(50.0, 30.0), 0.0, 0.0)),
+            ("circle", loop_path(&ellipse_ring(40.0, 42.0), 0.6, 0.1)),
+            (
+                "open circle",
+                arc_path(&wobbly_circle_ring(60.0, 0.04), 0.3, 0.9),
+            ),
+            ("line", vec![[0.0, 0.0], [120.0, 40.0]]),
+            ("arrow", arrow_path([0.0, 0.0], [150.0, 30.0], 30.0, true)),
+        ];
+        for (i, (name, path)) in cases.iter().enumerate() {
+            let pts = drawn(path, 1.0, 40 + i as u64);
+            let (first, last) = (pts[0], pts[pts.len() - 1]);
+            let rec = recognize(&pts).unwrap_or_else(|| panic!("{name} not recognised"));
+            let (d0, d1) = (
+                outline_distance(&rec.shape, [first.x, first.y]),
+                outline_distance(&rec.shape, [last.x, last.y]),
+            );
+            // Close pen points anchor at their midpoint; a polygonal
+            // ellipse outline adds its sagitta.
+            let tol = 0.5 * dist([first.x, first.y], [last.x, last.y]) + 0.6;
+            assert!(
+                d0 <= tol,
+                "{name}: pen-down {:?} is {d0} from {:?}",
+                (first.x, first.y),
+                rec.shape
+            );
+            assert!(
+                d1 <= tol,
+                "{name}: held point {:?} is {d1} from {:?}",
+                (last.x, last.y),
+                rec.shape
+            );
         }
     }
 
