@@ -335,7 +335,7 @@ impl Core {
     /// with a user-facing name whenever it (re)connects to a workspace.
     pub fn register_device(&self, name: String, platform: String) -> Result<()> {
         let meta = pcore::DeviceMeta {
-            id: self.shared.device.to_string(),
+            id: self.shared.device,
             name,
             platform,
             last_seen_ms: now_ms(),
@@ -358,9 +358,10 @@ impl Core {
     /// row). Not revocation: it re-registers if it reconnects with a valid
     /// token.
     pub fn remove_device(&self, id: String) -> Result<()> {
+        let device: pcore::DeviceId = id.parse().map_err(|_| PendantError::MalformedId { id })?;
         let payload = {
             let mut state = self.shared.lock_state();
-            commit_workspace(&mut state, |ws| ws.remove_device(&id))?
+            commit_workspace(&mut state, |ws| ws.remove_device(device))?
         };
         if let Some(payload) = payload {
             let _ = self.shared.cmd.send(Cmd::Update {
@@ -597,7 +598,7 @@ impl NoteSession {
             Ok(doc
                 .strokes(sketch_id)?
                 .iter()
-                .filter(|s| pcore::hits(&pcore::flatten_stroke(s), s.base_width, x, y, radius))
+                .filter(|s| pcore::hits(&s.flatten(), s.base_width, x, y, radius))
                 .map(|s| s.id)
                 .collect())
         })?;

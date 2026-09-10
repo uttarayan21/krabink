@@ -28,10 +28,7 @@ mod wetink;
 mod workspace;
 
 pub use export::{ExportAsset, ExportBundle, SKETCH_URI_PREFIX, strokes_to_svg};
-pub use geom::{
-    DEFAULT_TOLERANCE, StrokeMesh, flatten_stroke, hits, mesh_triangles, ribbon_outline,
-    stroke_mesh,
-};
+pub use geom::{DEFAULT_TOLERANCE, StrokeMesh, hits, mesh_triangles, ribbon_outline, stroke_mesh};
 pub use ids::{DeviceId, NoteId, SketchId, StrokeId};
 pub use note::NoteDoc;
 pub use pair::PairInfo;

@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 
 use bevy::prelude::Resource;
-use pendant_core::{ClientDocs, DocKey, Flush, NoteDoc, NoteId, NoteMeta, Store, WorkspaceDoc};
+use pendant_core::{
+    ClientDocs, DeviceId, DocKey, Flush, NoteDoc, NoteId, NoteMeta, Store, WorkspaceDoc,
+};
 
 /// Compact a doc when its stored update log grows past this.
 const COMPACT_AFTER_UPDATES: u64 = 500;
@@ -103,13 +105,13 @@ impl Docs {
     /// connect); returns the workspace payload for the wire.
     pub fn register_device(
         &mut self,
-        id: &str,
+        id: DeviceId,
         name: &str,
         platform: &str,
     ) -> pendant_core::Result<Vec<u8>> {
         let before = self.workspace.version();
         self.workspace.upsert_device(&pendant_core::DeviceMeta {
-            id: id.into(),
+            id,
             name: name.into(),
             platform: platform.into(),
             last_seen_ms: now_ms(),
@@ -121,7 +123,7 @@ impl Docs {
 
     /// Drop `id` from the synced device registry; returns the workspace
     /// payload for the wire.
-    pub fn remove_device(&mut self, id: &str) -> pendant_core::Result<Vec<u8>> {
+    pub fn remove_device(&mut self, id: DeviceId) -> pendant_core::Result<Vec<u8>> {
         let before = self.workspace.version();
         self.workspace.remove_device(id)?;
         let payload = self.workspace.export_updates_since(&before)?;

@@ -56,7 +56,7 @@ impl EmbeddedRelay {
         let store = Store::open(store_path)
             .change_context(Error)
             .attach_with(|| format!("opening relay store {}", store_path.display()))?;
-        let state = pendant_server::app_state(store, tokens);
+        let state = pendant_server::AppState::new(store, tokens);
 
         let listener = runtime.block_on(bind(listen))?;
         let bound = listener.local_addr().change_context(Error)?;
@@ -71,16 +71,14 @@ impl EmbeddedRelay {
         let alt: Vec<String> = ips.iter().skip(1).map(url).collect();
 
         let serve = runtime.spawn({
-            let router = pendant_server::router(state.clone());
+            let router = state.router();
             async move {
                 if let Err(err) = axum::serve(listener, router).await {
                     tracing::error!(%err, "embedded relay stopped");
                 }
             }
         });
-        let maintenance = runtime.spawn(pendant_server::maintenance(std::sync::Arc::clone(
-            &state.docs,
-        )));
+        let maintenance = runtime.spawn(state.clone().maintenance());
 
         let mdns = advertise(&ips, port, device)
             .map_err(|err| tracing::warn!(%err, "mDNS advertising failed; direct pairing by address only"))
@@ -110,7 +108,7 @@ impl Drop for EmbeddedRelay {
             let _ = daemon.unregister(&fullname);
             let _ = daemon.shutdown();
         }
-        if let Err(err) = pendant_server::checkpoint(&self.state) {
+        if let Err(err) = self.state.checkpoint() {
             tracing::error!(%err, "embedded relay final checkpoint failed");
         }
     }

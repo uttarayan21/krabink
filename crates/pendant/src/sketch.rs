@@ -19,7 +19,7 @@ use bevy::render::render_resource::TextureUsages;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, EguiUserTextures, egui};
 use pendant_core::{
     DEFAULT_TOLERANCE, DocKey, PointSize, Rgba, SKETCH_URI_PREFIX, SketchId, StrokeId, StrokePoint,
-    Tilt, Tool, WetInk, WetPoint, flatten_stroke, stroke_mesh,
+    Tilt, Tool, WetInk, WetPoint, stroke_mesh,
 };
 
 use crate::docs::{Docs, now_ms};
@@ -224,7 +224,7 @@ fn sync_sketch_scenes(
             if stale.remove(&stroke.id).is_some() {
                 continue;
             }
-            let flat = flatten_stroke(stroke);
+            let flat = stroke.flatten();
             let entity = ink_mesh(stroke.tool, &flat, stroke.base_width).map(|mesh| {
                 commands
                     .spawn((

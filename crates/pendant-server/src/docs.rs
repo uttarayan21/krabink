@@ -17,6 +17,16 @@ struct OpenDoc {
     last_used: Instant,
 }
 
+/// What [`ServerDocs::maintain`] does with docs nobody touched for
+/// [`IDLE_UNLOAD`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleDocs {
+    /// Drop them from memory; the store keeps their state.
+    Unload,
+    /// Keep them loaded (final checkpoint before exit).
+    Keep,
+}
+
 /// All documents the server knows, plus their persistence.
 pub struct ServerDocs {
     store: Store,
@@ -53,7 +63,7 @@ impl ServerDocs {
 
     /// Checkpoint every open doc with pending updates and drop idle ones.
     /// Called periodically and on shutdown.
-    pub fn maintain(&mut self, unload_idle: bool) -> Result<()> {
+    pub fn maintain(&mut self, idle: IdleDocs) -> Result<()> {
         let now = Instant::now();
         let keys: Vec<DocKey> = self.open.keys().copied().collect();
         for key in keys {
@@ -63,7 +73,7 @@ impl ServerDocs {
                 self.store.checkpoint(key, &snapshot)?;
                 entry.pending_updates = 0;
             }
-            if unload_idle && now.duration_since(entry.last_used) > IDLE_UNLOAD {
+            if idle == IdleDocs::Unload && now.duration_since(entry.last_used) > IDLE_UNLOAD {
                 self.open.remove(&key);
             }
         }

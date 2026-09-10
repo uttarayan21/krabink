@@ -1,6 +1,6 @@
 //! Stroke geometry: turn stored point runs into render-ready meshes.
 //!
-//! Two stages. [`flatten_stroke`] evaluates PencilKit-authored uniform cubic
+//! Two stages. [`Stroke::flatten`] evaluates PencilKit-authored uniform cubic
 //! B-spline *control points* into a polyline (polyline-sampled strokes pass
 //! through unchanged). [`stroke_mesh`] then tessellates that polyline into
 //! triangles: round tools go through lyon's stroker with a per-point width
@@ -20,16 +20,18 @@ use crate::stroke::{PointKind, Stroke, StrokePoint, Tool};
 /// (a few canvas units long) visually smooth at 1:1 zoom.
 const SAMPLES_PER_SEGMENT: u32 = 8;
 
-/// Evaluate a stroke's stored points into a drawable polyline.
-///
-/// B-spline control runs are clamped (first/last control point repeated) so
-/// the curve interpolates the stroke's endpoints, matching how PencilKit
-/// renders its own paths. Force and timestamps are blended with the same
-/// basis, so width transitions stay smooth.
-pub fn flatten_stroke(stroke: &Stroke) -> Vec<StrokePoint> {
-    match stroke.kind {
-        PointKind::PolylineSample => stroke.points.clone(),
-        PointKind::BSplineControl => flatten_bspline(&stroke.points),
+impl Stroke {
+    /// Evaluate the stored points into a drawable polyline.
+    ///
+    /// B-spline control runs are clamped (first/last control point repeated)
+    /// so the curve interpolates the stroke's endpoints, matching how
+    /// PencilKit renders its own paths. Force and timestamps are blended
+    /// with the same basis, so width transitions stay smooth.
+    pub fn flatten(&self) -> Vec<StrokePoint> {
+        match self.kind {
+            PointKind::PolylineSample => self.points.clone(),
+            PointKind::BSplineControl => flatten_bspline(&self.points),
+        }
     }
 }
 
@@ -465,7 +467,7 @@ mod tests {
     fn polyline_passes_through() {
         let points = vec![pt(0.0, 0.0), pt(3.0, 4.0)];
         let s = stroke(PointKind::PolylineSample, points.clone());
-        assert_eq!(flatten_stroke(&s), points);
+        assert_eq!(s.flatten(), points);
     }
 
     #[test]
@@ -474,7 +476,7 @@ mod tests {
             PointKind::BSplineControl,
             vec![pt(0.0, 0.0), pt(10.0, 0.0), pt(10.0, 10.0), pt(0.0, 10.0)],
         );
-        let flat = flatten_stroke(&s);
+        let flat = s.flatten();
         let first = flat.first().unwrap();
         let last = flat.last().unwrap();
         assert!((first.x - 0.0).abs() < 1e-3 && (first.y - 0.0).abs() < 1e-3);
@@ -489,7 +491,7 @@ mod tests {
             vec![pt(0.0, 0.0), pt(5.0, 8.0), pt(12.0, -3.0), pt(20.0, 4.0)],
         );
         // Convex-combination bound, with float-error slack.
-        for p in flatten_stroke(&s) {
+        for p in s.flatten() {
             assert!((-1e-3..=20.0 + 1e-3).contains(&p.x), "x = {}", p.x);
             assert!((-3.0 - 1e-3..=8.0 + 1e-3).contains(&p.y), "y = {}", p.y);
             assert!((0.0..=1.0).contains(&p.force));

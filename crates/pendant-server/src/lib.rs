@@ -10,43 +10,57 @@ use std::time::Duration;
 
 use pendant_core::Store;
 
-use crate::docs::ServerDocs;
-use crate::relay::{AppState, PeerRegistry};
+use crate::docs::{IdleDocs, ServerDocs};
+pub use crate::relay::AppState;
+use crate::relay::PeerRegistry;
 
 /// How often open docs are checkpointed to disk and idle ones unloaded.
 pub const MAINTAIN_EVERY: Duration = Duration::from_secs(30);
 
-pub fn app_state(store: Store, tokens: Vec<String>) -> AppState {
-    AppState {
-        docs: Arc::new(Mutex::new(ServerDocs::new(store))),
-        peers: Arc::new(Mutex::new(PeerRegistry::default())),
-        tokens: Arc::new(RwLock::new(tokens)),
-    }
-}
-
-pub fn router(state: AppState) -> axum::Router {
-    axum::Router::new()
-        .route("/ws", axum::routing::get(relay::ws_handler))
-        .with_state(state)
-}
-
-/// Periodic checkpoint + idle unload; runs until the task is dropped.
-pub async fn maintenance(docs: Arc<Mutex<ServerDocs>>) {
-    let mut tick = tokio::time::interval(MAINTAIN_EVERY);
-    loop {
-        tick.tick().await;
-        let result = docs.lock().expect("doc registry poisoned").maintain(true);
-        if let Err(err) = result {
-            tracing::error!(%err, "maintenance failed");
+impl AppState {
+    /// A relay over `store` accepting `tokens` as bearer tokens.
+    pub fn new(store: Store, tokens: Vec<String>) -> Self {
+        Self {
+            docs: Arc::new(Mutex::new(ServerDocs::new(store))),
+            peers: Arc::new(Mutex::new(PeerRegistry::default())),
+            tokens: Arc::new(RwLock::new(tokens)),
         }
     }
-}
 
-/// Durable checkpoint of every open doc; call once before exit.
-pub fn checkpoint(state: &AppState) -> pendant_core::Result<()> {
-    state
-        .docs
-        .lock()
-        .expect("doc registry poisoned")
-        .maintain(false)
+    /// The websocket router; serve it with `axum::serve`.
+    pub fn router(&self) -> axum::Router {
+        axum::Router::new()
+            .route("/ws", axum::routing::get(relay::ws_handler))
+            .with_state(self.clone())
+    }
+
+    /// Periodic checkpoint + idle unload; runs until the task is dropped.
+    /// The checkpoint hits redb, so it runs on the blocking pool rather
+    /// than stalling a runtime worker every tick.
+    pub async fn maintenance(self) {
+        let mut tick = tokio::time::interval(MAINTAIN_EVERY);
+        loop {
+            tick.tick().await;
+            let docs = Arc::clone(&self.docs);
+            let result = tokio::task::spawn_blocking(move || {
+                docs.lock()
+                    .expect("doc registry poisoned")
+                    .maintain(IdleDocs::Unload)
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => tracing::error!(%err, "maintenance failed"),
+                Err(err) => tracing::error!(%err, "maintenance task panicked"),
+            }
+        }
+    }
+
+    /// Durable checkpoint of every open doc; call once before exit.
+    pub fn checkpoint(&self) -> pendant_core::Result<()> {
+        self.docs
+            .lock()
+            .expect("doc registry poisoned")
+            .maintain(IdleDocs::Keep)
+    }
 }

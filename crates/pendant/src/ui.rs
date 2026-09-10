@@ -86,7 +86,7 @@ fn editor_ui(
     let view = crate::settings::SettingsView {
         links: transport.links(),
         mdns_name: relay.mdns_name.clone(),
-        this_device: transport.device().to_string(),
+        this_device: transport.device(),
         devices: docs.workspace.devices(),
         now_ms: crate::docs::now_ms(),
     };
@@ -94,7 +94,7 @@ fn editor_ui(
         Some(crate::settings::SettingsAction::Join(info)) => {
             adopted.write(crate::settings::PairAdopted(info));
         }
-        Some(crate::settings::SettingsAction::RemoveDevice(id)) => match docs.remove_device(&id) {
+        Some(crate::settings::SettingsAction::RemoveDevice(id)) => match docs.remove_device(id) {
             Ok(payload) if !payload.is_empty() => {
                 commits.write(LocalCommit {
                     doc: DocKey::WORKSPACE,
@@ -102,7 +102,7 @@ fn editor_ui(
                 });
             }
             Ok(_) => {}
-            Err(err) => tracing::error!(%err, id, "removing device failed"),
+            Err(err) => tracing::error!(%err, %id, "removing device failed"),
         },
         None => {}
     }

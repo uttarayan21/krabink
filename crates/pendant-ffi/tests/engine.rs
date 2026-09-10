@@ -23,7 +23,7 @@ fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
 /// Real relay on an ephemeral port, on its own thread + runtime.
 fn start_server(dir: &std::path::Path, token: &str) -> String {
     let store = pendant_core::Store::open(&dir.join("server.redb")).unwrap();
-    let state = pendant_server::app_state(store, vec![token.to_string()]);
+    let state = pendant_server::AppState::new(store, vec![token.to_string()]);
     let (addr_tx, addr_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
@@ -33,9 +33,7 @@ fn start_server(dir: &std::path::Path, token: &str) -> String {
             .block_on(async move {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 addr_tx.send(listener.local_addr().unwrap()).unwrap();
-                axum::serve(listener, pendant_server::router(state))
-                    .await
-                    .unwrap();
+                axum::serve(listener, state.router()).await.unwrap();
             });
     });
     let addr = addr_rx.recv().unwrap();

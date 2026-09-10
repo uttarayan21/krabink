@@ -177,7 +177,7 @@ const WET_WIDTH_FALLBACK: f32 = 2.0;
 #[uniffi::export]
 pub fn stroke_triangles(stroke: Stroke, tolerance: f32) -> Vec<f32> {
     let stroke = pcore::Stroke::from(stroke);
-    let flat = pcore::flatten_stroke(&stroke);
+    let flat = stroke.flatten();
     flatten_xy(pcore::mesh_triangles(
         stroke.tool,
         &flat,
@@ -200,7 +200,7 @@ pub fn default_tolerance() -> f32 {
 #[uniffi::export]
 pub fn stroke_outline(stroke: Stroke) -> Vec<f32> {
     let stroke = pcore::Stroke::from(stroke);
-    let flat = pcore::flatten_stroke(&stroke);
+    let flat = stroke.flatten();
     flatten_xy(pcore::ribbon_outline(stroke.tool, &flat, stroke.base_width))
 }
 
@@ -281,7 +281,7 @@ pub struct DeviceInfo {
 impl From<pcore::DeviceMeta> for DeviceInfo {
     fn from(m: pcore::DeviceMeta) -> Self {
         Self {
-            id: m.id,
+            id: m.id.to_string(),
             name: m.name,
             platform: m.platform,
             last_seen_ms: m.last_seen_ms,
