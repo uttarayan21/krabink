@@ -1,6 +1,6 @@
 // Metal ink renderer. Every stroke on screen — committed, remote wet, the
 // local live stroke and its predicted tail — is an indexed triangle mesh
-// from the Rust core (`strokeMesh` / `wetMesh` / `pointsMesh`), drawn with
+// from the Rust core (`elementMesh` / `wetMesh` / `pointsMesh`), drawn with
 // one flat-colour pipeline under 4x MSAA. The view is demand-driven: it
 // redraws only when ink or the viewport changes, so an idle canvas costs
 // no GPU time.
@@ -200,7 +200,7 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     private weak var view: MTKView?
 
     private struct Committed {
-        let stroke: Stroke
+        let element: Element
         var z: Int
         var mesh: IndexedMesh
     }
@@ -291,19 +291,25 @@ final class InkRenderer: NSObject, MTKViewDelegate {
 
     // MARK: committed ink
 
-    /// Show a committed stroke (idempotent; re-show only updates z).
-    func show(_ stroke: Stroke, z: Int) {
-        if committed[stroke.id] != nil {
-            if committed[stroke.id]?.z != z {
-                committed[stroke.id]?.z = z
+    /// Show a committed element, stroke or shape (idempotent; re-show only
+    /// updates z).
+    func show(_ element: Element, z: Int) {
+        let id = element.id
+        if committed[id] != nil {
+            if committed[id]?.z != z {
+                committed[id]?.z = z
                 resort()
             }
             return
         }
-        let mesh = strokeMesh(stroke: stroke, tolerance: tolerance)
-        committed[stroke.id] = Committed(stroke: stroke, z: z, mesh: mesh)
+        let mesh = elementMesh(element: element, tolerance: tolerance)
+        committed[id] = Committed(element: element, z: z, mesh: mesh)
         inkBounds = inkBounds.union(mesh.bounds)
         resort()
+    }
+
+    func show(_ stroke: Stroke, z: Int) {
+        show(.stroke(stroke), z: z)
     }
 
     func remove(_ id: String) {
@@ -335,7 +341,7 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         committedStale = false
         for id in order {
             guard let entry = committed[id] else { continue }
-            committed[id]?.mesh = strokeMesh(stroke: entry.stroke, tolerance: tolerance)
+            committed[id]?.mesh = elementMesh(element: entry.element, tolerance: tolerance)
         }
         batchDirty = true
     }
@@ -345,7 +351,7 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         var geometry = InkGeometry()
         for id in order {
             guard let entry = committed[id] else { continue }
-            geometry.append(entry.mesh, color: entry.stroke.color)
+            geometry.append(entry.mesh, color: entry.element.color)
         }
         batch.upload(geometry)
     }
@@ -384,6 +390,16 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     /// thousands of points).
     func setLocal(points: [StrokePoint], tool: Tool, color: UInt32, baseWidth: Float) {
         let mesh = pointsMesh(points: points, tool: tool, baseWidth: baseWidth, tolerance: tolerance)
+        local.upload(InkGeometry(mesh, color: color))
+        hasLocal = true
+        needsDisplay()
+    }
+
+    /// Replace the live stroke's ink with a snapped shape's outline (the
+    /// draw-and-hold preview), in the stroke's tool, colour and width.
+    func setLocalShape(_ shape: Shape, tool: Tool, color: UInt32, baseWidth: Float) {
+        let mesh = shapeOutlineMesh(
+            shape: shape, tool: tool, baseWidth: baseWidth, tolerance: tolerance)
         local.upload(InkGeometry(mesh, color: color))
         hasLocal = true
         needsDisplay()

@@ -37,3 +37,26 @@ enum StrokeCodec {
             alpha: CGFloat(v & 0xff) / 255)
     }
 }
+
+/// What every element exposes regardless of kind; UniFFI enums carry no
+/// methods, so the accessors live here.
+extension Element {
+    var id: String {
+        switch self {
+        case .stroke(let s): s.id
+        case .shape(let s): s.id
+        }
+    }
+
+    var color: UInt32 {
+        switch self {
+        case .stroke(let s): s.color
+        case .shape(let s): s.color
+        }
+    }
+
+    var isShape: Bool {
+        if case .shape = self { return true }
+        return false
+    }
+}

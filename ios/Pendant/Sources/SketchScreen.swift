@@ -15,8 +15,12 @@
 // Local strokes stream wet samples onto the ephemeral channel while drawn;
 // pen-up commits `modeler.finish()` to the CRDT under the wet id, so
 // receivers swap their provisional ink for identical committed ink.
-// Erasing: the eraser tool's samples hit-test whole strokes in the core.
-// Remote strokes: wet batches render through `wetMesh`; strokesChanged
+// Draw-and-hold: a pen still for `holdDelay` asks the core to recognise
+// the stroke so far; a hit previews the snapped outline (with a haptic)
+// and pen-up commits a shape element under the same wet id instead of a
+// stroke. Moving again drops the snap and the stroke goes on as ink.
+// Erasing: the eraser tool's samples hit-test whole elements in the core.
+// Remote elements: wet batches render through `wetMesh`; strokesChanged
 // diffs the CRDT into meshes — deferred while a local pen is down.
 
 import MetalKit
@@ -27,6 +31,10 @@ import UIKit
 
 /// Wet batches leave the pen at this cadence (plan: 60ms ≈ 4-8 samples).
 private let wetFlushInterval: Duration = .milliseconds(60)
+/// The pen must stay within this many screen points for `holdDelay` to
+/// count as a draw-and-hold.
+private let holdRadius: CGFloat = 3
+private let holdDelay: Duration = .milliseconds(500)
 /// Backpressure cap: ~2s of 240Hz samples. Overflow drops the oldest —
 /// wet ink is lossy-tolerant, the committed stroke is not built from it.
 private let wetBufferCap = 480
@@ -105,13 +113,46 @@ private struct LiveStroke {
     let baseWidth: Float
     var seq: UInt32 = 0
     var wetBuffer: [WetPoint] = []
+    /// Where the pen last came to rest; the hold timer runs from there.
+    var holdAnchor: RawSample?
+    var holdTask: Task<Void, Never>?
+    /// The shape this stroke will commit as, once a hold recognised one.
+    var snap: Recognition?
+    /// Raw samples kept for `-recordStrokes 1`.
+    var recording: [RawSample]?
+}
+
+/// Writes raw pen samples to Documents for the core's shape corpus
+/// (`crates/pendant-core/tests/corpus/shapes`), one file per stroke in the
+/// replay format. Enabled by the `-recordStrokes 1` launch argument; the
+/// app shares Documents with Files so the recordings can be copied out.
+private enum StrokeRecorder {
+    static let enabled = UserDefaults.standard.bool(forKey: "recordStrokes")
+
+    static func save(_ samples: [RawSample], tool: Tool, size: Float) {
+        guard enabled, !samples.isEmpty,
+              let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        else { return }
+        let dir = documents.appendingPathComponent("strokes", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let stamp = Int(Date().timeIntervalSince1970 * 1000)
+        var text = "# expect: none\n# tool: \(tool) size: \(size)\n"
+        for s in samples {
+            text += String(format: "%.2f %.2f %.2f %.1f\n", s.x, s.y, s.force, s.tMs)
+        }
+        try? text.write(to: dir.appendingPathComponent("stroke-\(stamp).txt"), atomically: true, encoding: .utf8)
+        NSLog("recorded %d samples to strokes/stroke-%d.txt", samples.count, stamp)
+    }
 }
 
 @Observable @MainActor
 final class SketchModel {
     let session: NoteSession
     let sketchId: String
+    /// Stroke elements on screen.
     var strokeCount = 0
+    /// Shape elements on screen.
+    var shapeCount = 0
     /// Diagnostics surfaced in the status label (log capture on the sim is
     /// unreliable): outbound wet flushes and inbound wet batches this session.
     var wetSent = 0
@@ -122,8 +163,10 @@ final class SketchModel {
 
     private weak var canvas: SketchCanvasView?
     private var renderer: InkRenderer? { canvas?.renderer }
-    /// Committed stroke ids on screen, in CRDT order.
+    /// Committed element ids on screen, in CRDT order.
     private var ids: [String] = []
+    /// The subset of `ids` that are shapes.
+    private var shapeIds: Set<String> = []
     private var penDown = false
     private var pendingRefresh = false
     private var erasing = false
@@ -140,8 +183,14 @@ final class SketchModel {
         // The model outlives its canvas (cached per note); a reattach gets a
         // fresh canvas + renderer, so forget what the old one showed.
         ids = []
+        shapeIds = []
         canvas.renderer.removeAll()
         refreshFromCrdt()
+    }
+
+    private func updateCounts() {
+        shapeCount = shapeIds.count
+        strokeCount = ids.count - shapeCount
     }
 
     // MARK: pen input
@@ -165,7 +214,9 @@ final class SketchModel {
             id: id, modeler: BrushModeler(tool: coreTool, size: baseWidth),
             tool: coreTool, color: color, baseWidth: baseWidth)
         stroke.wetBuffer = wetPoints(points: stroke.modeler.push(samples: [sample]))
+        if StrokeRecorder.enabled { stroke.recording = [sample] }
         live = stroke
+        armHold(at: sample)
         showLive(predicted: [])
         flushTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -191,7 +242,53 @@ final class SketchModel {
         if live!.wetBuffer.count > wetBufferCap {
             live!.wetBuffer.removeFirst(live!.wetBuffer.count - wetBufferCap)
         }
+        live!.recording?.append(contentsOf: coalesced)
+        if let last = coalesced.last { armHold(at: last) }
         showLive(predicted: predicted)
+    }
+
+    // MARK: draw-and-hold
+
+    /// Keep the hold timer running while the pen stays within `holdRadius`
+    /// of where it came to rest; any larger move re-anchors, restarts the
+    /// timer and drops a snap already shown.
+    private func armHold(at sample: RawSample) {
+        guard live != nil else { return }
+        let zoom = Float(max(renderer?.viewport.zoom ?? 1, 0.01))
+        let radius = Float(holdRadius) / zoom
+        if let anchor = live!.holdAnchor,
+           hypot(sample.x - anchor.x, sample.y - anchor.y) <= radius
+        {
+            return
+        }
+        live!.holdTask?.cancel()
+        live!.holdAnchor = sample
+        live!.snap = nil
+        let id = live!.id
+        live!.holdTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: holdDelay)
+            guard !Task.isCancelled else { return }
+            self?.holdFired(stroke: id)
+        }
+    }
+
+    private func holdFired(stroke id: String) {
+        guard live?.id == id, live?.snap == nil else { return }
+        guard let rec = recognizeShape(points: live!.modeler.points()) else { return }
+        live!.snap = rec
+        NSLog("hold snapped to %@ (confidence %.2f)", String(describing: rec.shape), rec.confidence)
+        showLive(predicted: [])
+        snapHaptic()
+    }
+
+    private func snapHaptic() {
+        guard let canvas else { return }
+        if #available(iOS 17.5, *) {
+            let generator = UICanvasFeedbackGenerator(view: canvas)
+            generator.alignmentOccurred(at: CGPoint(x: canvas.bounds.midX, y: canvas.bounds.midY))
+        } else {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        }
     }
 
     /// Pen-up commits the modelled stroke under the wet id (`finishStroke`
@@ -209,24 +306,45 @@ final class SketchModel {
         flushWet()
         guard let stroke = live else { return }
         live = nil
+        stroke.holdTask?.cancel()
         renderer?.clearLocal()
         if cancelled {
             try? session.cancelStroke(stroke: stroke.id)
             return
         }
-        let committed = Stroke(
-            id: stroke.id, tool: stroke.tool, color: stroke.color, baseWidth: stroke.baseWidth,
-            kind: .polylineSample, points: stroke.modeler.finish(),
-            createdMs: UInt64(max(0, Date().timeIntervalSince1970 * 1000)))
-        try? session.finishStroke(sketch: sketchId, stroke: committed)
-        renderer?.show(committed, z: ids.count)
+        if let recording = stroke.recording {
+            StrokeRecorder.save(recording, tool: stroke.tool, size: stroke.baseWidth)
+        }
+        let createdMs = UInt64(max(0, Date().timeIntervalSince1970 * 1000))
+        let element: Element
+        if let snap = stroke.snap {
+            // Same id as the wet stream: receivers swap ink for shape.
+            let shape = ShapeElement(
+                id: stroke.id, shape: snap.shape, tool: stroke.tool, color: stroke.color,
+                width: stroke.baseWidth, start: nil, end: nil, createdMs: createdMs)
+            try? session.finishShape(sketch: sketchId, shape: shape)
+            element = .shape(shape)
+            shapeIds.insert(stroke.id)
+        } else {
+            let committed = Stroke(
+                id: stroke.id, tool: stroke.tool, color: stroke.color, baseWidth: stroke.baseWidth,
+                kind: .polylineSample, points: stroke.modeler.finish(), createdMs: createdMs)
+            try? session.finishStroke(sketch: sketchId, stroke: committed)
+            element = .stroke(committed)
+        }
+        renderer?.show(element, z: ids.count)
         ids.append(stroke.id)
-        strokeCount = ids.count
+        updateCounts()
         grow()
     }
 
     private func showLive(predicted: [RawSample]) {
         guard let stroke = live else { return }
+        if let snap = stroke.snap {
+            renderer?.setLocalShape(
+                snap.shape, tool: stroke.tool, color: stroke.color, baseWidth: stroke.baseWidth)
+            return
+        }
         let points = stroke.modeler.points() + stroke.modeler.predict(samples: predicted)
         renderer?.setLocal(
             points: points, tool: stroke.tool, color: stroke.color, baseWidth: stroke.baseWidth)
@@ -258,7 +376,8 @@ final class SketchModel {
         let gone = Set(removed)
         for id in gone { renderer?.remove(id) }
         ids.removeAll { gone.contains($0) }
-        strokeCount = ids.count
+        shapeIds.subtract(gone)
+        updateCounts()
     }
 
     private static func eraserRadius(_ eraser: PKEraserTool) -> Float {
@@ -304,28 +423,30 @@ final class SketchModel {
         }
     }
 
-    /// Erase helper for the toolbar (and UI tests): drops the newest stroke
+    /// Erase helper for the toolbar (and UI tests): drops the newest element
     /// through the same CRDT path the eraser uses.
     func eraseLast() {
         guard let last = ids.last else { return }
-        try? session.removeStroke(sketch: sketchId, stroke: last)
+        try? session.removeElement(sketch: sketchId, element: last)
         renderer?.remove(last)
         ids.removeLast()
-        strokeCount = ids.count
+        shapeIds.remove(last)
+        updateCounts()
     }
 
     private func refreshFromCrdt() {
-        guard let renderer, let crdt = try? session.strokes(sketch: sketchId) else { return }
+        guard let renderer, let crdt = try? session.elements(sketch: sketchId) else { return }
         let newIds = crdt.map(\.id)
         if newIds != ids {
             let keep = Set(newIds)
             for id in ids where !keep.contains(id) { renderer.remove(id) }
-            for (z, stroke) in crdt.enumerated() { renderer.show(stroke, z: z) }
+            for (z, element) in crdt.enumerated() { renderer.show(element, z: z) }
             ids = newIds
         }
-        // A committed stroke replaces its wet ink.
+        shapeIds = Set(crdt.filter(\.isShape).map(\.id))
+        // A committed element replaces its wet ink.
         for id in newIds where renderer.hasWet(id) { renderer.wetRemove(id) }
-        strokeCount = ids.count
+        updateCounts()
         grow()
     }
 
@@ -554,7 +675,7 @@ struct SketchScreen: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("strokes=\(model.strokeCount) wetSent=\(model.wetSent) wetRecv=\(model.wetRecv)")
+                Text("strokes=\(model.strokeCount) shapes=\(model.shapeCount) wetSent=\(model.wetSent) wetRecv=\(model.wetRecv)")
                     .font(.system(size: 13, design: .monospaced))
                     .accessibilityIdentifier("sketchStatus")
                 Spacer()

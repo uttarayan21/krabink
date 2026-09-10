@@ -82,6 +82,31 @@ final class SketchUITests: XCTestCase {
         sleep(2)
     }
 
+    // Draw-and-hold: a drag that ends with the pen held still snaps to a
+    // shape (a straight drag is a line) and commits a shape element.
+    func testHoldSnapsToShape() {
+        let app = launch()
+        waitConnected(app)
+
+        app.buttons["newNote"].tap()
+        app.buttons["sketchMenu"].tap()
+        app.buttons["newSketch"].tap()
+
+        let canvas = app.descendants(matching: .any)["sketchCanvas"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        let start = canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.3))
+        let end = canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.7, dy: 0.5))
+        start.press(forDuration: 0.1, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.9)
+
+        waitStatus(app, contains: "shapes=1", timeout: 10)
+        XCTAssertTrue(app.staticTexts["sketchStatus"].label.contains("strokes=0"))
+
+        // The shape is an element like any other: erase drops it.
+        app.buttons["eraseLast"].tap()
+        waitStatus(app, contains: "shapes=0", timeout: 10)
+        sleep(1)
+    }
+
     // iM5: creating a sketch splices an inline embed; preview renders it as a
     // tappable thumbnail that reopens the canvas.
     func testInlineEmbedPreviewTapOpens() {

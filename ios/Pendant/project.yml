@@ -27,6 +27,9 @@ targets:
       path: Info.plist
       properties:
         UILaunchScreen: {}
+        # Documents visible in Files, for `-recordStrokes 1` recordings.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationPortraitUpsideDown
