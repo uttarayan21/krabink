@@ -1,21 +1,25 @@
-// Full-screen sketch canvas. PencilKit is the *input device only*: a
-// transparent PKCanvasView whose drawing is kept empty provides pen capture,
-// the tool picker and the ruler. Every visible stroke — committed or wet,
-// local or remote — is geometry from the Rust core (`strokeOutline` /
-// `wetOutline`) filled into CAShapeLayers on an ink view over the canvas
-// content. That outline is the legacy flat ribbon; the desktop already
-// draws the core's lyon mesh (round caps and joins). The iPad moves to the
-// mesh with its own Metal renderer — see docs/plans/ink-renderer.md.
+// Full-screen sketch canvas with its own input pipeline and renderer; no
+// PencilKit canvas. Raw touches (coalesced + predicted) feed the core's
+// `BrushModeler`, which emits the stroke's points with their rendered
+// width; `InkRenderer` draws those points as the core's lyon mesh in Metal.
+// The live stroke, the committed stroke and every remote copy are the same
+// geometry, so nothing changes on screen at pen-up — the reason PencilKit
+// went (docs/plans/ink-renderer.md).
 //
-// Local strokes: PencilKit renders the live stroke itself (lowest latency)
-// while the active observer streams wet samples onto the ephemeral channel;
-// at pen-up canvasViewDrawingDidChange commits the PKStroke to the CRDT
-// (reusing the wet id so receivers swap overlay for ink), its ribbon layer
-// appears, and the PKDrawing is cleared in the same frame.
+// View stack: a UIScrollView owns finger pan/zoom/inertia (its content view
+// is an empty rect the size of the canvas); the Metal view sits above it,
+// pinned to the screen, and reads the scroll state into its viewport each
+// frame. A gesture recognizer on the scroll view captures pen touches.
+// PencilKit survives only as the tool picker.
+//
+// Local strokes stream wet samples onto the ephemeral channel while drawn;
+// pen-up commits `modeler.finish()` to the CRDT under the wet id, so
+// receivers swap their provisional ink for identical committed ink.
 // Erasing: the eraser tool's samples hit-test whole strokes in the core.
-// Remote strokes: wet batches render as ribbons; strokesChanged diffs the
-// CRDT into layers — deferred while a local pen is down, flushed at pen-up.
+// Remote strokes: wet batches render through `wetMesh`; strokesChanged
+// diffs the CRDT into meshes — deferred while a local pen is down.
 
+import MetalKit
 import PencilKit
 import PendantCore
 import SwiftUI
@@ -29,30 +33,78 @@ private let wetBufferCap = 480
 /// Provisional ink lingers this long after End if the commit never lands
 /// (same as the desktop).
 private let wetLinger: Duration = .seconds(5)
+/// Canvas grows in steps this far beyond the ink (infinite canvas v1:
+/// down/right only).
+private let canvasMargin: CGFloat = 400
+private let minZoom: CGFloat = 0.5
+private let maxZoom: CGFloat = 8
 
-/// One raw pen sample from the observer: location plus the full pen
-/// orientation. Barrel roll is Apple Pencil Pro only (iOS 17.5+), 0 otherwise.
-struct PenSample {
-    var location: CGPoint
-    var force: CGFloat
-    var azimuth: CGFloat
-    var altitude: CGFloat
-    var roll: CGFloat
+/// Which touches ink. The Pencil only on device (fingers pan and zoom);
+/// fingers too on the simulator and under `-anyInput 1`, so UI tests can
+/// draw with drags. `-anyInput 0` forces pencil-only anywhere.
+enum InputPolicy {
+    case pencilOnly
+    case anyInput
 
-    /// Where a flat nib points on the canvas.
-    var nib: CGFloat { azimuth + roll }
+    static var launch: InputPolicy {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: "anyInput") != nil {
+            return defaults.bool(forKey: "anyInput") ? .anyInput : .pencilOnly
+        }
+        #if targetEnvironment(simulator)
+            return .anyInput
+        #else
+            return .pencilOnly
+        #endif
+    }
 
-    init(_ touch: UITouch, in view: UIView) {
-        location = touch.location(in: view)
-        force = max(touch.force, 0.3)
-        azimuth = touch.azimuthAngle(in: view)
-        altitude = touch.altitudeAngle
-        if #available(iOS 17.5, *) {
-            roll = touch.rollAngle
-        } else {
-            roll = 0
+    var touchTypes: [NSNumber] {
+        switch self {
+        case .pencilOnly: [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
+        case .anyInput:
+            [
+                NSNumber(value: UITouch.TouchType.pencil.rawValue),
+                NSNumber(value: UITouch.TouchType.direct.rawValue),
+            ]
         }
     }
+}
+
+extension RawSample {
+    /// One touch as the modeler sees it, in `view`'s (canvas) coordinates.
+    /// Pencil force is in units of average pressure (1 = average), which
+    /// the model treats as full width; fingers report no force and get 1.
+    /// Barrel roll is Apple Pencil Pro only (iOS 17.5+), 0 otherwise.
+    init(_ touch: UITouch, in view: UIView) {
+        let location = touch.location(in: view)
+        let pencil = touch.type == .pencil
+        var tilt: Tilt?
+        if pencil {
+            var roll: CGFloat = 0
+            if #available(iOS 17.5, *) { roll = touch.rollAngle }
+            tilt = Tilt(
+                azimuth: Float(touch.azimuthAngle(in: view)),
+                altitude: Float(touch.altitudeAngle),
+                roll: Float(roll))
+        }
+        self.init(
+            x: Float(location.x), y: Float(location.y),
+            force: pencil ? Float(min(touch.force, 1)) : 1,
+            tMs: touch.timestamp * 1000,
+            tilt: tilt)
+    }
+}
+
+/// The one local stroke in progress.
+@MainActor
+private struct LiveStroke {
+    let id: String
+    let modeler: BrushModeler
+    let tool: Tool
+    let color: UInt32
+    let baseWidth: Float
+    var seq: UInt32 = 0
+    var wetBuffer: [WetPoint] = []
 }
 
 @Observable @MainActor
@@ -64,79 +116,57 @@ final class SketchModel {
     /// unreliable): outbound wet flushes and inbound wet batches this session.
     var wetSent = 0
     var wetRecv = 0
+    /// Selected in the PencilKit tool picker; inking tools draw, the eraser
+    /// erases, anything else is ignored.
+    var tool: PKTool = PKInkingTool(.pen, color: .black, width: 10)
 
-    private weak var canvas: PKCanvasView?
-    private weak var ink: InkView?
+    private weak var canvas: SketchCanvasView?
+    private var renderer: InkRenderer? { canvas?.renderer }
     /// Committed stroke ids on screen, in CRDT order.
     private var ids: [String] = []
     private var penDown = false
     private var pendingRefresh = false
-    private var clearingDrawing = false
     private var erasing = false
-
-    // Outbound wet stream (one local pen at a time).
-    private var liveStrokeId: String?
-    private var liveSeq: UInt32 = 0
-    private var wetBuffer: [WetPoint] = []
-    /// Every sample of the live stroke, for roll lookup at commit.
-    private var liveSamples: [PenSample] = []
-    private var liveTool: Tool = .pen
+    private var live: LiveStroke?
     private var flushTask: Task<Void, Never>?
-    /// Set at pen-up; `commit` consumes it so the committed stroke keeps the
-    /// id receivers already saw on the wet channel.
-    private var pendingCommitId: String?
-
-    // Inbound wet overlays, keyed by remote stroke id.
-    private var remoteWet: [String: WetLayer] = [:]
 
     init(session: NoteSession, sketchId: String) {
         self.session = session
         self.sketchId = sketchId
     }
 
-    func attach(_ canvas: PKCanvasView, ink: InkView) {
+    func attach(_ canvas: SketchCanvasView) {
         self.canvas = canvas
-        self.ink = ink
         // The model outlives its canvas (cached per note); a reattach gets a
-        // fresh canvas + ink view, so forget what the old one showed.
+        // fresh canvas + renderer, so forget what the old one showed.
         ids = []
-        remoteWet = [:]
-        ink.removeAll()
+        canvas.renderer.removeAll()
         refreshFromCrdt()
     }
 
-    func penState(down: Bool) {
-        penDown = down
-        if !down, pendingRefresh {
-            pendingRefresh = false
-            refreshFromCrdt()
-        }
-    }
+    // MARK: pen input
 
-    // MARK: pen input (active observer)
-
-    /// Pen-down: an inking tool opens the wet stream, the eraser starts
-    /// hit-testing. Other tools (lasso, ruler handling) are PencilKit's own.
-    func penBegan(_ sample: PenSample) {
-        guard let canvas else { return }
-        if canvas.tool is PKEraserTool {
+    func penBegan(_ sample: RawSample) {
+        penDown = true
+        if let eraser = tool as? PKEraserTool {
             erasing = true
-            erase(at: sample.location)
+            erase(at: sample, radius: Self.eraserRadius(eraser))
             return
         }
-        guard let tool = canvas.tool as? PKInkingTool else { return }
-        liveSeq = 0
-        wetBuffer = []
-        liveSamples = []
-        liveTool = StrokeCodec.tool(tool.inkType)
-        liveStrokeId = try? session.beginStroke(
-            sketch: sketchId,
-            tool: liveTool,
-            color: StrokeCodec.pack(tool.color),
-            baseWidth: Float(tool.width))
-        NSLog("IM4 wet begin id=%@", liveStrokeId ?? "FAILED")
-        guard liveStrokeId != nil else { return }
-        buffer(sample)
+        guard let ink = tool as? PKInkingTool else { return }
+        let coreTool = StrokeCodec.tool(ink.inkType)
+        let color = StrokeCodec.pack(ink.color)
+        let baseWidth = Float(ink.width)
+        guard
+            let id = try? session.beginStroke(
+                sketch: sketchId, tool: coreTool, color: color, baseWidth: baseWidth)
+        else { return }
+        var stroke = LiveStroke(
+            id: id, modeler: BrushModeler(tool: coreTool, size: baseWidth),
+            tool: coreTool, color: color, baseWidth: baseWidth)
+        stroke.wetBuffer = wetPoints(points: stroke.modeler.push(samples: [sample]))
+        live = stroke
+        showLive(predicted: [])
         flushTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: wetFlushInterval)
@@ -145,20 +175,31 @@ final class SketchModel {
         }
     }
 
-    func penMoved(_ samples: [PenSample]) {
-        if erasing {
-            for sample in samples { erase(at: sample.location) }
+    /// `coalesced` are the real samples since the last event; `predicted`
+    /// is Apple's guess at the next few, drawn as a tail and discarded on
+    /// the next event.
+    func penMoved(coalesced: [RawSample], predicted: [RawSample]) {
+        if erasing, let eraser = tool as? PKEraserTool {
+            let radius = Self.eraserRadius(eraser)
+            for sample in coalesced { erase(at: sample, radius: radius) }
             return
         }
-        guard liveStrokeId != nil else { return }
-        for sample in samples { buffer(sample) }
+        guard live != nil else { return }
+        let emitted = live!.modeler.push(samples: coalesced)
+        let fresh = wetPoints(points: emitted)
+        live!.wetBuffer.append(contentsOf: fresh)
+        if live!.wetBuffer.count > wetBufferCap {
+            live!.wetBuffer.removeFirst(live!.wetBuffer.count - wetBufferCap)
+        }
+        showLive(predicted: predicted)
     }
 
-    /// Pen-up/cancel: flush the tail and hand the id to the upcoming commit.
-    /// `finishStroke` (in `commit`) sends the wet End frame. If no stroke
-    /// lands (the pen dragged the ruler, not ink), receivers get a Cancel so
-    /// the provisional ink does not linger as a phantom stroke.
+    /// Pen-up commits the modelled stroke under the wet id (`finishStroke`
+    /// sends the wet End frame); a cancelled touch sends Cancel so receivers
+    /// drop the provisional ink at once.
     func penEnded(cancelled: Bool) {
+        penDown = false
+        defer { flushPendingRefresh() }
         if erasing {
             erasing = false
             return
@@ -166,114 +207,94 @@ final class SketchModel {
         flushTask?.cancel()
         flushTask = nil
         flushWet()
-        guard let id = liveStrokeId else { return }
-        liveStrokeId = nil
+        guard let stroke = live else { return }
+        live = nil
+        renderer?.clearLocal()
         if cancelled {
-            pendingCommitId = nil
-            try? session.cancelStroke(stroke: id)
+            try? session.cancelStroke(stroke: stroke.id)
             return
         }
-        pendingCommitId = id
-        // PencilKit commits the stroke on the same touch-up; anything still
-        // pending shortly after was never a stroke.
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(150))
-            guard let self, self.pendingCommitId == id else { return }
-            self.pendingCommitId = nil
-            try? self.session.cancelStroke(stroke: id)
-        }
+        let committed = Stroke(
+            id: stroke.id, tool: stroke.tool, color: stroke.color, baseWidth: stroke.baseWidth,
+            kind: .polylineSample, points: stroke.modeler.finish(),
+            createdMs: UInt64(max(0, Date().timeIntervalSince1970 * 1000)))
+        try? session.finishStroke(sketch: sketchId, stroke: committed)
+        renderer?.show(committed, z: ids.count)
+        ids.append(stroke.id)
+        strokeCount = ids.count
+        grow()
     }
 
-    private func buffer(_ sample: PenSample) {
-        liveSamples.append(sample)
-        if wetBuffer.count >= wetBufferCap { wetBuffer.removeFirst() }
-        wetBuffer.append(
-            WetPoint(
-                x: Float(sample.location.x), y: Float(sample.location.y),
-                force: Float(sample.force), width: nil,
-                nib: liveTool == .brush ? Float(sample.nib) : nil))
+    private func showLive(predicted: [RawSample]) {
+        guard let stroke = live else { return }
+        let points = stroke.modeler.points() + stroke.modeler.predict(samples: predicted)
+        renderer?.setLocal(
+            points: points, tool: stroke.tool, color: stroke.color, baseWidth: stroke.baseWidth)
     }
 
     private func flushWet() {
-        guard let id = liveStrokeId, !wetBuffer.isEmpty else { return }
-        liveSeq += 1
+        guard live != nil, !live!.wetBuffer.isEmpty else { return }
+        live!.seq += 1
         wetSent += 1
-        try? session.appendPoints(stroke: id, seq: liveSeq, points: wetBuffer)
-        wetBuffer = []
+        try? session.appendPoints(stroke: live!.id, seq: live!.seq, points: live!.wetBuffer)
+        live!.wetBuffer = []
+    }
+
+    private func flushPendingRefresh() {
+        if pendingRefresh {
+            pendingRefresh = false
+            refreshFromCrdt()
+        }
     }
 
     // MARK: eraser
 
-    private func erase(at point: CGPoint) {
+    private func erase(at sample: RawSample, radius: Float) {
         guard
             let removed = try? session.eraseAt(
-                sketch: sketchId, x: Float(point.x), y: Float(point.y), radius: Float(eraserRadius())),
+                sketch: sketchId, x: sample.x, y: sample.y, radius: radius),
             !removed.isEmpty
         else { return }
         let gone = Set(removed)
-        for id in gone { ink?.remove(id) }
+        for id in gone { renderer?.remove(id) }
         ids.removeAll { gone.contains($0) }
         strokeCount = ids.count
     }
 
-    private func eraserRadius() -> CGFloat {
-        if #available(iOS 16.4, *), let eraser = canvas?.tool as? PKEraserTool {
-            return max(4, eraser.width / 2)
+    private static func eraserRadius(_ eraser: PKEraserTool) -> Float {
+        if #available(iOS 16.4, *) {
+            return Float(max(4, eraser.width / 2))
         }
         return 12
     }
 
-    // MARK: inbound wet overlay
+    // MARK: inbound wet ink
 
     func remoteWetBegin(stroke: String, tool: Tool, color: UInt32, baseWidth: Float) {
-        guard let ink else { return }
-        remoteWet[stroke]?.layer.removeFromSuperlayer()
-        let wet = WetLayer(color: StrokeCodec.unpack(color), tool: tool, baseWidth: baseWidth)
-        ink.addWet(wet.layer)
-        remoteWet[stroke] = wet
+        renderer?.wetBegin(stroke, tool: tool, color: color, baseWidth: baseWidth)
     }
 
     func remoteWetPoints(stroke: String, points: [WetPoint]) {
         wetRecv += 1
-        guard let wet = remoteWet[stroke] else { return }
-        wet.append(points)
+        renderer?.wetAppend(stroke, points)
     }
 
-    /// Sender says no stroke is coming: drop the overlay right away.
+    /// Sender says no stroke is coming: drop the provisional ink right away.
     func remoteWetCancel(stroke: String) {
-        guard let wet = remoteWet.removeValue(forKey: stroke) else { return }
-        wet.layer.removeFromSuperlayer()
+        renderer?.wetRemove(stroke)
     }
 
     func remoteWetEnd(stroke: String) {
-        // Keep the overlay until the committed stroke lands (strokesChanged →
+        // Keep the wet ink until the committed stroke lands (strokesChanged →
         // refresh) so ink never blinks out; drop it only as a fallback when
         // no commit ever arrives.
-        guard let wet = remoteWet[stroke] else { return }
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: wetLinger)
-            guard let self, self.remoteWet[stroke] === wet else { return }
-            self.remoteWet[stroke] = nil
-            wet.layer.removeFromSuperlayer()
+            self?.renderer?.wetRemove(stroke)
         }
     }
 
-    // MARK: PencilKit → CRDT → ink layers
-
-    /// PencilKit finished a stroke: commit every stroke it holds, show the
-    /// committed ink from the core, and empty the drawing again — the
-    /// canvas never keeps ink of its own.
-    func drawingChanged() {
-        guard !clearingDrawing, let canvas else { return }
-        let strokes = canvas.drawing.strokes
-        guard !strokes.isEmpty else { return }
-        for stroke in strokes { commit(stroke) }
-        clearingDrawing = true
-        canvas.drawing = PKDrawing()
-        clearingDrawing = false
-        strokeCount = ids.count
-        grow()
-    }
+    // MARK: CRDT → renderer
 
     func remoteChanged() {
         if penDown {
@@ -288,171 +309,225 @@ final class SketchModel {
     func eraseLast() {
         guard let last = ids.last else { return }
         try? session.removeStroke(sketch: sketchId, stroke: last)
-        ink?.remove(last)
+        renderer?.remove(last)
         ids.removeLast()
         strokeCount = ids.count
     }
 
-    private func commit(_ stroke: PKStroke) {
-        let id: String
-        if let pending = pendingCommitId {
-            // Streamed stroke: reuse the id the wet channel announced so
-            // receivers swap their overlay for this committed stroke.
-            pendingCommitId = nil
-            id = pending
-        } else {
-            let preview = StrokeCodec.encode(stroke, id: "")
-            guard
-                let fresh = try? session.beginStroke(
-                    sketch: sketchId,
-                    tool: preview.tool,
-                    color: preview.color,
-                    baseWidth: preview.baseWidth)
-            else { return }
-            id = fresh
-        }
-        let encoded = StrokeCodec.encode(stroke, id: id, samples: liveSamples)
-        liveSamples = []
-        try? session.finishStroke(sketch: sketchId, stroke: encoded)
-        ink?.show(encoded, z: ids.count)
-        ids.append(id)
-    }
-
     private func refreshFromCrdt() {
-        guard let ink, let crdt = try? session.strokes(sketch: sketchId) else { return }
+        guard let renderer, let crdt = try? session.strokes(sketch: sketchId) else { return }
         let newIds = crdt.map(\.id)
         if newIds != ids {
             let keep = Set(newIds)
-            for id in ids where !keep.contains(id) { ink.remove(id) }
-            for (z, stroke) in crdt.enumerated() { ink.show(stroke, z: z) }
+            for id in ids where !keep.contains(id) { renderer.remove(id) }
+            for (z, stroke) in crdt.enumerated() { renderer.show(stroke, z: z) }
             ids = newIds
         }
-        // A committed stroke replaces its wet overlay.
-        for id in newIds {
-            if let wet = remoteWet.removeValue(forKey: id) { wet.layer.removeFromSuperlayer() }
-        }
+        // A committed stroke replaces its wet ink.
+        for id in newIds where renderer.hasWet(id) { renderer.wetRemove(id) }
         strokeCount = ids.count
         grow()
     }
 
     /// Infinite canvas v1: grow content down/right only.
     private func grow() {
-        guard let canvas, let ink else { return }
-        let drawn = ink.inkBounds
-        let margin: CGFloat = 400
-        let needed = CGSize(
-            width: max(canvas.bounds.width, drawn.maxX + margin),
-            height: max(canvas.bounds.height, drawn.maxY + margin))
-        if canvas.contentSize.width < needed.width || canvas.contentSize.height < needed.height {
-            canvas.contentSize = needed
-        }
-        ink.frame = CGRect(origin: .zero, size: canvas.contentSize)
+        guard let canvas, let renderer else { return }
+        let drawn = renderer.inkBounds
+        guard !drawn.isNull else { return }
+        canvas.ensureCanvas(
+            covers: CGSize(width: drawn.maxX + canvasMargin, height: drawn.maxY + canvasMargin))
     }
 }
 
-/// All ink on screen: one CAShapeLayer per committed stroke (z = CRDT
-/// order) plus wet overlays on top, each filled with the core's legacy
-/// ribbon outline (one polygon, non-zero rule, one clean antialiased edge).
+/// Captures pen (or, under `.anyInput`, finger) touches with the full
+/// `UIEvent`, which is where coalesced and predicted touches live. Runs
+/// alongside the scroll view's own recognizers; tracks one touch and
+/// cancels the stroke when a second one lands (a pinch, not ink).
 @MainActor
-final class InkView: UIView {
-    private var strokes: [String: CAShapeLayer] = [:]
-    /// Union of committed ink bounds; drives the infinite-canvas growth.
-    private(set) var inkBounds = CGRect.zero
+final class PenGestureRecognizer: UIGestureRecognizer, UIGestureRecognizerDelegate {
+    enum Phase {
+        case began(RawSample)
+        case moved(coalesced: [RawSample], predicted: [RawSample])
+        case ended
+        case cancelled
+    }
 
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        isUserInteractionEnabled = false
-        backgroundColor = .clear
-        isOpaque = false
+    var onPhase: ((Phase) -> Void)?
+    /// Touch locations are taken in this view (the zoomable canvas).
+    weak var canvasSpace: UIView?
+    private var tracked: UITouch?
+
+    init(policy: InputPolicy) {
+        super.init(target: nil, action: nil)
+        allowedTouchTypes = policy.touchTypes
+        cancelsTouchesInView = false
+        delaysTouchesBegan = false
+        delaysTouchesEnded = false
+        delegate = self
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        if tracked != nil {
+            // A second finger: this is a pinch, not a stroke.
+            finish(.cancelled)
+            state = .cancelled
+            return
+        }
+        guard let touch = touches.first, let space = canvasSpace else { return }
+        tracked = touch
+        onPhase?(.began(RawSample(touch, in: space)))
+        state = .began
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard let touch = tracked, touches.contains(touch), let space = canvasSpace else { return }
+        let coalesced = (event.coalescedTouches(for: touch) ?? [touch]).map {
+            RawSample($0, in: space)
+        }
+        let predicted = (event.predictedTouches(for: touch) ?? []).map { RawSample($0, in: space) }
+        onPhase?(.moved(coalesced: coalesced, predicted: predicted))
+        state = .changed
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard let touch = tracked, touches.contains(touch) else { return }
+        finish(.ended)
+        state = .ended
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard let touch = tracked, touches.contains(touch) else { return }
+        finish(.cancelled)
+        state = .cancelled
+    }
+
+    override func reset() {
+        tracked = nil
+    }
+
+    private func finish(_ phase: Phase) {
+        tracked = nil
+        onPhase?(phase)
+    }
+
+    nonisolated func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+    ) -> Bool {
+        true
+    }
+}
+
+/// The sketch surface: scroll view (pan/zoom/inertia) under a pinned Metal
+/// view. First responder so the PencilKit tool picker attaches to it.
+@MainActor
+final class SketchCanvasView: UIView, UIScrollViewDelegate {
+    let scroll = UIScrollView()
+    /// Zoomable, empty; its frame is the canvas. Touch locations are read
+    /// in this view so they are canvas coordinates at any zoom.
+    let content = UIView()
+    let metal: MTKView
+    let renderer: InkRenderer
+    let pen: PenGestureRecognizer
+
+    init?(policy: InputPolicy) {
+        metal = MTKView(frame: .zero, device: MTLCreateSystemDefaultDevice())
+        guard let renderer = InkRenderer(view: metal) else { return nil }
+        self.renderer = renderer
+        pen = PenGestureRecognizer(policy: policy)
+        super.init(frame: .zero)
+
+        isAccessibilityElement = true
+        accessibilityIdentifier = "sketchCanvas"
+
+        scroll.delegate = self
+        scroll.minimumZoomScale = minZoom
+        scroll.maximumZoomScale = maxZoom
+        scroll.bouncesZoom = true
+        scroll.contentInsetAdjustmentBehavior = .never
+        scroll.showsVerticalScrollIndicator = false
+        scroll.showsHorizontalScrollIndicator = false
+        scroll.backgroundColor = .clear
+        let direct = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        switch policy {
+        case .pencilOnly:
+            scroll.panGestureRecognizer.allowedTouchTypes = direct
+            scroll.pinchGestureRecognizer?.allowedTouchTypes = direct
+        case .anyInput:
+            // One finger inks; two pan or pinch.
+            scroll.panGestureRecognizer.minimumNumberOfTouches = 2
+        }
+        content.isUserInteractionEnabled = false
+        scroll.addSubview(content)
+        addSubview(scroll)
+
+        metal.delegate = renderer
+        metal.sampleCount = InkRenderer.sampleCount
+        metal.isPaused = true
+        metal.enableSetNeedsDisplay = true
+        metal.isUserInteractionEnabled = false
+        metal.isOpaque = true
+        addSubview(metal)
+        applyBackground()
+
+        pen.canvasSpace = content
+        scroll.addGestureRecognizer(pen)
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    /// Show a committed stroke (idempotent; re-show only updates z).
-    func show(_ stroke: Stroke, z: Int) {
-        if let existing = strokes[stroke.id] {
-            existing.zPosition = CGFloat(z)
-            return
-        }
-        let shape = CAShapeLayer()
-        shape.fillColor = StrokeCodec.unpack(stroke.color).cgColor
-        shape.strokeColor = nil
-        shape.fillRule = .nonZero
-        shape.path = Self.polygon(strokeOutline(stroke: stroke))
-        shape.zPosition = CGFloat(z)
-        layer.addSublayer(shape)
-        strokes[stroke.id] = shape
-        if let box = shape.path?.boundingBox {
-            inkBounds = inkBounds.isEmpty ? box : inkBounds.union(box)
-        }
+    override var canBecomeFirstResponder: Bool { true }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        scroll.frame = bounds
+        metal.frame = bounds
+        ensureCanvas(covers: bounds.size)
+        pushViewport()
     }
 
-    func remove(_ id: String) {
-        strokes.removeValue(forKey: id)?.removeFromSuperlayer()
+    /// Grow the canvas (never shrink) so `size` fits at zoom 1.
+    func ensureCanvas(covers size: CGSize) {
+        let current = content.bounds.size
+        let needed = CGSize(width: max(current.width, size.width), height: max(current.height, size.height))
+        guard needed != current else { return }
+        content.frame = CGRect(origin: .zero, size: needed)
+        scroll.contentSize = CGSize(
+            width: needed.width * scroll.zoomScale, height: needed.height * scroll.zoomScale)
     }
 
-    func removeAll() {
-        for shape in strokes.values { shape.removeFromSuperlayer() }
-        strokes = [:]
-        layer.sublayers?.forEach { $0.removeFromSuperlayer() }
-        inkBounds = .zero
+    private func pushViewport() {
+        renderer.viewport = Viewport(
+            zoom: scroll.zoomScale, offset: scroll.contentOffset, size: bounds.size)
     }
 
-    /// Wet overlays sit above every committed stroke.
-    func addWet(_ wet: CALayer) {
-        wet.zPosition = 1_000_000
-        layer.addSublayer(wet)
+    private func applyBackground() {
+        var r: CGFloat = 0
+        var g: CGFloat = 0
+        var b: CGFloat = 0
+        var a: CGFloat = 0
+        UIColor.systemBackground.resolvedColor(with: traitCollection).getRed(&r, green: &g, blue: &b, alpha: &a)
+        metal.clearColor = MTLClearColor(red: r, green: g, blue: b, alpha: 1)
+        renderer.needsDisplay()
     }
 
-    /// Flat `[x0, y0, x1, y1, …]` outline → one closed polygon.
-    static func polygon(_ xy: [Float]) -> CGPath {
-        let path = CGMutablePath()
-        guard xy.count >= 6 else { return path }
-        path.move(to: CGPoint(x: CGFloat(xy[0]), y: CGFloat(xy[1])))
-        var i = 2
-        while i + 1 < xy.count {
-            path.addLine(to: CGPoint(x: CGFloat(xy[i]), y: CGFloat(xy[i + 1])))
-            i += 2
-        }
-        path.closeSubpath()
-        return path
+    override func traitCollectionDidChange(_ previous: UITraitCollection?) {
+        super.traitCollectionDidChange(previous)
+        if traitCollection.hasDifferentColorAppearance(comparedTo: previous) { applyBackground() }
     }
 
-    /// Flat `[x0, y0, x1, y1, x2, y2, …]` triangles → one closed subpath each.
-    static func path(_ xy: [Float]) -> CGPath {
-        let path = CGMutablePath()
-        var i = 0
-        while i + 5 < xy.count {
-            path.move(to: CGPoint(x: CGFloat(xy[i]), y: CGFloat(xy[i + 1])))
-            path.addLine(to: CGPoint(x: CGFloat(xy[i + 2]), y: CGFloat(xy[i + 3])))
-            path.addLine(to: CGPoint(x: CGFloat(xy[i + 4]), y: CGFloat(xy[i + 5])))
-            path.closeSubpath()
-            i += 6
-        }
-        return path
-    }
-}
+    // MARK: UIScrollViewDelegate
 
-/// One in-flight remote stroke, re-tessellated from the core on every
-/// batch so it looks exactly like the ink it will become.
-@MainActor
-final class WetLayer {
-    let layer = CAShapeLayer()
-    private let tool: Tool
-    private let baseWidth: Float
-    private var points: [WetPoint] = []
-
-    init(color: UIColor, tool: Tool, baseWidth: Float) {
-        self.tool = tool
-        self.baseWidth = baseWidth
-        layer.fillColor = color.cgColor
-        layer.strokeColor = nil
-        layer.fillRule = .nonZero
+    nonisolated func viewForZooming(in scrollView: UIScrollView) -> UIView? {
+        MainActor.assumeIsolated { content }
     }
 
-    func append(_ batch: [WetPoint]) {
-        points.append(contentsOf: batch)
-        layer.path = InkView.polygon(wetOutline(points: points, tool: tool, baseWidth: baseWidth))
+    nonisolated func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        MainActor.assumeIsolated { pushViewport() }
+    }
+
+    nonisolated func scrollViewDidZoom(_ scrollView: UIScrollView) {
+        MainActor.assumeIsolated { pushViewport() }
     }
 }
 
@@ -483,72 +558,72 @@ struct SketchCanvas: UIViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(model: model) }
 
-    func makeUIView(context: Context) -> PKCanvasView {
-        let canvas = PKCanvasView()
-        // .anyInput so simulator fingers draw; device pass will gate on
-        // .pencilOnly so fingers scroll.
-        canvas.drawingPolicy = .anyInput
-        canvas.tool = PKInkingTool(.pen, color: .black, width: 10)
-        canvas.delegate = context.coordinator
-        canvas.isAccessibilityElement = true
-        canvas.accessibilityIdentifier = "sketchCanvas"
-        // Follow the system appearance like PencilKit's default did (black
-        // in dark mode); the ink view over it is transparent.
-        canvas.backgroundColor = .systemBackground
-
-        // All ink (committed + remote wet) lives in content coordinates on
-        // top of PencilKit's content view (which paints opaquely, so nothing
-        // can sit beneath it). PencilKit only ever holds the stroke being
-        // drawn, which therefore renders under existing ink until pen-up.
-        let ink = InkView(frame: CGRect(origin: .zero, size: canvas.contentSize))
-        canvas.addSubview(ink)
-
-        // Pen tracking + outbound wet stream ride the active observer
-        // variant the iM2 spike validated (passive observers never see
-        // pen-up). Touch locations in the scroll view are content coords.
-        let observer = ActiveObserverGestureRecognizer(target: nil, action: nil)
+    func makeUIView(context: Context) -> UIView {
+        guard let canvas = SketchCanvasView(policy: .launch) else {
+            // No Metal device: nothing to draw with. Leave a labelled blank so
+            // the screen still opens and closes.
+            let fallback = UILabel()
+            fallback.text = "Metal is unavailable on this device"
+            fallback.textAlignment = .center
+            fallback.accessibilityIdentifier = "sketchCanvas"
+            return fallback
+        }
         let model = model
-        observer.onTouches = { [weak canvas] phase, touches, event in
-            guard let canvas, let touch = touches.first else { return }
+        canvas.pen.onPhase = { phase in
             switch phase {
-            case .began:
-                model.penState(down: true)
-                model.penBegan(PenSample(touch, in: canvas))
-            case .moved:
-                let coalesced = event.coalescedTouches(for: touch) ?? [touch]
-                model.penMoved(coalesced.map { PenSample($0, in: canvas) })
-            case .ended:
-                model.penState(down: false)
-                model.penEnded(cancelled: false)
-            case .cancelled:
-                model.penState(down: false)
-                model.penEnded(cancelled: true)
-            default: break
+            case .began(let sample): model.penBegan(sample)
+            case .moved(let coalesced, let predicted):
+                model.penMoved(coalesced: coalesced, predicted: predicted)
+            case .ended: model.penEnded(cancelled: false)
+            case .cancelled: model.penEnded(cancelled: true)
             }
         }
-        canvas.addGestureRecognizer(observer)
 
+        // PencilKit's picker works with any first responder; it hands us
+        // the selected tool through the observer.
         let picker = PKToolPicker()
         picker.setVisible(true, forFirstResponder: canvas)
-        picker.addObserver(canvas)
+        picker.addObserver(context.coordinator)
         context.coordinator.picker = picker
         canvas.becomeFirstResponder()
+        if let selected = context.coordinator.selectedTool { model.tool = selected }
 
-        model.attach(canvas, ink: ink)
+        model.attach(canvas)
         return canvas
     }
 
-    func updateUIView(_ canvas: PKCanvasView, context: Context) {}
+    func updateUIView(_ view: UIView, context: Context) {}
 
     @MainActor
-    final class Coordinator: NSObject, PKCanvasViewDelegate {
+    final class Coordinator: NSObject, PKToolPickerObserver {
         let model: SketchModel
         var picker: PKToolPicker?
 
         init(model: SketchModel) { self.model = model }
 
-        nonisolated func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
-            MainActor.assumeIsolated { model.drawingChanged() }
+        var selectedTool: PKTool? {
+            guard let picker else { return nil }
+            if #available(iOS 18.0, *) {
+                switch picker.selectedToolItem {
+                case let inking as PKToolPickerInkingItem: return inking.inkingTool
+                case let eraser as PKToolPickerEraserItem: return eraser.eraserTool
+                default: return nil
+                }
+            }
+            return picker.selectedTool
+        }
+
+        nonisolated func toolPickerSelectedToolDidChange(_ toolPicker: PKToolPicker) {
+            MainActor.assumeIsolated {
+                if let selected = selectedTool { model.tool = selected }
+            }
+        }
+
+        @available(iOS 18.0, *)
+        nonisolated func toolPickerSelectedToolItemDidChange(_ toolPicker: PKToolPicker) {
+            MainActor.assumeIsolated {
+                if let selected = selectedTool { model.tool = selected }
+            }
         }
     }
 }

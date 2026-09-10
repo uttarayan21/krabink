@@ -203,7 +203,7 @@ impl From<Stroke> for pcore::Stroke {
 }
 
 /// Renderers fall back to this width for wet ink whose points carry none.
-const WET_WIDTH_FALLBACK: f32 = 2.0;
+pub(crate) const WET_WIDTH_FALLBACK: f32 = 2.0;
 
 /// The committed stroke's ink as consistently wound triangles, flat
 /// `[x0, y0, x1, y1, x2, y2, …]` in canvas units. Fill with the non-zero

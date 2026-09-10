@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use pendant_core as pcore;
 
-use crate::types::{Stroke, StrokePoint, Tilt, Tool, WetPoint};
+use crate::types::{
+    Stroke, StrokePoint, Tilt, Tool, WET_WIDTH_FALLBACK, WetPoint, wet_to_stroke_point,
+};
 
 /// One raw touch sample, before smoothing.
 #[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
@@ -152,6 +154,21 @@ pub fn points_mesh(
     pcore::stroke_mesh(tool.into(), &flat, base_width, tolerance).into()
 }
 
+/// Ink for a remote wet run received on the ephemeral channel, same
+/// geometry as [`stroke_mesh`]: receivers draw exactly what the sender
+/// drew, and the committed stroke lands on top without a visible change.
+#[uniffi::export]
+pub fn wet_mesh(points: Vec<WetPoint>, tool: Tool, base_width: f32, tolerance: f32) -> IndexedMesh {
+    let flat: Vec<pcore::StrokePoint> = points.iter().map(wet_to_stroke_point).collect();
+    pcore::stroke_mesh(
+        tool.into(),
+        &flat,
+        base_width.max(WET_WIDTH_FALLBACK),
+        tolerance,
+    )
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +208,11 @@ mod tests {
         assert!(wet.iter().all(|w| w.width.is_some()));
 
         let mesh = points_mesh(done.clone(), Tool::Pen, 4.0, 0.25);
+        assert_eq!(
+            wet_mesh(wet, Tool::Pen, 4.0, 0.25),
+            mesh,
+            "receivers draw the sender's ink"
+        );
         assert!(mesh.indices.len() >= 3 && mesh.indices.len().is_multiple_of(3));
         assert!(mesh.positions.len().is_multiple_of(2));
         let vertices = u32::try_from(mesh.positions.len() / 2).unwrap();

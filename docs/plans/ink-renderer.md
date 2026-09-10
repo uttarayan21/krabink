@@ -229,6 +229,40 @@ Exit: draw on device, no visible change at pen-up. Compare a screenshot
 before and after pen-up for the same stroke (pixel diff ≈ 0 apart from the
 predicted tail).
 
+Done (commit after `2ec5786`). Decisions taken while implementing:
+- Files: `SketchScreen.swift` rewritten (`SketchModel`, `PenGestureRecognizer`,
+  `SketchCanvasView`, `SketchCanvas`), new `InkRenderer.swift` (Metal,
+  `GPUMesh`, `Viewport`, `IndexedMesh.cgPath/bounds`), new `Shaders.metal`,
+  `StrokeCodec.swift` down to tool/colour mapping, `SketchPreview.swift`
+  thumbnails from `strokeMesh`.
+- Input goes through a `UIGestureRecognizer` on the scroll view (not
+  `touchesBegan` on the view): it is the proven path from the PencilKit
+  era, receives the `UIEvent` for coalesced/predicted touches, and
+  coexists with the scroll view's pan/pinch. Locations are read in the
+  zoomable content view so they are canvas coordinates at any zoom.
+- `InputPolicy`: pencil-only on device (pan/pinch take `.direct`
+  touches only), any input on the simulator; `-anyInput 0|1` overrides.
+  Under any-input the scroll pan needs two fingers so one finger inks; a
+  second touch during a stroke cancels it (a pinch, not ink).
+- Pencil force: `min(touch.force, 1)`, i.e. average pressure = full
+  width; fingers report 1. Retune with the brush params on device.
+- Renderer: one pipeline, straight-alpha blending, `MTKView.sampleCount
+  = 4`, demand-driven (`isPaused`, `enableSetNeedsDisplay`). Committed
+  meshes are cached per stroke and rebuilt when the zoom crosses a
+  power-of-two bucket; wet and live strokes are re-tessellated whole on
+  every update. The live stroke is `modeler.points() + predict(tail)`.
+- Remote wet ink uses the new FFI `wet_mesh` (WetPoint run → indexed
+  mesh), so receivers draw the sender's widths exactly.
+- `PKToolPicker` stays attached to the canvas view as first responder;
+  iOS 18's `selectedToolItem` and iOS 17's `selectedTool` both feed
+  `SketchModel.tool`. Lasso and ruler are gone.
+- Thumbnails fill the mesh triangles with antialiasing off at 2× and let
+  the frame's downscale smooth the edges; antialiased adjacent triangles
+  leave hairline seams.
+- Estimated touch property updates are still ignored (follow-up).
+- `stroke_triangles` / `wet_triangles` / `stroke_outline` / `wet_outline`
+  and core `ribbon_outline` have no callers left; Phase 4 removes them.
+
 ### Phase 3: desktop parity
 
 Files: `crates/pendant/src/sketch.rs`.

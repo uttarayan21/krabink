@@ -5,7 +5,6 @@
 // Each `![alt](pendant://sketch/<id>)` token becomes an NSTextAttachment
 // rendered from the sketch's committed strokes; tapping it opens the canvas.
 
-import PencilKit
 import PendantCore
 import SwiftUI
 import UIKit
@@ -110,7 +109,10 @@ struct SketchPreview: UIViewRepresentable {
         }
 
         /// Render committed strokes to a bounded thumbnail from the core's
-        /// ribbon outline — the same ink the canvas shows.
+        /// stroke mesh — the same ink the canvas draws. The triangles are
+        /// filled without antialiasing (adjacent antialiased triangles leave
+        /// seams) at double resolution, so the downscale into the frame
+        /// smooths the edges instead.
         /// Empty sketch → a placeholder box.
         private func thumbnail(id: String, model: NoteModel) -> UIImage {
             let strokes = (try? model.session.strokes(sketch: id)) ?? []
@@ -122,16 +124,20 @@ struct SketchPreview: UIViewRepresentable {
             if strokes.isEmpty {
                 image = placeholder(size: CGSize(width: maxSide, height: 120))
             } else {
+                let tolerance = defaultTolerance()
                 let shapes = strokes.map { stroke in
-                    (InkView.polygon(strokeOutline(stroke: stroke)), StrokeCodec.unpack(stroke.color))
+                    (strokeMesh(stroke: stroke, tolerance: tolerance).cgPath, StrokeCodec.unpack(stroke.color))
                 }
                 let bounds = shapes
                     .reduce(CGRect.null) { $0.union($1.0.boundingBox) }
                     .insetBy(dx: -8, dy: -8)
                 let scale = max(0.1, min(1, maxSide / max(bounds.width, bounds.height, 1)))
                 let size = CGSize(width: bounds.width * scale, height: bounds.height * scale)
-                let rendered = UIGraphicsImageRenderer(size: size).image { ctx in
+                let format = UIGraphicsImageRendererFormat.default()
+                format.scale *= 2
+                let rendered = UIGraphicsImageRenderer(size: size, format: format).image { ctx in
                     let cg = ctx.cgContext
+                    cg.setShouldAntialias(false)
                     cg.scaleBy(x: scale, y: scale)
                     cg.translateBy(x: -bounds.minX, y: -bounds.minY)
                     for (path, color) in shapes {
