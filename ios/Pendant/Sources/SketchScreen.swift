@@ -141,7 +141,9 @@ private enum StrokeRecorder {
             text += String(format: "%.2f %.2f %.2f %.1f\n", s.x, s.y, s.force, s.tMs)
         }
         try? text.write(to: dir.appendingPathComponent("stroke-\(stamp).txt"), atomically: true, encoding: .utf8)
-        NSLog("recorded %d samples to strokes/stroke-%d.txt", samples.count, stamp)
+        // Also to the console, so an attached `devicectl --console` captures
+        // the stroke without a trip through Files.
+        NSLog("recorded %d samples to strokes/stroke-%d.txt\n--- begin stroke-%d.txt ---\n%@--- end ---", samples.count, stamp, stamp, text)
     }
 }
 
@@ -274,7 +276,14 @@ final class SketchModel {
 
     private func holdFired(stroke id: String) {
         guard live?.id == id, live?.snap == nil else { return }
-        guard let rec = recognizeShape(points: live!.modeler.points()) else { return }
+        // The pen may have wandered `holdRadius` screen points during the
+        // hold; tell the recognizer that in canvas units, with slack.
+        let zoom = Float(max(renderer?.viewport.zoom ?? 1, 0.01))
+        let radius = 1.5 * Float(holdRadius) / zoom
+        guard let rec = recognizeShape(points: live!.modeler.points(), holdRadius: radius) else {
+            NSLog("hold: no shape recognised from %d points", live!.modeler.points().count)
+            return
+        }
         live!.snap = rec
         NSLog("hold snapped to %@ (confidence %.2f)", String(describing: rec.shape), rec.confidence)
         showLive(predicted: [])

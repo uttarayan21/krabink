@@ -49,7 +49,7 @@ func createAndEdit(dir: String) throws -> (note: String, sketch: String, stroke:
         }
     }
     _ = rectModeler.push(samples: rectSamples)
-    guard let snapped = recognizeShape(points: rectModeler.points()),
+    guard let snapped = recognizeShape(points: rectModeler.points(), holdRadius: 4.5),
           case .rect = snapped.shape else { fatalError("rectangle not recognised") }
     let shapeId = try note.beginStroke(sketch: sketch, tool: .pen, color: 0xFF00_00FF, baseWidth: 3.0)
     let shape = ShapeElement(

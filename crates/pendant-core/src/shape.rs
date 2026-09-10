@@ -212,15 +212,13 @@ pub struct Recognition {
 /// or path length (`len`); angles are radians.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RecognizerParams {
-    /// A tail confined to this radius of the last point (or to
-    /// `hold_fraction` of `diag`, whichever is larger) …
+    /// A tail confined to this radius of its own centroid …
     pub hold_radius: f32,
-    /// … for at least this long is the draw-and-hold and collapses to its
-    /// centroid.
+    /// … for at least this long is the draw-and-hold and collapses to that
+    /// centroid. Callers that judge the hold themselves (the iPad: 3 screen
+    /// points) should pass their own threshold in canvas units, with some
+    /// slack; the default suits zoom 1.
     pub hold_min_ms: u32,
-    /// The hold radius grows with the stroke: the pen's stillness is judged
-    /// in screen points, so at low zoom the same hold spans more canvas.
-    pub hold_fraction: f32,
     /// A head confined to this radius of the first point is the pen-down
     /// blob and collapses to its centroid.
     pub head_radius: f32,
@@ -285,9 +283,8 @@ pub struct RecognizerParams {
 impl Default for RecognizerParams {
     fn default() -> Self {
         Self {
-            hold_radius: 3.0,
+            hold_radius: 4.5,
             hold_min_ms: 120,
-            hold_fraction: 0.04,
             head_radius: 1.5,
             min_diag: 20.0,
             samples_per_diag: 40.0,
@@ -297,13 +294,13 @@ impl Default for RecognizerParams {
             straw_threshold: 0.95,
             corner_turn: 35.0_f32.to_radians(),
             straight_ratio: 1.05,
-            closure: 0.15,
+            closure: 0.40,
             overshoot: 0.06,
             line_residual: 0.03,
             ellipse_radial_error: 0.10,
             ellipse_turn_tolerance: 0.5,
             ellipse_max_straight: 0.30,
-            ellipse_soft_corner: 60.0_f32.to_radians(),
+            ellipse_soft_corner: 70.0_f32.to_radians(),
             circle_tolerance: 0.10,
             rect_min_side: 0.15,
             rect_corner_tolerance: 20.0_f32.to_radians(),
@@ -316,21 +313,28 @@ impl Default for RecognizerParams {
             arrow_leg_max: 0.35,
             arrow_leg_angle_min: 20.0_f32.to_radians(),
             arrow_leg_angle_max: 70.0_f32.to_radians(),
-            min_confidence: 0.25,
+            min_confidence: 0.0,
         }
     }
 }
 
 /// Recognise `points` (a modelled stroke, typically
 /// [`crate::BrushModeler::points`] at hold time) with the default
-/// parameters. `None` when the stroke is not a clean enough shape.
+/// parameters. `None` when the stroke is not a clean enough shape. Callers
+/// with their own hold threshold should use [`recognize_with`] and set
+/// [`RecognizerParams::hold_radius`].
 pub fn recognize(points: &[StrokePoint]) -> Option<Recognition> {
     recognize_with(points, &RecognizerParams::default())
 }
 
 /// [`recognize`] with explicit thresholds.
 pub fn recognize_with(points: &[StrokePoint], params: &RecognizerParams) -> Option<Recognition> {
-    let trimmed = trim_holds(&dedupe(points), params);
+    let clean = dedupe(points);
+    let (Some(pen_down), Some(pen_now)) = (clean.first(), clean.last()) else {
+        return None;
+    };
+    let (pen_down, pen_now) = ([pen_down.x, pen_down.y], [pen_now.x, pen_now.y]);
+    let trimmed = trim_holds(&clean, params);
     let pts: Vec<P> = trimmed.iter().map(|p| [p.x, p.y]).collect();
     let (lo, hi) = bbox(&pts)?;
     let diag = dist(lo, hi);
@@ -343,10 +347,28 @@ pub fn recognize_with(points: &[StrokePoint], params: &RecognizerParams) -> Opti
     let r = resample(&pts, n, Closed::No);
 
     let fit = match closed_loop(&r, diag, params) {
-        Some(ring) => classify_closed(&ring, diag, params),
+        Some((ring, completed)) => classify_closed(&ring, diag, params)
+            .or_else(|| completed.and_then(|ring| classify_closed(&ring, diag, params))),
         None => classify_open(&r, len, params),
     };
     let (shape, worst) = fit?;
+    // A line runs exactly from where the pen landed to where it is held;
+    // an arrow's tail does the same at whichever end it was drawn from.
+    let shape = match shape {
+        Shape::Line { .. } => Shape::Line {
+            a: pen_down,
+            b: pen_now,
+        },
+        Shape::Arrow { a, b } => Shape::Arrow {
+            a: if dist(a, pen_down) <= dist(a, pen_now) {
+                pen_down
+            } else {
+                pen_now
+            },
+            b,
+        },
+        other => other,
+    };
     let confidence = 1.0 - worst;
     (confidence >= params.min_confidence && shape.is_finite())
         .then_some(Recognition { shape, confidence })
@@ -357,10 +379,7 @@ pub fn recognize_with(points: &[StrokePoint], params: &RecognizerParams) -> Opti
 /// Collapse the pen-down blob and the draw-and-hold tail to their centroids
 /// so neither reads as a hook or a corner.
 fn trim_holds(points: &[StrokePoint], params: &RecognizerParams) -> Vec<StrokePoint> {
-    let raw: Vec<P> = points.iter().map(|p| [p.x, p.y]).collect();
-    let diag = bbox(&raw).map_or(0.0, |(lo, hi)| dist(lo, hi));
-    let radius = params.hold_radius.max(params.hold_fraction * diag);
-    let tail = trim_tail(points, radius, params.hold_min_ms);
+    let tail = trim_tail(points, params.hold_radius, params.hold_min_ms);
     let mut reversed: Vec<StrokePoint> = tail.into_iter().rev().collect();
     reversed = trim_tail(&reversed, params.head_radius, 0);
     reversed.reverse();
@@ -373,11 +392,18 @@ fn trim_tail(points: &[StrokePoint], radius: f32, min_ms: u32) -> Vec<StrokePoin
     let Some(last) = points.last() else {
         return Vec::new();
     };
-    let held = points
-        .iter()
-        .rev()
-        .take_while(|p| dist([p.x, p.y], [last.x, last.y]) <= radius)
-        .count();
+    // The last point may sit at the edge of the jitter cloud: measure a
+    // first suffix from it, then the real one from that suffix's centroid.
+    let suffix_within = |center: P| {
+        points
+            .iter()
+            .rev()
+            .take_while(|p| dist([p.x, p.y], center) <= radius)
+            .count()
+    };
+    let rough = suffix_within([last.x, last.y]);
+    let center = centroid(&points[points.len() - rough..]).unwrap_or([last.x, last.y]);
+    let held = suffix_within(center);
     let start = points.len() - held;
     let Some(first_held) = points.get(start) else {
         return points.to_vec();
@@ -385,19 +411,27 @@ fn trim_tail(points: &[StrokePoint], radius: f32, min_ms: u32) -> Vec<StrokePoin
     if held < 2 || last.t_ms.saturating_sub(first_held.t_ms) < min_ms {
         return points.to_vec();
     }
-    let n = to_f32(held);
-    let (sx, sy) = points[start..]
-        .iter()
-        .fold((0.0, 0.0), |(sx, sy), p| (sx + p.x, sy + p.y));
+    let [x, y] = centroid(&points[start..]).unwrap_or([last.x, last.y]);
     points[..start]
         .iter()
         .copied()
         .chain([StrokePoint {
-            x: sx / n,
-            y: sy / n,
+            x,
+            y,
             ..*first_held
         }])
         .collect()
+}
+
+fn centroid(points: &[StrokePoint]) -> Option<P> {
+    if points.is_empty() {
+        return None;
+    }
+    let n = to_f32(points.len());
+    let (sx, sy) = points
+        .iter()
+        .fold((0.0, 0.0), |(sx, sy), p| (sx + p.x, sy + p.y));
+    Some([sx / n, sy / n])
 }
 
 // ---- stage 2: resampling ----
@@ -707,8 +741,11 @@ fn refine(
 // ---- stage 4: closure ----
 
 /// The ring the path traces if it closes: the path cut where its last
-/// quarter comes nearest the start, resampled evenly around the loop.
-fn closed_loop(r: &[P], diag: f32, params: &RecognizerParams) -> Option<Vec<P>> {
+/// quarter comes nearest the start, resampled evenly around the loop. The
+/// second ring, when the gap looks like a missing corner, closes through
+/// that corner instead of a straight chord; callers try it only when the
+/// chord ring fits nothing.
+fn closed_loop(r: &[P], diag: f32, params: &RecognizerParams) -> Option<(Vec<P>, Option<Vec<P>>)> {
     let (first, last) = (*r.first()?, *r.last()?);
     let n = r.len();
     let gap = dist(first, last);
@@ -731,7 +768,47 @@ fn closed_loop(r: &[P], diag: f32, params: &RecognizerParams) -> Option<Vec<P>> 
         return None;
     }
     let cut = if near < gap { cut } else { n - 1 };
-    Some(resample(r.get(..=cut)?, n, Closed::Yes))
+    let loop_pts = r.get(..=cut)?;
+    let chord = resample(loop_pts, n, Closed::Yes);
+    let completed = missing_corner(loop_pts, params).map(|corner| {
+        let mut with_corner = loop_pts.to_vec();
+        with_corner.push(corner);
+        resample(&with_corner, n, Closed::Yes)
+    });
+    Some((chord, completed))
+}
+
+/// Where a gap spans a corner (the pen started a little way along one side
+/// and stopped a little short on the neighbouring side), a straight closing
+/// chord would cut the corner diagonally. If the tangents at both ends
+/// meet at a sharp angle, within reach of each end, close through that
+/// intersection instead.
+fn missing_corner(pts: &[P], params: &RecognizerParams) -> Option<P> {
+    let w = params.straw_window;
+    let n = pts.len();
+    if n < 2 * w + 2 {
+        return None;
+    }
+    let (first, last) = (*pts.first()?, *pts.last()?);
+    let gap = dist(first, last);
+    let d_end = sub(last, *pts.get(n - 1 - w)?);
+    let d_start = sub(*pts.get(w)?, first);
+    if angle_between(d_end, d_start) < params.corner_turn {
+        return None;
+    }
+    // last + t·d_end == first - u·d_start
+    let denom = cross(d_end, d_start);
+    if denom.abs() <= f32::EPSILON {
+        return None;
+    }
+    let diff = sub(first, last);
+    let t = cross(diff, d_start) / denom;
+    let u = cross(d_end, diff) / denom;
+    let corner = add(last, scale(d_end, t));
+    let reach = 1.5 * gap;
+    // Forward from the end, backward from the start.
+    (t >= 0.0 && u >= 0.0 && dist(last, corner) <= reach && dist(first, corner) <= reach)
+        .then_some(corner)
 }
 
 // ---- stage 5: classification ----
@@ -1620,9 +1697,11 @@ mod tests {
         let mut held: Vec<StrokePoint> = (0..20).map(|i| pt(i as f32 * 2.0, 0.0, i * 8)).collect();
         held.extend((0..30).map(|i| pt(38.0 + (i % 3) as f32, (i % 2) as f32, 160 + i * 10)));
         let trimmed = trim_holds(&held, &params);
-        // The last line point (x = 38) sits within the hold radius too.
-        assert_eq!(trimmed.len(), 20, "{trimmed:?}");
-        let end = trimmed[19];
+        // The whole cloud and the slow line points inside the radius go;
+        // the run before them is untouched.
+        assert!(trimmed.len() <= 20 && trimmed.len() >= 17, "{trimmed:?}");
+        assert_eq!(trimmed[..trimmed.len() - 1], held[..trimmed.len() - 1]);
+        let end = trimmed[trimmed.len() - 1];
         assert!((end.x - 39.0).abs() < 0.5 && end.y.abs() < 0.6, "{end:?}");
 
         // A hairpin drawn in 16 ms within the same radius survives intact.
@@ -1703,6 +1782,121 @@ mod tests {
         );
     }
 
+    fn rounded_rect_ring(w: f32, h: f32, radius: f32) -> Vec<P> {
+        let (hw, hh) = (w / 2.0 - radius, h / 2.0 - radius);
+        let centers = [[hw, hh], [-hw, hh], [-hw, -hh], [hw, -hh]];
+        let mut ring = Vec::new();
+        for (k, c) in centers.iter().enumerate() {
+            for i in 0..12 {
+                let t = FRAC_PI_2 * (k as f32 + i as f32 / 12.0);
+                ring.push([c[0] + radius * t.cos(), c[1] + radius * t.sin()]);
+            }
+        }
+        ring
+    }
+
+    fn wobbly_circle_ring(r: f32, wobble: f32) -> Vec<P> {
+        (0..200)
+            .map(|i| {
+                let t = TAU * i as f32 / 200.0;
+                let rr =
+                    r * (1.0 + wobble * (2.0 * t).sin() + 0.6 * wobble * (3.0 * t + 1.0).sin());
+                [rr * t.cos(), rr * t.sin()]
+            })
+            .collect()
+    }
+
+    /// Open path around a ring: from `start` fraction for `turns` of the
+    /// perimeter (< 1 leaves a gap, > 1 overshoots).
+    fn arc_path(ring: &[P], start: f32, turns: f32) -> Vec<P> {
+        let dense = resample(ring, 400, Closed::Yes);
+        let first = (start * 400.0) as usize;
+        let count = (turns * 400.0) as usize + 1;
+        (0..count).map(|i| dense[(first + i) % 400]).collect()
+    }
+
+    /// Hand-drawn closed shapes: rounded corners, wobble, jitter, and a
+    /// gap or overshoot at the join (people rarely close a loop exactly).
+    #[test]
+    fn rough_and_unclosed_shapes_snap() {
+        let mut cases: Vec<(String, Vec<P>, f32)> = Vec::new();
+        for &radius in &[4.0, 8.0, 14.0] {
+            for &turns in &[0.88, 0.95, 1.0, 1.08] {
+                for &jitter in &[1.0, 2.5] {
+                    cases.push((
+                        format!("rect r{radius} turns{turns} j{jitter}"),
+                        arc_path(&rounded_rect_ring(160.0, 100.0, radius), 0.1, turns),
+                        jitter,
+                    ));
+                }
+            }
+        }
+        for &wobble in &[0.04, 0.08, 0.12] {
+            for &turns in &[0.85, 0.92, 1.0, 1.1] {
+                for &jitter in &[1.0, 2.5] {
+                    cases.push((
+                        format!("circle w{wobble} turns{turns} j{jitter}"),
+                        arc_path(&wobbly_circle_ring(60.0, wobble), 0.3, turns),
+                        jitter,
+                    ));
+                }
+            }
+        }
+        let params = RecognizerParams::default();
+        let mut fails = 0;
+        for (i, (name, path, jitter)) in cases.iter().enumerate() {
+            let pts = drawn(path, *jitter, 100 + i as u64);
+            let rec = recognize(&pts);
+            let got = match rec.map(|r| r.shape) {
+                Some(Shape::Rect { .. }) => "rect",
+                Some(Shape::Ellipse { .. }) => "ellipse",
+                Some(Shape::Line { .. }) => "line",
+                Some(Shape::Arrow { .. }) => "arrow",
+                None => "none",
+            };
+            let want = if name.starts_with("rect") {
+                "rect"
+            } else {
+                "ellipse"
+            };
+            if got != want {
+                fails += 1;
+                // stage info
+                let trimmed = trim_holds(&dedupe(&pts), &params);
+                let p: Vec<P> = trimmed.iter().map(|p| [p.x, p.y]).collect();
+                let (lo, hi) = bbox(&p).unwrap();
+                let diag = dist(lo, hi);
+                let len = path_length(&p);
+                let n = to_count(len / (diag / 40.0) + 1.0).clamp(16, 256);
+                let r = resample(&p, n, Closed::No);
+                match closed_loop(&r, diag, &params).map(|(ring, _)| ring) {
+                    Some(ring) => {
+                        let cc = corners_closed(&ring, &params);
+                        let turns: Vec<i32> = cc
+                            .iter()
+                            .enumerate()
+                            .map(|(i, _)| polygon_turn(&ring, &cc, i).to_degrees() as i32)
+                            .collect();
+                        let rect = if cc.len() == 4 {
+                            fit_rect(&ring, &cc, diag, &params).map(|f| f.1)
+                        } else {
+                            None
+                        };
+                        let ell = fit_ellipse(&ring, &cc, diag, &params).map(|f| f.1);
+                        eprintln!(
+                            "FAIL {name}: got {got}; closed, corners {cc:?} turns {turns:?} rect worst {rect:?} ellipse worst {ell:?}"
+                        );
+                    }
+                    None => {
+                        let gap = dist(r[0], r[r.len() - 1]) / diag;
+                        eprintln!("FAIL {name}: got {got}; OPEN gap {gap:.2}·diag");
+                    }
+                }
+            }
+        }
+        assert_eq!(fails, 0, "{fails} of {} rough shapes rejected", cases.len());
+    }
+
     // ---- properties ----
 
     fn arb_point() -> impl Strategy<Value = StrokePoint> {
@@ -1729,8 +1923,10 @@ mod tests {
                 start,
                 0.05
             )),
-            (30.0_f32..100.0, 30.0_f32..100.0, 0.0_f32..1.0).prop_map(|(a, b, start)| loop_path(
-                &ellipse_ring(a, b),
+            // Beyond about 2.5:1 the tips of an ellipse turn sharply
+            // enough across the straw window to count as corners.
+            (30.0_f32..100.0, 0.4_f32..2.5, 0.0_f32..1.0).prop_map(|(a, ratio, start)| loop_path(
+                &ellipse_ring(a, a * ratio),
                 start,
                 0.05
             )),
@@ -1777,7 +1973,13 @@ mod tests {
                 .iter()
                 .map(|p| StrokePoint { x: p.x * scale_by + dx, y: p.y * scale_by + dy, ..*p })
                 .collect();
-            let rec2 = recognize(&moved).expect("moved shape recognised");
+            // The app passes its hold threshold in canvas units, which
+            // scales with the canvas like everything else.
+            let scaled = RecognizerParams {
+                hold_radius: RecognizerParams::default().hold_radius * scale_by,
+                ..RecognizerParams::default()
+            };
+            let rec2 = recognize_with(&moved, &scaled).expect("moved shape recognised");
             let (Some(a), Some(b)) = (rec, Some(rec2)) else { unreachable!() };
             prop_assert_eq!(core::mem::discriminant(&a.shape), core::mem::discriminant(&b.shape));
             let (lo, hi) = a.shape.bounds();

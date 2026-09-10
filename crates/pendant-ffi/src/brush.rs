@@ -205,11 +205,17 @@ pub fn shape_outline_mesh(
 
 /// Snap a live stroke (`BrushModeler.points` at hold time) to a line,
 /// arrow, rectangle or ellipse; `None` when it is not drawn cleanly enough
-/// to be one.
+/// to be one. `hold_radius` is how far, in canvas units, the pen may have
+/// wandered during the hold (the caller's own stillness threshold plus
+/// slack); the tail inside it is collapsed before recognition.
 #[uniffi::export]
-pub fn recognize_shape(points: Vec<StrokePoint>) -> Option<Recognition> {
+pub fn recognize_shape(points: Vec<StrokePoint>, hold_radius: f32) -> Option<Recognition> {
     let pts: Vec<pcore::StrokePoint> = points.into_iter().map(Into::into).collect();
-    pcore::recognize(&pts).map(Into::into)
+    let params = pcore::RecognizerParams {
+        hold_radius: hold_radius.max(0.0),
+        ..pcore::RecognizerParams::default()
+    };
+    pcore::recognize_with(&pts, &params).map(Into::into)
 }
 
 #[cfg(test)]
@@ -307,7 +313,7 @@ mod tests {
             .collect();
         let m = BrushModeler::new(Tool::Pen, 4.0);
         m.push(raw);
-        let rec = recognize_shape(m.points()).expect("rectangle");
+        let rec = recognize_shape(m.points(), 4.5).expect("rectangle");
         let Shape::Rect { size, .. } = rec.shape else {
             panic!("expected a rect, got {rec:?}");
         };

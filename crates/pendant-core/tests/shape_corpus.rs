@@ -9,17 +9,22 @@
 //! …
 //! ```
 //!
+//! A `# kind: modeled` header marks points that already went through the
+//! brush model (a stroke dumped by the app at hold time); they are fed to
+//! the recognizer as they are.
+//!
 //! Name recordings by what they are (`rect-hand-03`, `letter-s-01`) and
 //! copy them in by hand; every file is asserted.
 
 use std::path::Path;
 
-use pendant_core::{BrushModeler, RawSample, Shape, Tool, recognize};
+use pendant_core::{BrushModeler, RawSample, Shape, StrokePoint, Tool, recognize};
 
 struct Case {
     expect: String,
     tool: Tool,
     size: f32,
+    modeled: bool,
     samples: Vec<RawSample>,
 }
 
@@ -27,10 +32,13 @@ fn parse(text: &str) -> Case {
     let mut expect = None;
     let mut tool = Tool::Pen;
     let mut size = 4.0;
+    let mut modeled = false;
     let mut samples = Vec::new();
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
         if let Some(rest) = line.strip_prefix("# expect:") {
             expect = Some(rest.trim().to_owned());
+        } else if let Some(rest) = line.strip_prefix("# kind:") {
+            modeled = rest.trim() == "modeled";
         } else if let Some(rest) = line.strip_prefix("# tool:") {
             let mut words = rest.split_whitespace();
             tool = words
@@ -58,6 +66,7 @@ fn parse(text: &str) -> Case {
         expect: expect.expect("# expect: header"),
         tool,
         size,
+        modeled,
         samples,
     }
 }
@@ -85,11 +94,27 @@ fn recorded_strokes_recognise_as_expected() {
     let mut failures = Vec::new();
     for path in &files {
         let case = parse(&std::fs::read_to_string(path).expect("read corpus file"));
-        let mut modeler = BrushModeler::new(case.tool, case.size);
-        for &s in &case.samples {
-            modeler.push(s);
-        }
-        let got = variant(recognize(modeler.points()).map(|r| r.shape));
+        let points: Vec<StrokePoint> = if case.modeled {
+            case.samples
+                .iter()
+                .map(|s| StrokePoint {
+                    x: s.x,
+                    y: s.y,
+                    force: s.force,
+                    // f64 -> u32 has no TryFrom; corpus timestamps are small.
+                    t_ms: s.t_ms.max(0.0) as u32, // ast-grep-ignore: no-as-cast
+                    tilt: None,
+                    size: None,
+                })
+                .collect()
+        } else {
+            let mut modeler = BrushModeler::new(case.tool, case.size);
+            for &s in &case.samples {
+                modeler.push(s);
+            }
+            modeler.points().to_vec()
+        };
+        let got = variant(recognize(&points).map(|r| r.shape));
         if got != case.expect {
             failures.push(format!(
                 "{}: expected {}, got {}",

@@ -315,3 +315,30 @@ notification.
   status line; `-recordStrokes 1` recorder (Documents shared with Files). UI
   test `testHoldSnapsToShape`.
 - **E** desktop scene diff over `note.elements()`.
+
+### Tuning after the first device session (2026-09-10)
+
+Device feedback: lines should run from the pen-down point to the held
+point; rectangles and circles were too hard to get. A synthetic matrix of
+rough closed shapes (rounded corners 4–14 pt, wobble up to 12 %, jitter to
+2.5 pt, 12–15 % of the perimeter left open or overshot) showed every
+rejection was the closure gate: a hand-drawn loop rarely closes, and a
+circle with 8 % missing already has a 0.18·diag gap. Changes:
+
+- `Shape::Line` snaps to the raw pen-down and pen-held points (an arrow's
+  tail likewise); the fit only decides whether it is a line.
+- `closure` 0.15 → 0.40·diag (a 300° arc is ~0.35, a C or U is ≥ 0.5).
+- A gap that spans a corner is closed through the intersection of the two
+  end tangents (`missing_corner`), tried only when the straight-chord ring
+  fits nothing, so open circles keep their chord.
+- `min_confidence` 0.25 → 0: the per-test thresholds gate; confidence is
+  informational.
+- The hold trim measures the tail from the cloud's centroid (the last point
+  can sit at the cloud's edge), and its radius is passed by the caller
+  (`recognize_shape(points, hold_radius)`, iPad: 1.5 × 3 pt / zoom) instead
+  of being guessed from the stroke size.
+- `ellipse_soft_corner` 60° → 70°; ellipses beyond ~2.5:1 read their tips
+  as corners and stay freehand (documented limit, proptest bounded).
+- `-recordStrokes 1` also prints each stroke to the console, and the corpus
+  accepts `# kind: modeled` files, so device strokes can be captured from an
+  attached `devicectl --console` and replayed without the brush model.
