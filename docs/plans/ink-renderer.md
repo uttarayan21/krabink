@@ -278,6 +278,13 @@ Files: `crates/pendant/src/sketch.rs`.
    the pieces will exist; only a system that feeds mouse/tablet events is
    missing.
 
+Done (commit after `e2702de`). Items 1 and 3 had already landed with
+Phase 0 (`sketch.rs` renders `stroke_mesh` for committed and wet ink; the
+render target is 1 canvas unit = 1 pixel, so `DEFAULT_TOLERANCE` is the
+right tolerance). Bevy 0.19 makes `Msaa` a required component of `Camera`
+defaulting to `Sample4`, so the offscreen camera already sampled 4x; it is
+now pinned explicitly so parity does not ride on a bevy default.
+
 ### Phase 4: cleanup
 
 - Delete `ActiveObserverGestureRecognizer`, `PKStroke` codec paths,

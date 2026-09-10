@@ -27,7 +27,8 @@ use crate::ui::EditorState;
 
 /// Wet ink lingers this long after `End` if the committed stroke never shows.
 const WET_TTL_MS: u64 = 5_000;
-/// Render-target size bounds (pixels; 1 canvas unit = 1 pixel).
+/// Render-target size bounds (pixels; 1 canvas unit = 1 pixel, which is
+/// why [`DEFAULT_TOLERANCE`] is the right cap/join flattening tolerance).
 const MIN_TARGET: u32 = 256;
 const MAX_TARGET: u32 = 2048;
 const WET_WIDTH_FALLBACK: f32 = 2.0;
@@ -292,6 +293,9 @@ fn new_scene(
                 ..default()
             },
             RenderTarget::Image(ImageRenderTarget::from(image.clone())),
+            // Pinned, not left to bevy's default: the iPad's Metal view
+            // samples 4x too, so both platforms antialias ink edges alike.
+            Msaa::Sample4,
             Projection::Orthographic(OrthographicProjection {
                 scaling_mode: ScalingMode::Fixed {
                     width: size.x as f32,
