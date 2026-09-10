@@ -21,7 +21,7 @@ pub struct NoteMeta {
 /// this device came online", not liveness.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceMeta {
-    pub id: String,
+    pub id: crate::DeviceId,
     pub name: String,
     pub platform: String,
     pub last_seen_ms: u64,
@@ -107,7 +107,7 @@ impl WorkspaceDoc {
 
     pub fn upsert_device(&self, meta: &DeviceMeta) -> Result<()> {
         let devices = self.doc.get_map(DEVICES);
-        let entry = devices.insert_container(&meta.id, LoroMap::new())?;
+        let entry = devices.insert_container(&meta.id.to_string(), LoroMap::new())?;
         entry.insert("name", meta.name.as_str())?;
         entry.insert("platform", meta.platform.as_str())?;
         entry.insert("seen", meta.last_seen_ms as i64)?;
@@ -118,8 +118,8 @@ impl WorkspaceDoc {
     /// Forget a device: every peer's list loses the row. The device
     /// re-registers itself if it connects again with a valid token; this
     /// is housekeeping, not revocation (that needs a token rotation).
-    pub fn remove_device(&self, id: &str) -> Result<()> {
-        self.doc.get_map(DEVICES).delete(id)?;
+    pub fn remove_device(&self, id: crate::DeviceId) -> Result<()> {
+        self.doc.get_map(DEVICES).delete(&id.to_string())?;
         self.doc.commit();
         Ok(())
     }
@@ -140,7 +140,7 @@ impl WorkspaceDoc {
                     _ => None,
                 };
                 Some(DeviceMeta {
-                    id: key.to_string(),
+                    id: key.parse().ok()?,
                     name: string(get("name")?)?,
                     platform: string(get("platform")?)?,
                     last_seen_ms: match get("seen")? {
@@ -211,7 +211,7 @@ mod tests {
     fn device_registry_roundtrip() {
         let a = WorkspaceDoc::new();
         let ipad = DeviceMeta {
-            id: "dev-a".into(),
+            id: crate::DeviceId::new(),
             name: "iPad".into(),
             platform: "iPad16,3".into(),
             last_seen_ms: 10,
@@ -222,7 +222,7 @@ mod tests {
         b.import_update(&a.export_updates_since(&[]).unwrap())
             .unwrap();
         let desk = DeviceMeta {
-            id: "dev-b".into(),
+            id: crate::DeviceId::new(),
             name: "desk".into(),
             platform: "linux".into(),
             last_seen_ms: 20,
@@ -239,18 +239,18 @@ mod tests {
         })
         .unwrap();
         assert_eq!(a.devices().len(), 2);
-        assert_eq!(a.devices()[0].id, "dev-a");
+        assert_eq!(a.devices()[0].id, ipad.id);
 
         // Removal syncs; removing an unknown id is a no-op, not an error.
         // Bring b up to date first: a delete concurrent with a's re-upsert
         // above would resolve by peer id, which is random per doc.
         b.import_update(&a.export_updates_since(&b.version()).unwrap())
             .unwrap();
-        b.remove_device("dev-a").unwrap();
-        b.remove_device("nope").unwrap();
+        b.remove_device(ipad.id).unwrap();
+        b.remove_device(crate::DeviceId::new()).unwrap();
         a.import_update(&b.export_updates_since(&a.version()).unwrap())
             .unwrap();
         assert_eq!(a.devices().len(), 1);
-        assert_eq!(a.devices()[0].id, "dev-b");
+        assert_eq!(a.devices()[0].id, desk.id);
     }
 }

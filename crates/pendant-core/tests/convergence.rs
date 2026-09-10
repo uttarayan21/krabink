@@ -1,7 +1,10 @@
 //! Property test: two replicas applying arbitrary interleaved edits and
 //! exchanging updates in arbitrary order always converge.
 
-use pendant_core::{NoteDoc, NoteId, PointKind, Rgba, Stroke, StrokeId, StrokePoint, Tool};
+use pendant_core::{
+    ElementId, NoteDoc, NoteId, PointKind, Rgba, Shape, ShapeElement, Stroke, StrokeId,
+    StrokePoint, Style, Tool,
+};
 use proptest::prelude::*;
 
 #[derive(Debug, Clone)]
@@ -9,6 +12,7 @@ enum Op {
     Insert { at: usize, text: String },
     Delete { at: usize, len: usize },
     AddStroke { seed: u32 },
+    AddShape { seed: u32 },
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -16,6 +20,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         (0usize..64, "[a-z #\n]{1,8}").prop_map(|(at, text)| Op::Insert { at, text }),
         (0usize..64, 1usize..8).prop_map(|(at, len)| Op::Delete { at, len }),
         (0u32..1000).prop_map(|seed| Op::AddStroke { seed }),
+        (0u32..1000).prop_map(|seed| Op::AddShape { seed }),
     ]
 }
 
@@ -58,6 +63,45 @@ fn apply(doc: &NoteDoc, sketch: pendant_core::SketchId, op: &Op) {
             )
             .unwrap();
         }
+        Op::AddShape { seed } => {
+            let s = *seed as f32;
+            let shape = match seed % 4 {
+                0 => Shape::Line {
+                    a: [s, 0.0],
+                    b: [s + 10.0, 5.0],
+                },
+                1 => Shape::Arrow {
+                    a: [0.0, s],
+                    b: [20.0, s],
+                },
+                2 => Shape::Rect {
+                    center: [s, s],
+                    size: [30.0, 20.0],
+                    angle: 0.1,
+                },
+                _ => Shape::Ellipse {
+                    center: [s, 0.0],
+                    radii: [15.0, 10.0],
+                    angle: 0.0,
+                },
+            };
+            doc.add_shape(
+                sketch,
+                &ShapeElement {
+                    id: ElementId::new(),
+                    shape,
+                    style: Style {
+                        tool: Tool::Pen,
+                        color: Rgba::BLACK,
+                        width: 2.0,
+                    },
+                    start: None,
+                    end: None,
+                    created_ms: u64::from(*seed),
+                },
+            )
+            .unwrap();
+        }
     }
 }
 
@@ -95,6 +139,6 @@ proptest! {
         }
 
         prop_assert_eq!(a.text(), b.text());
-        prop_assert_eq!(a.strokes(sketch).unwrap(), b.strokes(sketch).unwrap());
+        prop_assert_eq!(a.elements(sketch).unwrap(), b.elements(sketch).unwrap());
     }
 }

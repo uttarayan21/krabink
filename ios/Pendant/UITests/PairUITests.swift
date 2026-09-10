@@ -21,7 +21,7 @@ final class PairUITests: XCTestCase {
 
         let state = app.staticTexts["syncState"]
         expectation(
-            for: NSPredicate(format: "label == 'connected'"), evaluatedWith: state)
+            for: NSPredicate(format: "label BEGINSWITH 'connected'"), evaluatedWith: state)
         waitForExpectations(timeout: 15)
 
         // Paired device can itself share: settings shows the pairing QR and

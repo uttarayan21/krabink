@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pendant_ffi::{
-    Core, CoreListener, NoteInfo, NoteListener, PointKind, Stroke, StrokePoint, SyncState, Tool,
-    WetPoint,
+    Core, CoreListener, Element, NoteInfo, NoteListener, Point2, PointKind, Shape, ShapeElement,
+    Stroke, StrokePoint, SyncState, Tool, WetPoint,
 };
 
 fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
@@ -23,7 +23,7 @@ fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
 /// Real relay on an ephemeral port, on its own thread + runtime.
 fn start_server(dir: &std::path::Path, token: &str) -> String {
     let store = pendant_core::Store::open(&dir.join("server.redb")).unwrap();
-    let state = pendant_server::app_state(store, vec![token.to_string()]);
+    let state = pendant_server::AppState::new(store, vec![token.to_string()]);
     let (addr_tx, addr_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
@@ -33,9 +33,7 @@ fn start_server(dir: &std::path::Path, token: &str) -> String {
             .block_on(async move {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 addr_tx.send(listener.local_addr().unwrap()).unwrap();
-                axum::serve(listener, pendant_server::router(state))
-                    .await
-                    .unwrap();
+                axum::serve(listener, state.router()).await.unwrap();
             });
     });
     let addr = addr_rx.recv().unwrap();
@@ -288,6 +286,62 @@ fn two_cores_converge_through_relay() {
     assert!(
         wet.iter().any(|e| e == &format!("end:{stroke_id}")),
         "wet end missing: {wet:?}"
+    );
+
+    // A snapped shape: wet ink streams under an id, the shape commits
+    // under the same id, and B is told the sketch changed (the change
+    // detection must count shapes, not just strokes).
+    let events_before = rec_b.stroke_events.lock().unwrap().len();
+    let shape_id = note_a
+        .begin_stroke(sketch.clone(), Tool::Marker, 0xff0000ff, 5.0)
+        .unwrap();
+    note_a
+        .finish_shape(
+            sketch.clone(),
+            ShapeElement {
+                id: shape_id.clone(),
+                shape: Shape::Rect {
+                    center: Point2 { x: 50.0, y: 40.0 },
+                    size: Point2 { x: 100.0, y: 80.0 },
+                    angle: 0.0,
+                },
+                tool: Tool::Marker,
+                color: 0xff0000ff,
+                width: 5.0,
+                start: None,
+                end: None,
+                created_ms: 3,
+            },
+        )
+        .unwrap();
+    wait_for("shape reaches B", || {
+        note_b
+            .elements(sketch.clone())
+            .map(|e| e.len() == 2)
+            .unwrap_or(false)
+    });
+    let elements = note_b.elements(sketch.clone()).unwrap();
+    assert!(matches!(&elements[0], Element::Stroke(s) if s.id == stroke_id));
+    match &elements[1] {
+        Element::Shape(s) => {
+            assert_eq!(s.id, shape_id);
+            assert!(matches!(s.shape, Shape::Rect { size, .. } if size.x == 100.0));
+            assert_eq!((s.tool, s.color, s.width), (Tool::Marker, 0xff0000ff, 5.0));
+        }
+        other => panic!("expected the shape, got {other:?}"),
+    }
+    assert_eq!(note_b.strokes(sketch.clone()).unwrap().len(), 1);
+    assert!(
+        rec_b.stroke_events.lock().unwrap().len() > events_before,
+        "strokes_changed must fire for a remote shape"
+    );
+    assert!(
+        rec_b
+            .wet
+            .lock()
+            .unwrap()
+            .contains(&format!("end:{shape_id}")),
+        "wet end missing for the shape"
     );
 
     // B edits flow back to A.

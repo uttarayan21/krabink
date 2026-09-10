@@ -4,7 +4,7 @@
 
 use bevy::prelude::*;
 use bevy_egui::egui;
-use pendant_core::{DeviceMeta, PairInfo};
+use pendant_core::{DeviceId, DeviceMeta, PairInfo};
 
 use crate::sync::{LOCAL_PLATFORM, LinkKind, LinkStatus, SyncStatus, local_device_name};
 
@@ -68,7 +68,7 @@ pub enum SettingsAction {
     /// Join the workspace behind a pasted pairing URI.
     Join(PairInfo),
     /// Forget a device (by id) in the synced registry.
-    RemoveDevice(String),
+    RemoveDevice(DeviceId),
 }
 
 /// Read-only snapshot the window renders each frame; gathered by the
@@ -76,7 +76,7 @@ pub enum SettingsAction {
 pub struct SettingsView {
     pub links: Vec<LinkStatus>,
     pub mdns_name: Option<String>,
-    pub this_device: String,
+    pub this_device: DeviceId,
     pub devices: Vec<DeviceMeta>,
     pub now_ms: u64,
 }
@@ -91,7 +91,7 @@ pub struct Settings {
     join_uri: String,
     join_error: bool,
     /// Device id whose "remove" was clicked once; second click confirms.
-    pending_remove: Option<String>,
+    pending_remove: Option<DeviceId>,
 }
 
 impl Settings {
@@ -208,14 +208,14 @@ impl Settings {
                 ui.label(LOCAL_PLATFORM);
                 ui.end_row();
                 ui.label("id");
-                ui.monospace(&view.this_device);
+                ui.monospace(view.this_device.to_string());
                 ui.end_row();
             });
         ui.separator();
     }
 
     /// Returns the id of a device the user confirmed removing.
-    fn devices_section(&mut self, ui: &mut egui::Ui, view: &SettingsView) -> Option<String> {
+    fn devices_section(&mut self, ui: &mut egui::Ui, view: &SettingsView) -> Option<DeviceId> {
         ui.heading("paired devices");
         let others: Vec<&DeviceMeta> = view
             .devices
@@ -229,7 +229,7 @@ impl Settings {
         } else {
             // A row vanishing from the registry cancels its pending removal.
             if let Some(pending) = &self.pending_remove
-                && !others.iter().any(|d| &d.id == pending)
+                && !others.iter().any(|d| d.id == *pending)
             {
                 self.pending_remove = None;
             }
@@ -241,21 +241,21 @@ impl Settings {
                         ui.label(&d.name);
                         ui.label(&d.platform);
                         ui.weak(format!("seen {}", ago(view.now_ms, d.last_seen_ms)));
-                        if self.pending_remove.as_deref() == Some(d.id.as_str()) {
+                        if self.pending_remove == Some(d.id) {
                             ui.horizontal(|ui| {
                                 let confirm = egui::Button::new(
                                     egui::RichText::new("confirm remove")
                                         .color(egui::Color32::LIGHT_RED),
                                 );
                                 if ui.add(confirm).clicked() {
-                                    removed = Some(d.id.clone());
+                                    removed = Some(d.id);
                                 }
                                 if ui.small_button("cancel").clicked() {
                                     self.pending_remove = None;
                                 }
                             });
                         } else if ui.small_button("remove").clicked() {
-                            self.pending_remove = Some(d.id.clone());
+                            self.pending_remove = Some(d.id);
                         }
                         ui.end_row();
                     }

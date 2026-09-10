@@ -7,9 +7,14 @@
 
 uniffi::setup_scaffolding!("pendant");
 
+mod brush;
 mod engine;
 mod net;
 mod types;
 
+pub use brush::{BrushModeler, IndexedMesh, RawSample};
 pub use engine::{Core, CoreListener, NoteListener, NoteSession, PendantError};
-pub use types::{NoteInfo, PointKind, Stroke, StrokePoint, SyncState, Tilt, Tool, WetPoint};
+pub use types::{
+    Binding, Element, NoteInfo, Point2, PointKind, Recognition, Shape, ShapeElement, Stroke,
+    StrokePoint, SyncState, Tilt, Tool, WetPoint,
+};

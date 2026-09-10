@@ -47,9 +47,12 @@ ulid_id!(
     SketchId
 );
 ulid_id!(
-    /// Identifies a single stroke within a sketch.
-    StrokeId
+    /// Identifies one element (stroke or shape) within a sketch.
+    ElementId
 );
+/// Strokes share the element id space: a shape committed under the id its
+/// wet ink streamed with replaces that ink on every receiver.
+pub type StrokeId = ElementId;
 ulid_id!(
     /// Stable per-install identifier, used for presence and self-echo suppression.
     DeviceId

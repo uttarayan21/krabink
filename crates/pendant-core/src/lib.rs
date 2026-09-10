@@ -15,11 +15,14 @@
 //! assert_eq!(b.text(), "# shared note");
 //! ```
 
+mod brush;
+mod element;
 mod export;
 mod geom;
 mod ids;
 mod note;
 mod pair;
+mod shape;
 mod store;
 mod stroke;
 mod sync;
@@ -27,14 +30,14 @@ mod sync_doc;
 mod wetink;
 mod workspace;
 
-pub use export::{ExportAsset, ExportBundle, SKETCH_URI_PREFIX, strokes_to_svg};
-pub use geom::{
-    RibbonMesh, flatten_stroke, hits, nib_ribbon, ribbon, ribbon_for, ribbon_outline,
-    ribbon_triangles,
-};
-pub use ids::{DeviceId, NoteId, SketchId, StrokeId};
+pub use brush::{BrushModeler, BrushParams, RawSample};
+pub use element::{Binding, Element, ShapeElement, Style};
+pub use export::{ExportAsset, ExportBundle, SKETCH_URI_PREFIX, elements_to_svg};
+pub use geom::{DEFAULT_TOLERANCE, StrokeMesh, hits, stroke_mesh};
+pub use ids::{DeviceId, ElementId, NoteId, SketchId, StrokeId};
 pub use note::NoteDoc;
 pub use pair::PairInfo;
+pub use shape::{Recognition, RecognizerParams, Shape, recognize, recognize_with};
 pub use store::{DocKey, Flush, Store, StoredDoc};
 pub use stroke::{
     PointKind, PointSize, Rgba, Stroke, StrokePoint, Tilt, Tool, decode_chunks, encode_chunks,

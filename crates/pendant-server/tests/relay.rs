@@ -116,14 +116,12 @@ impl TestClient {
 async fn spawn_server() -> u16 {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("server.redb")).unwrap();
-    let state = pendant_server::app_state(store, vec![TOKEN.into()]);
+    let state = pendant_server::AppState::new(store, vec![TOKEN.into()]);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         let _dir = dir; // keep the store's tempdir alive for the whole test
-        axum::serve(listener, pendant_server::router(state))
-            .await
-            .unwrap();
+        axum::serve(listener, state.router()).await.unwrap();
     });
     port
 }

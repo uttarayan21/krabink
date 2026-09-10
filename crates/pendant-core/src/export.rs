@@ -1,5 +1,5 @@
 //! Markdown export: rewrites `pendant://sketch/<id>` image URIs to relative
-//! SVG assets and renders each referenced sketch's strokes to SVG.
+//! SVG assets and renders each referenced sketch's elements to SVG.
 //!
 //! The markdown is rewritten by plain string substitution rather than a
 //! parse-and-reserialize pass, so the exported source is byte-identical to
@@ -7,8 +7,8 @@
 
 use std::fmt::Write as _;
 
+use crate::element::Element;
 use crate::note::NoteDoc;
-use crate::stroke::Stroke;
 use crate::{Result, SketchId};
 
 pub const SKETCH_URI_PREFIX: &str = "pendant://sketch/";
@@ -55,7 +55,7 @@ impl NoteDoc {
                     {
                         assets.push(ExportAsset {
                             file_name,
-                            svg: strokes_to_svg(&self.strokes(id)?),
+                            svg: elements_to_svg(&self.elements(id)?),
                         });
                     }
                     rest = &after_prefix[ULID_LEN..];
@@ -73,13 +73,19 @@ impl NoteDoc {
     }
 }
 
-/// Render strokes to a standalone SVG document.
+/// Render elements to a standalone SVG document.
 ///
-/// v1 renders each stroke as a fixed-width polyline path (width scaled by the
-/// stroke's mean pressure); pressure-varying outlines come with the desktop
-/// tessellator.
-pub fn strokes_to_svg(strokes: &[Stroke]) -> String {
-    let points = strokes.iter().flat_map(|s| &s.points);
+/// Each element's outline becomes a fixed-width polyline path; a stroke's
+/// width is scaled by its mean pressure, a shape's outline carries full
+/// pressure so it gets the element's width. Pressure-varying outlines
+/// would need the tessellator's mesh.
+pub fn elements_to_svg(elements: &[Element]) -> String {
+    let outlines: Vec<(&Element, Vec<crate::StrokePoint>)> = elements
+        .iter()
+        .map(|el| (el, el.outline()))
+        .filter(|(_, pts)| !pts.is_empty())
+        .collect();
+    let points = outlines.iter().flat_map(|(_, pts)| pts);
     let (min_x, min_y, max_x, max_y) = points.fold(
         (f32::MAX, f32::MAX, f32::MIN, f32::MIN),
         |(min_x, min_y, max_x, max_y), p| {
@@ -91,8 +97,7 @@ pub fn strokes_to_svg(strokes: &[Stroke]) -> String {
             )
         },
     );
-    let empty = strokes.iter().all(|s| s.points.is_empty());
-    let (min_x, min_y, max_x, max_y) = if empty {
+    let (min_x, min_y, max_x, max_y) = if outlines.is_empty() {
         (0.0, 0.0, 1.0, 1.0)
     } else {
         (
@@ -110,14 +115,15 @@ pub fn strokes_to_svg(strokes: &[Stroke]) -> String {
     );
     svg.push('\n');
 
-    for stroke in strokes.iter().filter(|s| !s.points.is_empty()) {
-        let mean_force =
-            stroke.points.iter().map(|p| p.force).sum::<f32>() / stroke.points.len() as f32;
-        let width = (stroke.base_width * mean_force.clamp(0.3, 1.0)).max(0.1);
-        let [r, g, b, a] = stroke.color.0;
+    for (el, pts) in &outlines {
+        // usize -> f32 has no `From`; a point count is exact in f32.
+        let count = pts.len() as f32; // ast-grep-ignore: no-as-cast
+        let mean_force = pts.iter().map(|p| p.force).sum::<f32>() / count;
+        let width = (el.base_width() * mean_force.clamp(0.3, 1.0)).max(0.1);
+        let [r, g, b, a] = el.color().0;
 
         let mut d = String::new();
-        for (i, p) in stroke.points.iter().enumerate() {
+        for (i, p) in pts.iter().enumerate() {
             let cmd = if i == 0 { 'M' } else { 'L' };
             write!(d, "{cmd}{x} {y} ", x = p.x, y = p.y).expect("string write");
         }
@@ -137,8 +143,10 @@ pub fn strokes_to_svg(strokes: &[Stroke]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stroke::{PointKind, Rgba, StrokePoint, Tool};
-    use crate::{NoteId, StrokeId};
+    use crate::element::{ShapeElement, Style};
+    use crate::shape::Shape;
+    use crate::stroke::{PointKind, Rgba, Stroke, StrokePoint, Tool};
+    use crate::{ElementId, NoteId, StrokeId};
 
     #[test]
     fn export_rewrites_known_sketch_uris_only() {
@@ -174,6 +182,26 @@ mod tests {
             },
         )
         .unwrap();
+        note.add_shape(
+            sketch,
+            &ShapeElement {
+                id: ElementId::new(),
+                shape: Shape::Rect {
+                    center: [50.0, 50.0],
+                    size: [40.0, 20.0],
+                    angle: 0.0,
+                },
+                style: Style {
+                    tool: Tool::Pen,
+                    color: Rgba([255, 0, 0, 255]),
+                    width: 3.0,
+                },
+                start: None,
+                end: None,
+                created_ms: 0,
+            },
+        )
+        .unwrap();
 
         let missing = SketchId::new();
         note.splice_text(
@@ -197,6 +225,11 @@ mod tests {
                 .contains(&format!("![m]({SKETCH_URI_PREFIX}{missing})"))
         );
         assert_eq!(bundle.assets.len(), 1);
-        assert!(bundle.assets[0].svg.contains("<path"));
+        let svg = &bundle.assets[0].svg;
+        assert_eq!(svg.matches("<path").count(), 2);
+        // The rect's five outline points at full width, in its colour.
+        assert!(svg.contains(r#"stroke="rgb(255 0 0)""#), "{svg}");
+        assert!(svg.contains(r#"stroke-width="3""#), "{svg}");
+        assert!(svg.contains("M30 40 L70 40 L70 60 L30 60 L30 40"), "{svg}");
     }
 }

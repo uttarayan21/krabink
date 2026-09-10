@@ -1,12 +1,11 @@
 mod errors;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::Parser;
 use errors::{Error, Result, ResultExt};
 use pendant_core::Store;
-use pendant_server::app_state;
+use pendant_server::AppState;
 
 #[derive(Debug, clap::Parser)]
 #[clap(version, about = "pendant sync relay")]
@@ -88,9 +87,9 @@ async fn main() -> Result<()> {
         .change_context(Error)
         .attach_with(|| format!("opening store {}", config.db.display()))?;
 
-    let state = app_state(store, config.tokens);
+    let state = AppState::new(store, config.tokens);
 
-    let maintenance = tokio::spawn(pendant_server::maintenance(Arc::clone(&state.docs)));
+    let maintenance = tokio::spawn(state.clone().maintenance());
 
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
@@ -98,7 +97,7 @@ async fn main() -> Result<()> {
         .attach_with(|| format!("binding {}", config.listen))?;
     tracing::info!(listen = %config.listen, "pendant-server up");
 
-    axum::serve(listener, pendant_server::router(state.clone()))
+    axum::serve(listener, state.router())
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
@@ -107,7 +106,8 @@ async fn main() -> Result<()> {
 
     maintenance.abort();
     // Final durable checkpoint before exit.
-    pendant_server::checkpoint(&state)
+    state
+        .checkpoint()
         .change_context(Error)
         .attach("final checkpoint")?;
     Ok(())

@@ -19,11 +19,22 @@ targets:
       - package: PendantCore
     # Explicit Info.plist (instead of GENERATE_INFOPLIST_FILE) because the
     # pairing QR flow registers the pendant:// URL scheme, which has no
-    # INFOPLIST_KEY_ build setting. Xcode still merges the INFOPLIST_KEY_
-    # settings below into the final plist.
+    # INFOPLIST_KEY_ build setting. With an explicit plist Xcode does NOT
+    # merge INFOPLIST_KEY_ settings, so everything must be listed here.
+    # Without UILaunchScreen iPadOS runs the app letterboxed in a scaled
+    # compatibility mode.
     info:
       path: Info.plist
       properties:
+        UILaunchScreen: {}
+        # Documents visible in Files, for `-recordStrokes 1` recordings.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
         CFBundleURLTypes:
           - CFBundleURLName: dev.darksailor.pendant.pair
             CFBundleURLSchemes: [pendant]
@@ -36,12 +47,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.darksailor.pendant
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
         # iPad-first, but runs on iPhone too for cheap simulator checks.
         TARGETED_DEVICE_FAMILY: "1,2"
-        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: >-
-          UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown
-          UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
   PendantUITests:
     type: bundle.ui-testing
     platform: iOS

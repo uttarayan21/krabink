@@ -3,7 +3,7 @@
 //! exposed to egui through a custom `pendant://` texture loader so the
 //! markdown preview embeds it inline.
 //!
-//! Committed CRDT strokes become ribbon meshes; wet ink from the ephemeral
+//! Committed CRDT strokes become ink meshes; wet ink from the ephemeral
 //! channel renders as provisional meshes on top and is dropped once the
 //! authoritative stroke lands (or after a timeout).
 
@@ -18,8 +18,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::TextureUsages;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, EguiUserTextures, egui};
 use pendant_core::{
-    DocKey, PointSize, Rgba, SKETCH_URI_PREFIX, SketchId, StrokeId, StrokePoint, Tilt, Tool,
-    WetInk, WetPoint, flatten_stroke, ribbon_for,
+    DEFAULT_TOLERANCE, DocKey, Element, PointSize, Rgba, SKETCH_URI_PREFIX, SketchId, StrokeId,
+    StrokePoint, Tilt, Tool, WetInk, WetPoint, stroke_mesh,
 };
 
 use crate::docs::{Docs, now_ms};
@@ -27,7 +27,8 @@ use crate::ui::EditorState;
 
 /// Wet ink lingers this long after `End` if the committed stroke never shows.
 const WET_TTL_MS: u64 = 5_000;
-/// Render-target size bounds (pixels; 1 canvas unit = 1 pixel).
+/// Render-target size bounds (pixels; 1 canvas unit = 1 pixel, which is
+/// why [`DEFAULT_TOLERANCE`] is the right cap/join flattening tolerance).
 const MIN_TARGET: u32 = 256;
 const MAX_TARGET: u32 = 2048;
 const WET_WIDTH_FALLBACK: f32 = 2.0;
@@ -62,7 +63,7 @@ struct SketchScene {
     image: Handle<Image>,
     camera: Entity,
     size: UVec2,
-    /// Committed stroke id → mesh entity (`None` for strokes with no ink).
+    /// Committed element id → mesh entity (`None` for elements with no ink).
     strokes: HashMap<StrokeId, Option<Entity>>,
 }
 
@@ -168,18 +169,21 @@ fn sync_sketch_scenes(
     };
 
     for sketch in note.sketch_ids() {
-        let strokes = match note.strokes(sketch) {
-            Ok(strokes) => strokes,
+        let elements = match note.elements(sketch) {
+            Ok(elements) => elements,
             Err(err) => {
-                tracing::error!(%err, %sketch, "reading strokes failed");
+                tracing::error!(%err, %sketch, "reading elements failed");
                 continue;
             }
         };
+        // Strokes and shapes alike render their outline.
+        let outlines: Vec<(&Element, Vec<StrokePoint>)> =
+            elements.iter().map(|el| (el, el.outline())).collect();
 
         // Content bounds decide the render-target size.
-        let max = strokes
+        let max = outlines
             .iter()
-            .flat_map(|s| &s.points)
+            .flat_map(|(_, pts)| pts)
             .fold((0.0f32, 0.0f32), |(mx, my), p| (mx.max(p.x), my.max(p.y)));
         let desired = UVec2::new(target_extent(max.0), target_extent(max.1));
 
@@ -218,26 +222,27 @@ fn sync_sketch_scenes(
             };
         }
 
-        // Diff committed strokes.
+        // Diff committed elements.
         let mut stale: HashMap<_, _> = scene.strokes.clone();
-        for (z, stroke) in strokes.iter().enumerate() {
-            if stale.remove(&stroke.id).is_some() {
+        for (z, (element, outline)) in outlines.iter().enumerate() {
+            let id = element.id();
+            if stale.remove(&id).is_some() {
                 continue;
             }
-            let flat = flatten_stroke(stroke);
-            let entity = ribbon_mesh(stroke.tool, &flat, stroke.base_width).map(|mesh| {
+            let entity = ink_mesh(element.tool(), outline, element.base_width()).map(|mesh| {
                 commands
                     .spawn((
                         Mesh2d(meshes.add(mesh)),
-                        MeshMaterial2d(materials.add(color_of(stroke.color))),
+                        MeshMaterial2d(materials.add(color_of(element.color()))),
                         Transform::from_xyz(0.0, 0.0, z as f32 * 0.01),
                         RenderLayers::layer(scene.layer),
                     ))
                     .id()
             });
-            scene.strokes.insert(stroke.id, entity);
-            // Committed stroke replaces its wet-ink preview.
-            if let Some(wet) = scenes.wet.remove(&stroke.id)
+            scene.strokes.insert(id, entity);
+            // A committed element (stroke or snapped shape) replaces its
+            // wet-ink preview.
+            if let Some(wet) = scenes.wet.remove(&id)
                 && let Some(entity) = wet.entity
             {
                 commands.entity(entity).despawn();
@@ -292,6 +297,9 @@ fn new_scene(
                 ..default()
             },
             RenderTarget::Image(ImageRenderTarget::from(image.clone())),
+            // Pinned, not left to bevy's default: the iPad's Metal view
+            // samples 4x too, so both platforms antialias ink edges alike.
+            Msaa::Sample4,
             Projection::Orthographic(OrthographicProjection {
                 scaling_mode: ScalingMode::Fixed {
                     width: size.x as f32,
@@ -323,26 +331,22 @@ fn color_of(rgba: Rgba) -> ColorMaterial {
     ColorMaterial::from(Color::srgba_u8(r, g, b, a))
 }
 
-/// Canvas-space ribbon → bevy mesh (y flipped into bevy's y-up space).
+/// Canvas-space stroke mesh → bevy mesh (y flipped into bevy's y-up space).
 /// `None` when there is nothing to draw: bevy's mesh allocator never
 /// allocates a zero-vertex mesh but still tries to upload it, logging a
 /// "Use-after-free" error every frame the mesh is extracted.
-fn ribbon_mesh(tool: Tool, points: &[StrokePoint], base_width: f32) -> Option<Mesh> {
-    let ribbon = ribbon_for(tool, points, base_width);
-    if ribbon.positions.is_empty() {
+fn ink_mesh(tool: Tool, points: &[StrokePoint], base_width: f32) -> Option<Mesh> {
+    let ink = stroke_mesh(tool, points, base_width, DEFAULT_TOLERANCE);
+    if ink.is_empty() {
         return None;
     }
-    let positions: Vec<[f32; 3]> = ribbon
-        .positions
-        .iter()
-        .map(|[x, y]| [*x, -*y, 0.0])
-        .collect();
+    let positions: Vec<[f32; 3]> = ink.positions.iter().map(|[x, y]| [*x, -*y, 0.0]).collect();
     let mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
     )
     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_indices(Indices::U32(ribbon.indices));
+    .with_inserted_indices(Indices::U32(ink.indices));
     Some(mesh)
 }
 
@@ -430,8 +434,7 @@ fn apply_wet_ink(
                         size: p.width.map(|w| PointSize { w, h: w }),
                     })
                     .collect();
-                let Some(mesh) =
-                    ribbon_mesh(wet.tool, &flat, wet.base_width.max(WET_WIDTH_FALLBACK))
+                let Some(mesh) = ink_mesh(wet.tool, &flat, wet.base_width.max(WET_WIDTH_FALLBACK))
                 else {
                     continue; // nothing drawable yet
                 };

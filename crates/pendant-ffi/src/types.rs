@@ -68,6 +68,26 @@ pub struct Tilt {
     pub roll: f32,
 }
 
+impl From<Tilt> for pcore::Tilt {
+    fn from(t: Tilt) -> Self {
+        Self {
+            azimuth: t.azimuth,
+            altitude: t.altitude,
+            roll: t.roll,
+        }
+    }
+}
+
+impl From<pcore::Tilt> for Tilt {
+    fn from(t: pcore::Tilt) -> Self {
+        Self {
+            azimuth: t.azimuth,
+            altitude: t.altitude,
+            roll: t.roll,
+        }
+    }
+}
+
 /// Rendered point size in canvas units (PencilKit `PKStrokePoint.size`).
 /// PencilKit derives it from more than force, so strokes drop fidelity
 /// without it.
@@ -96,11 +116,7 @@ impl From<StrokePoint> for pcore::StrokePoint {
             y: p.y,
             force: p.force,
             t_ms: p.t_ms,
-            tilt: p.tilt.map(|t| pcore::Tilt {
-                roll: t.roll,
-                azimuth: t.azimuth,
-                altitude: t.altitude,
-            }),
+            tilt: p.tilt.map(Into::into),
             size: p.size.map(|s| pcore::PointSize { w: s.w, h: s.h }),
         }
     }
@@ -113,11 +129,7 @@ impl From<pcore::StrokePoint> for StrokePoint {
             y: p.y,
             force: p.force,
             t_ms: p.t_ms,
-            tilt: p.tilt.map(|t| Tilt {
-                roll: t.roll,
-                azimuth: t.azimuth,
-                altitude: t.altitude,
-            }),
+            tilt: p.tilt.map(Into::into),
             size: p.size.map(|s| PointSize { w: s.w, h: s.h }),
         }
     }
@@ -134,6 +146,30 @@ pub struct WetPoint {
     pub width: Option<f32>,
     /// Flat-nib orientation (azimuth + roll, radians) for nib tools.
     pub nib: Option<f32>,
+}
+
+impl From<pcore::WetPoint> for WetPoint {
+    fn from(p: pcore::WetPoint) -> Self {
+        Self {
+            x: p.x,
+            y: p.y,
+            force: p.force,
+            width: p.width,
+            nib: p.nib,
+        }
+    }
+}
+
+impl From<WetPoint> for pcore::WetPoint {
+    fn from(p: WetPoint) -> Self {
+        Self {
+            x: p.x,
+            y: p.y,
+            force: p.force,
+            width: p.width,
+            nib: p.nib,
+        }
+    }
 }
 
 /// A finished stroke, as stored in the CRDT.
@@ -167,55 +203,7 @@ impl From<Stroke> for pcore::Stroke {
 }
 
 /// Renderers fall back to this width for wet ink whose points carry none.
-const WET_WIDTH_FALLBACK: f32 = 2.0;
-
-/// The committed stroke's ink as consistently wound triangles, flat
-/// `[x0, y0, x1, y1, x2, y2, …]` in canvas units. Fill with the non-zero
-/// rule. This is the desktop's exact geometry, so both platforms draw the
-/// same ink.
-#[uniffi::export]
-pub fn stroke_triangles(stroke: Stroke) -> Vec<f32> {
-    let stroke = pcore::Stroke::from(stroke);
-    let flat = pcore::flatten_stroke(&stroke);
-    flatten_xy(pcore::ribbon_triangles(
-        stroke.tool,
-        &flat,
-        stroke.base_width,
-    ))
-}
-
-/// The committed stroke's ink as one closed outline polygon, flat
-/// `[x0, y0, x1, y1, …]`. Same geometry as [`stroke_triangles`] but a single
-/// boundary, so path fillers antialias it cleanly. Fill non-zero.
-#[uniffi::export]
-pub fn stroke_outline(stroke: Stroke) -> Vec<f32> {
-    let stroke = pcore::Stroke::from(stroke);
-    let flat = pcore::flatten_stroke(&stroke);
-    flatten_xy(pcore::ribbon_outline(stroke.tool, &flat, stroke.base_width))
-}
-
-/// Provisional (wet) ink outline for the points received so far.
-#[uniffi::export]
-pub fn wet_outline(points: Vec<WetPoint>, tool: Tool, base_width: f32) -> Vec<f32> {
-    let flat: Vec<pcore::StrokePoint> = points.iter().map(wet_to_stroke_point).collect();
-    flatten_xy(pcore::ribbon_outline(
-        tool.into(),
-        &flat,
-        base_width.max(WET_WIDTH_FALLBACK),
-    ))
-}
-
-/// Provisional (wet) ink for the points received so far, same geometry
-/// as [`stroke_triangles`].
-#[uniffi::export]
-pub fn wet_triangles(points: Vec<WetPoint>, tool: Tool, base_width: f32) -> Vec<f32> {
-    let flat: Vec<pcore::StrokePoint> = points.iter().map(wet_to_stroke_point).collect();
-    flatten_xy(pcore::ribbon_triangles(
-        tool.into(),
-        &flat,
-        base_width.max(WET_WIDTH_FALLBACK),
-    ))
-}
+pub(crate) const WET_WIDTH_FALLBACK: f32 = 2.0;
 
 pub(crate) fn wet_to_stroke_point(p: &WetPoint) -> pcore::StrokePoint {
     pcore::StrokePoint {
@@ -232,10 +220,6 @@ pub(crate) fn wet_to_stroke_point(p: &WetPoint) -> pcore::StrokePoint {
         }),
         size: p.width.map(|w| pcore::PointSize { w, h: w }),
     }
-}
-
-fn flatten_xy(tris: Vec<[f32; 2]>) -> Vec<f32> {
-    tris.into_iter().flatten().collect()
 }
 
 impl From<pcore::Stroke> for Stroke {
@@ -265,7 +249,7 @@ pub struct DeviceInfo {
 impl From<pcore::DeviceMeta> for DeviceInfo {
     fn from(m: pcore::DeviceMeta) -> Self {
         Self {
-            id: m.id,
+            id: m.id.to_string(),
             name: m.name,
             platform: m.platform,
             last_seen_ms: m.last_seen_ms,
@@ -365,4 +349,257 @@ pub(crate) fn rgba_from_u32(v: u32) -> pcore::Rgba {
 
 pub(crate) fn rgba_to_u32(c: pcore::Rgba) -> u32 {
     u32::from_be_bytes(c.0)
+}
+
+// ---- elements ----
+
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct Point2 {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl From<[f32; 2]> for Point2 {
+    fn from([x, y]: [f32; 2]) -> Self {
+        Self { x, y }
+    }
+}
+
+impl From<Point2> for [f32; 2] {
+    fn from(p: Point2) -> Self {
+        [p.x, p.y]
+    }
+}
+
+/// A recognised primitive in canvas space (x right, y down).
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Enum)]
+pub enum Shape {
+    Line {
+        a: Point2,
+        b: Point2,
+    },
+    /// Head at `b`.
+    Arrow {
+        a: Point2,
+        b: Point2,
+    },
+    /// Full `size` rotated by `angle` radians about `center`.
+    Rect {
+        center: Point2,
+        size: Point2,
+        angle: f32,
+    },
+    /// Half axes `radii` rotated by `angle` radians about `center`.
+    Ellipse {
+        center: Point2,
+        radii: Point2,
+        angle: f32,
+    },
+}
+
+impl From<pcore::Shape> for Shape {
+    fn from(s: pcore::Shape) -> Self {
+        match s {
+            pcore::Shape::Line { a, b } => Self::Line {
+                a: a.into(),
+                b: b.into(),
+            },
+            pcore::Shape::Arrow { a, b } => Self::Arrow {
+                a: a.into(),
+                b: b.into(),
+            },
+            pcore::Shape::Rect {
+                center,
+                size,
+                angle,
+            } => Self::Rect {
+                center: center.into(),
+                size: size.into(),
+                angle,
+            },
+            pcore::Shape::Ellipse {
+                center,
+                radii,
+                angle,
+            } => Self::Ellipse {
+                center: center.into(),
+                radii: radii.into(),
+                angle,
+            },
+        }
+    }
+}
+
+impl From<Shape> for pcore::Shape {
+    fn from(s: Shape) -> Self {
+        match s {
+            Shape::Line { a, b } => Self::Line {
+                a: a.into(),
+                b: b.into(),
+            },
+            Shape::Arrow { a, b } => Self::Arrow {
+                a: a.into(),
+                b: b.into(),
+            },
+            Shape::Rect {
+                center,
+                size,
+                angle,
+            } => Self::Rect {
+                center: center.into(),
+                size: size.into(),
+                angle,
+            },
+            Shape::Ellipse {
+                center,
+                radii,
+                angle,
+            } => Self::Ellipse {
+                center: center.into(),
+                radii: radii.into(),
+                angle,
+            },
+        }
+    }
+}
+
+/// A snapped shape and how cleanly it was drawn, 0 (barely) ..= 1.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct Recognition {
+    pub shape: Shape,
+    pub confidence: f32,
+}
+
+impl From<pcore::Recognition> for Recognition {
+    fn from(r: pcore::Recognition) -> Self {
+        Self {
+            shape: r.shape.into(),
+            confidence: r.confidence,
+        }
+    }
+}
+
+/// A line or arrow end attached to another element (Excalidraw
+/// `fixedPoint`): `fixed_point` in the target's unit square, `gap` the
+/// distance kept from its outline. Reserved; v1 never writes one.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct Binding {
+    pub element: String,
+    pub fixed_point: Point2,
+    pub gap: f32,
+}
+
+impl From<pcore::Binding> for Binding {
+    fn from(b: pcore::Binding) -> Self {
+        Self {
+            element: b.element.to_string(),
+            fixed_point: b.fixed_point.into(),
+            gap: b.gap,
+        }
+    }
+}
+
+impl TryFrom<Binding> for pcore::Binding {
+    type Error = pcore::Error;
+
+    fn try_from(b: Binding) -> Result<Self, Self::Error> {
+        Ok(Self {
+            element: b.element.parse()?,
+            fixed_point: b.fixed_point.into(),
+            gap: b.gap,
+        })
+    }
+}
+
+/// A recognised shape as stored: geometry plus the ink style a stroke
+/// would carry.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct ShapeElement {
+    /// ULID string; the id its wet ink streamed under, so receivers swap
+    /// the provisional ink for the shape.
+    pub id: String,
+    pub shape: Shape,
+    pub tool: Tool,
+    /// RGBA8 packed big-endian: 0xRRGGBBAA.
+    pub color: u32,
+    /// Full ink width in canvas units.
+    pub width: f32,
+    pub start: Option<Binding>,
+    pub end: Option<Binding>,
+    /// Unix millis at creation.
+    pub created_ms: u64,
+}
+
+impl From<pcore::ShapeElement> for ShapeElement {
+    fn from(s: pcore::ShapeElement) -> Self {
+        Self {
+            id: s.id.to_string(),
+            shape: s.shape.into(),
+            tool: s.style.tool.into(),
+            color: rgba_to_u32(s.style.color),
+            width: s.style.width,
+            start: s.start.map(Into::into),
+            end: s.end.map(Into::into),
+            created_ms: s.created_ms,
+        }
+    }
+}
+
+impl From<ShapeElement> for pcore::ShapeElement {
+    fn from(s: ShapeElement) -> Self {
+        Self {
+            id: s.id.parse().unwrap_or_else(|_| pcore::ElementId::new()),
+            shape: s.shape.into(),
+            style: pcore::Style {
+                tool: s.tool.into(),
+                color: rgba_from_u32(s.color),
+                width: s.width,
+            },
+            // A binding to an unparsable id is no binding.
+            start: s.start.and_then(|b| b.try_into().ok()),
+            end: s.end.and_then(|b| b.try_into().ok()),
+            created_ms: s.created_ms,
+        }
+    }
+}
+
+/// One entry of a sketch's z-ordered element list.
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum Element {
+    Stroke(Stroke),
+    Shape(ShapeElement),
+}
+
+impl Element {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Stroke(s) => &s.id,
+            Self::Shape(s) => &s.id,
+        }
+    }
+
+    pub fn color(&self) -> u32 {
+        match self {
+            Self::Stroke(s) => s.color,
+            Self::Shape(s) => s.color,
+        }
+    }
+}
+
+impl From<pcore::Element> for Element {
+    fn from(e: pcore::Element) -> Self {
+        match e {
+            pcore::Element::Stroke(s) => Self::Stroke(s.into()),
+            pcore::Element::Shape(s) => Self::Shape(s.into()),
+        }
+    }
+}
+
+impl From<Element> for pcore::Element {
+    fn from(e: Element) -> Self {
+        match e {
+            Element::Stroke(s) => Self::Stroke(s.into()),
+            Element::Shape(s) => Self::Shape(s.into()),
+        }
+    }
 }

@@ -384,11 +384,7 @@ fn apply_effects(
                 }
                 // Announce this device in the synced registry so peers
                 // (e.g. the iPad's settings screen) can list it.
-                match docs.register_device(
-                    &device.to_string(),
-                    &local_device_name(),
-                    LOCAL_PLATFORM,
-                ) {
+                match docs.register_device(device, &local_device_name(), LOCAL_PLATFORM) {
                     Ok(payload) if !payload.is_empty() => {
                         let session = link.session.as_mut().expect("just connected");
                         let effects = session.local_update(DocKey::WORKSPACE, payload);

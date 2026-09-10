@@ -30,6 +30,7 @@ directories = "6"
 proptest = "1"
 tempfile = "3"
 uniffi = "0.32"
+lyon_tessellation = "1.0"
 pendant-core = { path = "crates/pendant-core" }
 pendant-server = { path = "crates/pendant-server" }
 

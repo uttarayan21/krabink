@@ -58,12 +58,15 @@ impl core::str::FromStr for Tool {
     }
 }
 
-/// What the stored points describe.
+/// What the stored points describe. Every stroke authored since the
+/// canvas took over input from PencilKit is `PolylineSample` (the output
+/// of `BrushModeler`); `BSplineControl` only exists in older data and is
+/// still flattened and rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PointKind {
-    /// Control points of PencilKit's uniform cubic B-spline (authoritative).
+    /// Control points of PencilKit's uniform cubic B-spline (legacy).
     BSplineControl,
-    /// Raw polyline samples (live capture, or non-PencilKit authors).
+    /// Modelled polyline samples, each carrying its rendered width.
     PolylineSample,
 }
 

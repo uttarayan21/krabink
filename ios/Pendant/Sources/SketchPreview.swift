@@ -3,9 +3,8 @@
 // 1:1 view↔CRDT text mapping, so attachments live only here in preview.
 //
 // Each `![alt](pendant://sketch/<id>)` token becomes an NSTextAttachment
-// rendered from the sketch's committed strokes; tapping it opens the canvas.
+// rendered from the sketch's committed elements; tapping it opens the canvas.
 
-import PencilKit
 import PendantCore
 import SwiftUI
 import UIKit
@@ -66,7 +65,7 @@ struct SketchPreview: UIViewRepresentable {
 
         private func thumbnailsStale(_ model: NoteModel) -> Bool {
             links.contains { link in
-                let count = (try? model.session.strokes(sketch: link.id))?.count ?? 0
+                let count = (try? model.session.elements(sketch: link.id))?.count ?? 0
                 return thumbCache[link.id]?.count != count
             }
         }
@@ -109,29 +108,36 @@ struct SketchPreview: UIViewRepresentable {
                 ])
         }
 
-        /// Render committed strokes to a bounded thumbnail from the core's
-        /// ribbon triangles — the same ink the canvas and the desktop show.
+        /// Render committed elements to a bounded thumbnail from the core's
+        /// element mesh — the same ink the canvas draws. The triangles are
+        /// filled without antialiasing (adjacent antialiased triangles leave
+        /// seams) at double resolution, so the downscale into the frame
+        /// smooths the edges instead.
         /// Empty sketch → a placeholder box.
         private func thumbnail(id: String, model: NoteModel) -> UIImage {
-            let strokes = (try? model.session.strokes(sketch: id)) ?? []
-            if let cached = thumbCache[id], cached.count == strokes.count {
+            let elements = (try? model.session.elements(sketch: id)) ?? []
+            if let cached = thumbCache[id], cached.count == elements.count {
                 return cached.image
             }
             let maxSide: CGFloat = 240
             let image: UIImage
-            if strokes.isEmpty {
+            if elements.isEmpty {
                 image = placeholder(size: CGSize(width: maxSide, height: 120))
             } else {
-                let shapes = strokes.map { stroke in
-                    (InkView.polygon(strokeOutline(stroke: stroke)), StrokeCodec.unpack(stroke.color))
+                let tolerance = defaultTolerance()
+                let shapes = elements.map { element in
+                    (elementMesh(element: element, tolerance: tolerance).cgPath, StrokeCodec.unpack(element.color))
                 }
                 let bounds = shapes
                     .reduce(CGRect.null) { $0.union($1.0.boundingBox) }
                     .insetBy(dx: -8, dy: -8)
                 let scale = max(0.1, min(1, maxSide / max(bounds.width, bounds.height, 1)))
                 let size = CGSize(width: bounds.width * scale, height: bounds.height * scale)
-                let rendered = UIGraphicsImageRenderer(size: size).image { ctx in
+                let format = UIGraphicsImageRendererFormat.default()
+                format.scale *= 2
+                let rendered = UIGraphicsImageRenderer(size: size, format: format).image { ctx in
                     let cg = ctx.cgContext
+                    cg.setShouldAntialias(false)
                     cg.scaleBy(x: scale, y: scale)
                     cg.translateBy(x: -bounds.minX, y: -bounds.minY)
                     for (path, color) in shapes {
@@ -142,7 +148,7 @@ struct SketchPreview: UIViewRepresentable {
                 }
                 image = framed(rendered)
             }
-            thumbCache[id] = (strokes.count, image)
+            thumbCache[id] = (elements.count, image)
             return image
         }
 
