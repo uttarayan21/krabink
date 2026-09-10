@@ -15,6 +15,7 @@
 //! assert_eq!(b.text(), "# shared note");
 //! ```
 
+mod brush;
 mod export;
 mod geom;
 mod ids;
@@ -27,6 +28,7 @@ mod sync_doc;
 mod wetink;
 mod workspace;
 
+pub use brush::{BrushModeler, BrushParams, RawSample};
 pub use export::{ExportAsset, ExportBundle, SKETCH_URI_PREFIX, strokes_to_svg};
 pub use geom::{DEFAULT_TOLERANCE, StrokeMesh, hits, mesh_triangles, ribbon_outline, stroke_mesh};
 pub use ids::{DeviceId, NoteId, SketchId, StrokeId};

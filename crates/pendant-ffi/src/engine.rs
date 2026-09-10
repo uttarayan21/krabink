@@ -559,16 +559,7 @@ impl NoteSession {
             stroke,
             seq,
             sent_ms: now_ms(),
-            points: points
-                .into_iter()
-                .map(|p| pcore::WetPoint {
-                    x: p.x,
-                    y: p.y,
-                    force: p.force,
-                    width: p.width,
-                    nib: p.nib,
-                })
-                .collect(),
+            points: points.into_iter().map(Into::into).collect(),
         })
     }
 

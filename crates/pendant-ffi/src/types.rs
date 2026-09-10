@@ -68,6 +68,26 @@ pub struct Tilt {
     pub roll: f32,
 }
 
+impl From<Tilt> for pcore::Tilt {
+    fn from(t: Tilt) -> Self {
+        Self {
+            azimuth: t.azimuth,
+            altitude: t.altitude,
+            roll: t.roll,
+        }
+    }
+}
+
+impl From<pcore::Tilt> for Tilt {
+    fn from(t: pcore::Tilt) -> Self {
+        Self {
+            azimuth: t.azimuth,
+            altitude: t.altitude,
+            roll: t.roll,
+        }
+    }
+}
+
 /// Rendered point size in canvas units (PencilKit `PKStrokePoint.size`).
 /// PencilKit derives it from more than force, so strokes drop fidelity
 /// without it.
@@ -96,11 +116,7 @@ impl From<StrokePoint> for pcore::StrokePoint {
             y: p.y,
             force: p.force,
             t_ms: p.t_ms,
-            tilt: p.tilt.map(|t| pcore::Tilt {
-                roll: t.roll,
-                azimuth: t.azimuth,
-                altitude: t.altitude,
-            }),
+            tilt: p.tilt.map(Into::into),
             size: p.size.map(|s| pcore::PointSize { w: s.w, h: s.h }),
         }
     }
@@ -113,11 +129,7 @@ impl From<pcore::StrokePoint> for StrokePoint {
             y: p.y,
             force: p.force,
             t_ms: p.t_ms,
-            tilt: p.tilt.map(|t| Tilt {
-                roll: t.roll,
-                azimuth: t.azimuth,
-                altitude: t.altitude,
-            }),
+            tilt: p.tilt.map(Into::into),
             size: p.size.map(|s| PointSize { w: s.w, h: s.h }),
         }
     }
@@ -134,6 +146,30 @@ pub struct WetPoint {
     pub width: Option<f32>,
     /// Flat-nib orientation (azimuth + roll, radians) for nib tools.
     pub nib: Option<f32>,
+}
+
+impl From<pcore::WetPoint> for WetPoint {
+    fn from(p: pcore::WetPoint) -> Self {
+        Self {
+            x: p.x,
+            y: p.y,
+            force: p.force,
+            width: p.width,
+            nib: p.nib,
+        }
+    }
+}
+
+impl From<WetPoint> for pcore::WetPoint {
+    fn from(p: WetPoint) -> Self {
+        Self {
+            x: p.x,
+            y: p.y,
+            force: p.force,
+            width: p.width,
+            nib: p.nib,
+        }
+    }
 }
 
 /// A finished stroke, as stored in the CRDT.

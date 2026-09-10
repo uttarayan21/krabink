@@ -130,6 +130,31 @@ Files: new `crates/pendant-core/src/brush.rs`, `wetink.rs`, FFI `types.rs`.
 
 Exit: core + FFI build; `scripts/swift-smoke.sh` passes.
 
+Done (commit after `aa209b0`). Decisions taken while implementing:
+- `BrushModeler` owns the live stroke's points: `push(raw) ->
+  Option<StrokePoint>` (None when the smoothed point moved less than
+  `min_distance`), `points()`, `predict(&[raw])`, `finish()`. The renderer
+  draws `points()` + `predict()` each frame; `finish()` is the commit.
+- `RawSample.t_ms` is `f64` on any monotonic clock (`UITouch.timestamp *
+  1000`); the modeler zeroes it at the first sample, so callers never
+  compute stroke-relative times.
+- Width = `size * lerp(1, force, thinning) * (1 - thinning * 0.5 *
+  clamp(speed / speed_ref)) * lead_in`, floored at `size * min_width`.
+  Speed is an EMA over raw samples. The end taper spans `taper_end` or half
+  the stroke, whichever is shorter, so dots and ticks keep their width.
+- Tuning lives in `BrushParams::for_tool`: pen thinning 0.5 / streamline
+  0.5 / tail taper 1.5×size; marker streamline 0.35; monoline 0.2; brush
+  constant width (the nib does the shaping). Expect to retune on device.
+- FFI: `BrushModeler` object (`push(samples)`, `points`, `predict`,
+  `finish`), `RawSample`, `IndexedMesh { positions, indices }`,
+  `stroke_mesh(stroke, tolerance)`, `points_mesh(points, tool, base_width,
+  tolerance)`, `wet_points(points)` (StrokePoint → WetPoint, keeps width +
+  nib). `stroke_triangles` / `wet_triangles` / `*_outline` stay until
+  Phase 2 removes their callers.
+- Nothing on iOS uses the modeler yet: PencilKit still owns input until
+  Phase 2, and the desktop has no pen input. The Swift smoke test drives
+  the full push → predict → finish → mesh → commit path instead.
+
 ### Phase 2: iPad – own canvas view (the big one)
 
 Files: `ios/Pendant/Sources/SketchScreen.swift` (rewrite), new

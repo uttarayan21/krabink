@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::stroke::{Rgba, Tool};
+use crate::stroke::{Rgba, StrokePoint, Tilt, Tool};
 use crate::{Result, SketchId, StrokeId};
 
 /// One live pen sample. No tilt — provisional rendering doesn't need it.
@@ -20,6 +20,20 @@ pub struct WetPoint {
     pub width: Option<f32>,
     /// Flat-nib orientation (azimuth + roll, radians) for nib tools.
     pub nib: Option<f32>,
+}
+
+impl From<StrokePoint> for WetPoint {
+    /// The wet-ink view of a modelled point: its rendered width and nib
+    /// orientation, nothing a receiver does not draw.
+    fn from(p: StrokePoint) -> Self {
+        Self {
+            x: p.x,
+            y: p.y,
+            force: p.force,
+            width: p.size.map(|s| s.w),
+            nib: p.tilt.map(Tilt::nib_angle),
+        }
+    }
 }
 
 /// A wet-ink event. `Begin` → `Points`* → `End`, keyed by the stroke id the

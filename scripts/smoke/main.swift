@@ -13,16 +13,27 @@ func createAndEdit(dir: String) throws -> (note: String, sketch: String, stroke:
 
     let sketch = try note.createSketch()
     let strokeId = try note.beginStroke(sketch: sketch, tool: .pen, color: 0x1E3C_C8FF, baseWidth: 3.0)
-    try note.appendPoints(stroke: strokeId, seq: 1, points: [WetPoint(x: 0, y: 0, force: 0.5)])
-    try note.finishStroke(
-        sketch: sketch,
-        stroke: Stroke(
-            id: strokeId, tool: .pen, color: 0x1E3C_C8FF, baseWidth: 3.0,
-            kind: .polylineSample,
-            points: (0..<16).map {
-                StrokePoint(x: Float($0) * 3, y: Float($0), force: 0.5, tMs: UInt32($0) * 8, tilt: nil)
-            },
-            createdMs: 1))
+
+    // Model raw touches the way the iPad canvas will: push, predict, finish.
+    let modeler = BrushModeler(tool: .pen, size: 3.0)
+    let live = modeler.push(samples: (0..<16).map {
+        RawSample(x: Float($0) * 3, y: Float($0), force: 0.5, tMs: 1000 + Double($0) * 8, tilt: nil)
+    })
+    guard !live.isEmpty, live.allSatisfy({ $0.size != nil }) else { fatalError("modeler emitted no ink") }
+    let tail = modeler.predict(samples: [RawSample(x: 60, y: 20, force: 0.5, tMs: 1200, tilt: nil)])
+    guard modeler.points() == live, tail.count == 1 else { fatalError("predict mutated the modeler") }
+    try note.appendPoints(stroke: strokeId, seq: 1, points: wetPoints(points: live))
+    let points = modeler.finish()
+    let mesh = pointsMesh(points: points, tool: .pen, baseWidth: 3.0, tolerance: defaultTolerance())
+    guard mesh.indices.count >= 3, mesh.indices.count % 3 == 0 else { fatalError("empty mesh") }
+
+    let stroke = Stroke(
+        id: strokeId, tool: .pen, color: 0x1E3C_C8FF, baseWidth: 3.0,
+        kind: .polylineSample, points: points, createdMs: 1)
+    guard strokeMesh(stroke: stroke, tolerance: defaultTolerance()) == mesh else {
+        fatalError("live and committed meshes differ")
+    }
+    try note.finishStroke(sketch: sketch, stroke: stroke)
 
     guard try note.text() == "# hello from swift" else { fatalError("text mismatch") }
     guard try note.strokes(sketch: sketch).count == 1 else { fatalError("stroke missing") }
@@ -38,7 +49,7 @@ func verifyPersisted(dir: String, ids: (note: String, sketch: String, stroke: St
     let note = try core.openNote(id: ids.note)
     guard try note.text() == "# hello from swift" else { fatalError("persisted text mismatch") }
     let strokes = try note.strokes(sketch: ids.sketch)
-    guard strokes.count == 1, strokes[0].id == ids.stroke, strokes[0].points.count == 16 else {
+    guard strokes.count == 1, strokes[0].id == ids.stroke, strokes[0].points.count > 1 else {
         fatalError("persisted stroke mismatch")
     }
     print("swift smoke OK — note \(ids.note), device \(core.deviceId())")
