@@ -117,7 +117,7 @@ flowchart LR
         SS["ServerSession\nBroadcast / Disconnect effects"]
         WS["WorkspaceDoc\nnotes + device registry"]
         PAIR["pair.rs\nPairInfo <-> pendant://pair URI"]
-        INK["brush.rs + geom.rs\nBrushModeler, lyon stroke_mesh"]
+        INK["brush.rs + geom.rs + shape.rs\nBrushModeler, lyon stroke_mesh,\nshape recognizer; element.rs"]
     end
     subgraph desktop["pendant (desktop bin)"]
         BEVY["Bevy app: ui, sketch, docs"]
@@ -147,6 +147,17 @@ round caps and joins) turns those into the triangles every renderer draws
 thumbnails). The live stroke, the committed stroke and every remote copy
 are the same geometry; wet ink carries the width per point so receivers
 draw what the sender drew. See `docs/plans/ink-renderer.md`.
+
+A sketch is one z-ordered list of `Element`s: freehand `Stroke`s and
+`ShapeElement`s (line, arrow, rectangle, ellipse, with reserved
+Excalidraw-style end bindings). Holding the Pencil still mid-stroke runs
+`shape::recognize` on the modelled points (hold trimming, arc-length
+resampling, ShortStraw corners, closure, PCA/corner fits, all thresholds
+relative to the stroke's size); a hit previews the snapped outline and
+pen-up commits the shape under the wet stroke's id, so every receiver swaps
+the provisional ink for the shape the way it does for a stroke. Shapes
+render through `Shape::outline` and the same `stroke_mesh`. See
+`docs/plans/shape-recognizer.md`.
 
 ## 5. Failure modes and what happens
 
