@@ -1,15 +1,21 @@
 // Ink pipeline: flat-coloured triangles from the core's stroke meshes.
-// Positions arrive in canvas units (x right, y down); `Uniforms` carries
-// the canvas → clip-space affine map for the current pan/zoom and the
-// stroke colour. Layout must match `Uniforms` in InkRenderer.swift.
+// Vertices carry canvas-space position (x right, y down) and their stroke's
+// colour, so every committed stroke can live in one batched buffer and be
+// drawn with a single call. `Uniforms` is the canvas → clip-space affine
+// map for the current pan/zoom. Layouts must match InkRenderer.swift
+// (`InkVertex`, `Uniforms`).
 
 #include <metal_stdlib>
 using namespace metal;
 
+struct VertexIn {
+    float2 position [[attribute(0)]];
+    float4 color [[attribute(1)]];
+};
+
 struct Uniforms {
     float2 scale;
     float2 translate;
-    float4 color;
 };
 
 struct InkVertex {
@@ -17,15 +23,12 @@ struct InkVertex {
     float4 color;
 };
 
-vertex InkVertex ink_vertex(
-    const device float2 *positions [[buffer(0)]],
-    constant Uniforms &u [[buffer(1)]],
-    uint vid [[vertex_id]])
+vertex InkVertex ink_vertex(VertexIn in [[stage_in]], constant Uniforms &u [[buffer(1)]])
 {
     InkVertex out;
-    float2 p = positions[vid] * u.scale + u.translate;
+    float2 p = in.position * u.scale + u.translate;
     out.position = float4(p, 0.0, 1.0);
-    out.color = u.color;
+    out.color = in.color;
     return out;
 }
 

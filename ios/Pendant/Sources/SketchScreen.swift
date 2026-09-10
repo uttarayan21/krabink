@@ -478,12 +478,28 @@ final class SketchCanvasView: UIView, UIScrollViewDelegate {
 
     override var canBecomeFirstResponder: Bool { true }
 
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        applyDrawableScale()
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
         scroll.frame = bounds
         metal.frame = bounds
+        applyDrawableScale()
         ensureCanvas(covers: bounds.size)
         pushViewport()
+    }
+
+    /// Render at the screen's native pixel density. An MTKView created
+    /// off-window keeps a 1x drawable otherwise, which no amount of MSAA
+    /// can hide.
+    private func applyDrawableScale() {
+        let scale = window?.screen.nativeScale ?? traitCollection.displayScale
+        guard scale > 0, metal.contentScaleFactor != scale else { return }
+        metal.contentScaleFactor = scale
+        renderer.needsDisplay()
     }
 
     /// Grow the canvas (never shrink) so `size` fits at zoom 1.
