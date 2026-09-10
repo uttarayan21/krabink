@@ -13,7 +13,9 @@ use pendant_core::{DeviceId, DocKey, Flush, NoteId, NoteMeta, SketchId, Store, W
 use tokio::sync::mpsc;
 
 use crate::net::{self, Cmd};
-use crate::types::{DeviceInfo, NoteInfo, Stroke, SyncState, Tool, WetPoint, rgba_from_u32};
+use crate::types::{
+    DeviceInfo, Element, NoteInfo, ShapeElement, Stroke, SyncState, Tool, WetPoint, rgba_from_u32,
+};
 
 /// Errors crossing the FFI boundary. Flattened to message-carrying variants;
 /// Swift rarely needs more than "which kind" + a human-readable cause.
@@ -46,10 +48,11 @@ pub trait CoreListener: Send + Sync {
     fn sync_state(&self, state: SyncState);
 }
 
-/// Per-note events. Text and stroke changes are coarse: re-read via
-/// [`NoteSession::text`] / [`NoteSession::strokes`]. Wet-ink events mirror the
-/// ephemeral stream and never touch the CRDT; render them provisionally and
-/// drop the overlay when `strokes_changed` delivers the committed stroke.
+/// Per-note events. Text and element changes are coarse: re-read via
+/// [`NoteSession::text`] / [`NoteSession::elements`]. Wet-ink events mirror
+/// the ephemeral stream and never touch the CRDT; render them provisionally
+/// and drop the overlay when `strokes_changed` delivers the committed
+/// element (a stroke or a snapped shape) under the same id.
 #[uniffi::export(foreign)]
 pub trait NoteListener: Send + Sync {
     /// Catch-up with the server finished; local edits now propagate live.
@@ -523,10 +526,17 @@ impl NoteSession {
             .map(|id| id.to_string())
     }
 
-    /// All strokes of a sketch in z-order.
+    /// All strokes of a sketch in z-order (shapes left out; prefer
+    /// [`Self::elements`]).
     pub fn strokes(&self, sketch: String) -> Result<Vec<Stroke>> {
         let sketch = self.parse_sketch(&sketch)?;
         self.read(|doc| Ok(doc.strokes(sketch)?.into_iter().map(Into::into).collect()))
+    }
+
+    /// Every element of a sketch (strokes and shapes) in z-order.
+    pub fn elements(&self, sketch: String) -> Result<Vec<Element>> {
+        let sketch = self.parse_sketch(&sketch)?;
+        self.read(|doc| Ok(doc.elements(sketch)?.into_iter().map(Into::into).collect()))
     }
 
     /// Pen-down: announce a wet stroke on the ephemeral channel. Returns the
@@ -580,21 +590,38 @@ impl NoteSession {
         })
     }
 
-    /// Eraser sample: remove every stroke whose ink a circle of `radius` at
-    /// (`x`, `y`) touches; returns their ids so the view can drop them. The
-    /// hit test lives in the core so erasing matches on every platform.
+    /// Pen-up on a stroke that snapped to a shape: commit the shape under
+    /// the wet stroke's id and end the wet stream, so receivers swap the
+    /// provisional ink for the shape in one step. `shape.id` must be the id
+    /// returned by `begin_stroke`.
+    pub fn finish_shape(&self, sketch: String, shape: ShapeElement) -> Result<()> {
+        let sketch = self.parse_sketch(&sketch)?;
+        let id: pcore::ElementId = shape.id.parse().map_err(|_| PendantError::MalformedId {
+            id: shape.id.clone(),
+        })?;
+        let committed = pcore::ShapeElement::from(shape);
+        self.commit(Flush::Immediate, |doc| doc.add_shape(sketch, &committed))?;
+        self.send_wet(pcore::WetInk::End {
+            stroke: id,
+            sent_ms: now_ms(),
+        })
+    }
+
+    /// Eraser sample: remove every element whose ink a circle of `radius`
+    /// at (`x`, `y`) touches; returns their ids so the view can drop them.
+    /// The hit test lives in the core so erasing matches on every platform.
     pub fn erase_at(&self, sketch: String, x: f32, y: f32, radius: f32) -> Result<Vec<String>> {
         let sketch_id = self.parse_sketch(&sketch)?;
-        let hit: Vec<pcore::StrokeId> = self.read(|doc| {
+        let hit: Vec<pcore::ElementId> = self.read(|doc| {
             Ok(doc
-                .strokes(sketch_id)?
+                .elements(sketch_id)?
                 .iter()
-                .filter(|s| pcore::hits(&s.flatten(), s.base_width, x, y, radius))
-                .map(|s| s.id)
+                .filter(|el| pcore::hits(&el.outline(), el.base_width(), x, y, radius))
+                .map(pcore::Element::id)
                 .collect())
         })?;
         for id in &hit {
-            self.commit(Flush::Immediate, |doc| doc.remove_stroke(sketch_id, *id))?;
+            self.commit(Flush::Immediate, |doc| doc.remove_element(sketch_id, *id))?;
         }
         Ok(hit.iter().map(ToString::to_string).collect())
     }
@@ -609,11 +636,17 @@ impl NoteSession {
         self.send_wet(pcore::WetInk::Cancel { stroke: stroke_id })
     }
 
-    pub fn remove_stroke(&self, sketch: String, stroke: String) -> Result<()> {
+    /// Remove one element (stroke or shape) by id.
+    pub fn remove_element(&self, sketch: String, element: String) -> Result<()> {
         let sketch = self.parse_sketch(&sketch)?;
-        let stroke: pcore::StrokeId = stroke
+        let id: pcore::ElementId = element
             .parse()
-            .map_err(|_| PendantError::MalformedId { id: stroke })?;
-        self.commit(Flush::Immediate, |doc| doc.remove_stroke(sketch, stroke))
+            .map_err(|_| PendantError::MalformedId { id: element })?;
+        self.commit(Flush::Immediate, |doc| doc.remove_element(sketch, id))
+    }
+
+    /// Alias of [`Self::remove_element`].
+    pub fn remove_stroke(&self, sketch: String, stroke: String) -> Result<()> {
+        self.remove_element(sketch, stroke)
     }
 }

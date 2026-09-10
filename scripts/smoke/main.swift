@@ -35,8 +35,38 @@ func createAndEdit(dir: String) throws -> (note: String, sketch: String, stroke:
     }
     try note.finishStroke(sketch: sketch, stroke: stroke)
 
+    // Shape recognition: a held rough rectangle snaps and commits as a shape.
+    let rectModeler = BrushModeler(tool: .pen, size: 3.0)
+    let corners: [(Float, Float)] = [(0, 0), (120, 1), (119, 80), (1, 79), (0, 2)]
+    var rectSamples: [RawSample] = []
+    for i in 0..<(corners.count - 1) {
+        let (ax, ay) = corners[i], (bx, by) = corners[i + 1]
+        for k in 0..<30 {
+            let t = Float(k) / 30
+            rectSamples.append(RawSample(
+                x: ax + (bx - ax) * t, y: ay + (by - ay) * t, force: 0.6,
+                tMs: Double(rectSamples.count) * 8, tilt: nil))
+        }
+    }
+    _ = rectModeler.push(samples: rectSamples)
+    guard let snapped = recognizeShape(points: rectModeler.points()),
+          case .rect = snapped.shape else { fatalError("rectangle not recognised") }
+    let shapeId = try note.beginStroke(sketch: sketch, tool: .pen, color: 0xFF00_00FF, baseWidth: 3.0)
+    let shape = ShapeElement(
+        id: shapeId, shape: snapped.shape, tool: .pen, color: 0xFF00_00FF, width: 3.0,
+        start: nil, end: nil, createdMs: 2)
+    let preview = shapeOutlineMesh(shape: snapped.shape, tool: .pen, baseWidth: 3.0, tolerance: defaultTolerance())
+    guard elementMesh(element: .shape(shape), tolerance: defaultTolerance()) == preview else {
+        fatalError("shape preview and committed meshes differ")
+    }
+    try note.finishShape(sketch: sketch, shape: shape)
+
     guard try note.text() == "# hello from swift" else { fatalError("text mismatch") }
     guard try note.strokes(sketch: sketch).count == 1 else { fatalError("stroke missing") }
+    let elements = try note.elements(sketch: sketch)
+    guard elements.count == 2, case .shape(let stored) = elements[1], stored.id == shapeId else {
+        fatalError("shape missing from elements")
+    }
     guard core.listNotes().first?.title == "smoke" else { fatalError("registry mismatch") }
     return (note.id(), sketch, strokeId)
 }
@@ -52,6 +82,7 @@ func verifyPersisted(dir: String, ids: (note: String, sketch: String, stroke: St
     guard strokes.count == 1, strokes[0].id == ids.stroke, strokes[0].points.count > 1 else {
         fatalError("persisted stroke mismatch")
     }
+    guard try note.elements(sketch: ids.sketch).count == 2 else { fatalError("persisted shape mismatch") }
     print("swift smoke OK — note \(ids.note), device \(core.deviceId())")
 }
 

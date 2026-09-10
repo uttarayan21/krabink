@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use pendant_core as pcore;
 
 use crate::types::{
-    Stroke, StrokePoint, Tilt, Tool, WET_WIDTH_FALLBACK, WetPoint, wet_to_stroke_point,
+    Element, Recognition, Shape, Stroke, StrokePoint, Tilt, Tool, WET_WIDTH_FALLBACK, WetPoint,
+    wet_to_stroke_point,
 };
 
 /// One raw touch sample, before smoothing.
@@ -174,6 +175,43 @@ pub fn wet_mesh(points: Vec<WetPoint>, tool: Tool, base_width: f32, tolerance: f
     .into()
 }
 
+/// Ink for a committed element, stroke or shape, same geometry as
+/// [`stroke_mesh`]; a shape's outline is built here so it never crosses
+/// the FFI.
+#[uniffi::export]
+pub fn element_mesh(element: Element, tolerance: f32) -> IndexedMesh {
+    let element = pcore::Element::from(element);
+    pcore::stroke_mesh(
+        element.tool(),
+        &element.outline(),
+        element.base_width(),
+        tolerance,
+    )
+    .into()
+}
+
+/// Ink for a shape that is not committed yet (the hold preview), drawn
+/// with the live stroke's tool and width.
+#[uniffi::export]
+pub fn shape_outline_mesh(
+    shape: Shape,
+    tool: Tool,
+    base_width: f32,
+    tolerance: f32,
+) -> IndexedMesh {
+    let outline = pcore::Shape::from(shape).outline();
+    pcore::stroke_mesh(tool.into(), &outline, base_width, tolerance).into()
+}
+
+/// Snap a live stroke (`BrushModeler.points` at hold time) to a line,
+/// arrow, rectangle or ellipse; `None` when it is not drawn cleanly enough
+/// to be one.
+#[uniffi::export]
+pub fn recognize_shape(points: Vec<StrokePoint>) -> Option<Recognition> {
+    let pts: Vec<pcore::StrokePoint> = points.into_iter().map(Into::into).collect();
+    pcore::recognize(&pts).map(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +274,64 @@ mod tests {
             0.25,
         );
         assert_eq!(committed, mesh, "live and committed ink are the same mesh");
+    }
+
+    #[test]
+    fn a_held_rectangle_snaps_and_meshes() {
+        let corners = [
+            [0.0, 0.0],
+            [120.0, 1.0],
+            [119.0, 80.0],
+            [1.0, 79.0],
+            [0.0, 2.0],
+        ];
+        let raw: Vec<RawSample> = corners
+            .windows(2)
+            .flat_map(|w| {
+                (0..30).map(move |i| {
+                    let t = i as f32 / 30.0;
+                    [
+                        w[0][0] + (w[1][0] - w[0][0]) * t,
+                        w[0][1] + (w[1][1] - w[0][1]) * t,
+                    ]
+                })
+            })
+            .enumerate()
+            .map(|(i, [x, y])| RawSample {
+                x,
+                y,
+                force: 0.6,
+                t_ms: i as f64 * 8.0,
+                tilt: None,
+            })
+            .collect();
+        let m = BrushModeler::new(Tool::Pen, 4.0);
+        m.push(raw);
+        let rec = recognize_shape(m.points()).expect("rectangle");
+        let Shape::Rect { size, .. } = rec.shape else {
+            panic!("expected a rect, got {rec:?}");
+        };
+        assert!((size.x - 120.0).abs() < 6.0 && (size.y - 80.0).abs() < 6.0);
+        assert!(rec.confidence > 0.0);
+
+        let preview = shape_outline_mesh(rec.shape, Tool::Pen, 4.0, 0.25);
+        let committed = element_mesh(
+            Element::Shape(crate::types::ShapeElement {
+                id: pcore::ElementId::new().to_string(),
+                shape: rec.shape,
+                tool: Tool::Pen,
+                color: 0xff,
+                width: 4.0,
+                start: None,
+                end: None,
+                created_ms: 0,
+            }),
+            0.25,
+        );
+        assert_eq!(
+            preview, committed,
+            "preview and committed ink are the same mesh"
+        );
+        assert!(!committed.indices.is_empty());
     }
 }
