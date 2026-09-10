@@ -310,18 +310,23 @@ pub fn hits(points: &[StrokePoint], base_width: f32, x: f32, y: f32, radius: f32
         ),
         pts => pts.windows(2).any(|w| {
             let (a, b) = (&w[0], &w[1]);
-            let (abx, aby) = (b.x - a.x, b.y - a.y);
-            let len2 = (abx * abx + aby * aby).max(f32::EPSILON);
-            let t = (((x - a.x) * abx + (y - a.y) * aby) / len2).clamp(0.0, 1.0);
-            let (cx, cy) = (a.x + t * abx, a.y + t * aby);
             let reach = radius + half_width(a, base_width).max(half_width(b, base_width));
-            within((cx - x).powi(2) + (cy - y).powi(2), reach)
+            within(segment_distance2([a.x, a.y], [b.x, b.y], [x, y]), reach)
         }),
     }
 }
 
+/// Squared distance from `p` to the segment `a`–`b`.
+pub(crate) fn segment_distance2(a: [f32; 2], b: [f32; 2], p: [f32; 2]) -> f32 {
+    let (abx, aby) = (b[0] - a[0], b[1] - a[1]);
+    let len2 = (abx * abx + aby * aby).max(f32::EPSILON);
+    let t = (((p[0] - a[0]) * abx + (p[1] - a[1]) * aby) / len2).clamp(0.0, 1.0);
+    let (cx, cy) = (a[0] + t * abx, a[1] + t * aby);
+    (cx - p[0]).powi(2) + (cy - p[1]).powi(2)
+}
+
 /// Drop non-finite points and merge runs closer than [`MIN_SEGMENT`].
-fn dedupe(points: &[StrokePoint]) -> Vec<StrokePoint> {
+pub(crate) fn dedupe(points: &[StrokePoint]) -> Vec<StrokePoint> {
     points
         .iter()
         .filter(|p| p.x.is_finite() && p.y.is_finite() && p.force.is_finite())
