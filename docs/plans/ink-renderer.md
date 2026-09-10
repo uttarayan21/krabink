@@ -1,6 +1,6 @@
 # Plan: one ink renderer on every platform (lyon + own input)
 
-Status: proposed. Replaces PencilKit as renderer *and* input device on iPad;
+Status: implemented (Phases 0–4; per-phase notes below). Replaces PencilKit as renderer *and* input device on iPad;
 desktop keeps bevy but tessellates through the same core code. Goal: the live
 stroke and the committed stroke are the same pixels, on both devices.
 
@@ -293,6 +293,21 @@ now pinned explicitly so parity does not ride on a bevy default.
   strokes are always `PolylineSample`.
 - Update `docs/architecture.md` ink section and the header comment in
   `SketchScreen.swift`.
+
+Done (commit after `d1a8e1c`):
+- Core: `ribbon`, `ribbon_outline`, `mesh_triangles` and their tests are
+  gone; `nib_ribbon` keeps its own single-point dot. FFI: `stroke_triangles`,
+  `wet_triangles`, `stroke_outline`, `wet_outline` removed;
+  `default_tolerance` lives with the mesh functions in `brush.rs`.
+- The consistent-winding guarantee `mesh_triangles` gave CoreGraphics
+  moved into the Swift `IndexedMesh.cgPath` (thumbnails), the only
+  non-zero-rule filler left.
+- `PointKind` docs say new strokes are always `PolylineSample`.
+- `ActiveObserverGestureRecognizer` stays: it belongs to the iM2
+  `SpikeScreen` (launch with `-spike 1`), which still has its own UI tests
+  and documents the PencilKit findings. Delete the spike as a whole when it
+  stops being useful.
+- `docs/architecture.md` gained the ink pipeline in the layering section.
 
 ## Risks and calls
 

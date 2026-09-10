@@ -117,12 +117,14 @@ flowchart LR
         SS["ServerSession\nBroadcast / Disconnect effects"]
         WS["WorkspaceDoc\nnotes + device registry"]
         PAIR["pair.rs\nPairInfo <-> pendant://pair URI"]
+        INK["brush.rs + geom.rs\nBrushModeler, lyon stroke_mesh"]
     end
     subgraph desktop["pendant (desktop bin)"]
         BEVY["Bevy app: ui, sketch, docs"]
         SYNC["sync.rs: N links, tokio task per WS"]
         RELAY["relay.rs: EmbeddedRelay"]
         BEVY --> SYNC --> CS
+        BEVY --> INK
         RELAY --> SRV
     end
     subgraph server["pendant-server (lib + bin)"]
@@ -130,11 +132,21 @@ flowchart LR
         SRV --> SS
     end
     subgraph ios["iPad"]
-        SWIFT["SwiftUI: AppModel, Settings, Scan, Sketch"]
-        FFI["pendant-ffi (UniFFI)\nengine.rs + net.rs single-socket task"]
+        SWIFT["SwiftUI: AppModel, Settings, Scan\nSketch: PenGestureRecognizer + Metal InkRenderer"]
+        FFI["pendant-ffi (UniFFI)\nengine.rs + net.rs single-socket task\nbrush.rs BrushModeler + meshes"]
         SWIFT --> FFI --> CS
+        FFI --> INK
     end
 ```
+
+Ink is one pipeline on both platforms: raw pen samples go through the
+core's `BrushModeler` (smoothing, width from force and speed, tapers) into
+`StrokePoint`s that carry their rendered width, and `stroke_mesh` (lyon,
+round caps and joins) turns those into the triangles every renderer draws
+(bevy `Mesh2d` on the desktop, `MTKView` on the iPad, CoreGraphics for
+thumbnails). The live stroke, the committed stroke and every remote copy
+are the same geometry; wet ink carries the width per point so receivers
+draw what the sender drew. See `docs/plans/ink-renderer.md`.
 
 ## 5. Failure modes and what happens
 

@@ -130,10 +130,15 @@ impl From<pcore::StrokeMesh> for IndexedMesh {
     }
 }
 
+/// Cap/join flattening tolerance for 1:1 zoom, canvas units.
+#[uniffi::export]
+pub fn default_tolerance() -> f32 {
+    pcore::DEFAULT_TOLERANCE
+}
+
 /// The committed stroke's ink as an indexed mesh. `tolerance` bounds
-/// cap/join flattening error in canvas units; pass
-/// [`default_tolerance`](crate::types::default_tolerance) divided by the
-/// zoom factor.
+/// cap/join flattening error in canvas units; pass [`default_tolerance`]
+/// divided by the zoom factor.
 #[uniffi::export]
 pub fn stroke_mesh(stroke: Stroke, tolerance: f32) -> IndexedMesh {
     let stroke = pcore::Stroke::from(stroke);

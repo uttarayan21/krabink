@@ -236,8 +236,22 @@ pub fn nib_ribbon(points: &[StrokePoint], base_width: f32) -> StrokeMesh {
     let pts = dedupe(points);
     let half = (base_width / 2.0).max(MIN_HALF_WIDTH);
     let floor = (base_width * NIB_MIN_FRACTION / 2.0).max(MIN_HALF_WIDTH);
-    if pts.len() < 2 {
-        return ribbon(&pts, base_width);
+    match pts.as_slice() {
+        [] => return StrokeMesh::default(),
+        [p] => {
+            // A nib touched down without moving: a square dot of its width.
+            let h = half;
+            return StrokeMesh {
+                positions: vec![
+                    [p.x - h, p.y - h],
+                    [p.x + h, p.y - h],
+                    [p.x - h, p.y + h],
+                    [p.x + h, p.y + h],
+                ],
+                indices: vec![0, 1, 2, 2, 1, 3],
+            };
+        }
+        _ => {}
     }
     let mut positions = Vec::with_capacity(pts.len() * 2);
     for (i, p) in pts.iter().enumerate() {
@@ -272,49 +286,6 @@ pub fn nib_ribbon(points: &[StrokePoint], base_width: f32) -> StrokeMesh {
     }
 }
 
-/// Legacy flat ribbon: two vertices per point offset across the direction
-/// of motion, butt ends, no joins. Only kept as the source of
-/// [`ribbon_outline`], which path fillers need as a single closed polygon;
-/// everything else goes through [`stroke_mesh`].
-fn ribbon(points: &[StrokePoint], base_width: f32) -> StrokeMesh {
-    let pts = dedupe(points);
-    let half = |p: &StrokePoint| half_width(p, base_width);
-
-    match pts.as_slice() {
-        [] => StrokeMesh::default(),
-        [p] => {
-            let h = half(p);
-            StrokeMesh {
-                positions: vec![
-                    [p.x - h, p.y - h],
-                    [p.x + h, p.y - h],
-                    [p.x - h, p.y + h],
-                    [p.x + h, p.y + h],
-                ],
-                indices: vec![0, 1, 2, 2, 1, 3],
-            }
-        }
-        pts => {
-            let mut positions = Vec::with_capacity(pts.len() * 2);
-            for (i, p) in pts.iter().enumerate() {
-                let prev = &pts[i.saturating_sub(1)];
-                let next = &pts[(i + 1).min(pts.len() - 1)];
-                let (dx, dy) = (next.x - prev.x, next.y - prev.y);
-                let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
-                // Left-hand normal of the averaged direction.
-                let (nx, ny) = (-dy / len, dx / len);
-                let h = half(p);
-                positions.push([p.x + nx * h, p.y + ny * h]);
-                positions.push([p.x - nx * h, p.y - ny * h]);
-            }
-            StrokeMesh {
-                indices: strip_indices(pts.len()),
-                positions,
-            }
-        }
-    }
-}
-
 /// Triangle-list indices for a strip of `points` (left, right) vertex pairs.
 fn strip_indices(points: usize) -> Vec<u32> {
     (0..points.saturating_sub(1) as u32)
@@ -323,62 +294,6 @@ fn strip_indices(points: usize) -> Vec<u32> {
             [base, base + 1, base + 2, base + 2, base + 1, base + 3]
         })
         .collect()
-}
-
-/// The mesh as a flat list of triangles (three `[x, y]` per triangle),
-/// every triangle wound the same way. Renderers that fill a path with the
-/// non-zero rule (CoreGraphics, SVG, Skia) get exactly the mesh's coverage:
-/// same-winding overlaps add up instead of cancelling into holes.
-pub fn mesh_triangles(
-    tool: Tool,
-    points: &[StrokePoint],
-    base_width: f32,
-    tolerance: f32,
-) -> Vec<[f32; 2]> {
-    let mesh = stroke_mesh(tool, points, base_width, tolerance);
-    mesh.indices
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .flat_map(|tri| {
-            let (a, b, c) = (
-                mesh.positions[tri[0] as usize],
-                mesh.positions[tri[1] as usize],
-                mesh.positions[tri[2] as usize],
-            );
-            let twice_area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
-            if twice_area >= 0.0 {
-                [a, b, c]
-            } else {
-                [a, c, b]
-            }
-        })
-        .collect()
-}
-
-/// The legacy ribbon's outline as one closed polygon: the left edge
-/// forward, then the right edge back. Path fillers (CoreGraphics, SVG) get
-/// a single antialiased boundary instead of seams between hundreds of
-/// triangles; fill with the non-zero rule so a ribbon folding over itself
-/// still covers. Empty when there is nothing to draw.
-///
-/// Debt: this is *not* the [`stroke_mesh`] geometry (butt ends, no joins).
-/// It survives only until the iPad draws meshes directly; see
-/// `docs/plans/ink-renderer.md`.
-pub fn ribbon_outline(tool: Tool, points: &[StrokePoint], base_width: f32) -> Vec<[f32; 2]> {
-    let mesh = if tool.has_nib() {
-        nib_ribbon(points, base_width)
-    } else {
-        ribbon(points, base_width)
-    };
-    let n = mesh.positions.len();
-    if n < 4 {
-        return Vec::new();
-    }
-    // Both ribbons emit (left, right) pairs per source point.
-    let left = (0..n).step_by(2).map(|i| mesh.positions[i]);
-    let right = (1..n).step_by(2).rev().map(|i| mesh.positions[i]);
-    left.chain(right).collect()
 }
 
 /// Whole-stroke hit test: does a circle of `radius` at (`x`, `y`) touch the
@@ -612,23 +527,6 @@ mod tests {
     }
 
     #[test]
-    fn triangles_all_wound_the_same_way() {
-        let pts = [
-            fpt(0.0, 0.0, 1.0),
-            fpt(10.0, 0.0, 1.0),
-            fpt(10.0, 0.5, 1.0),
-            fpt(0.0, 1.0, 1.0),
-        ];
-        let tris = mesh_triangles(Tool::Pen, &pts, 4.0, DEFAULT_TOLERANCE);
-        assert_eq!(tris.len(), pen(&pts, 4.0).indices.len());
-        for tri in tris.as_chunks::<3>().0 {
-            let (a, b, c) = (tri[0], tri[1], tri[2]);
-            let twice_area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
-            assert!(twice_area >= 0.0, "clockwise triangle {tri:?}");
-        }
-    }
-
-    #[test]
     fn finer_tolerance_adds_vertices() {
         let pts = [fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0)];
         let coarse = stroke_mesh(Tool::Pen, &pts, 8.0, 1.0);
@@ -678,26 +576,6 @@ mod tests {
             stroke_mesh(Tool::Pen, &nib_pts, 8.0, DEFAULT_TOLERANCE),
             pen(&[fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0)], 8.0)
         );
-    }
-
-    #[test]
-    fn outline_walks_left_then_right() {
-        let pts = [fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0), fpt(20.0, 0.0, 1.0)];
-        let outline = ribbon_outline(Tool::Pen, &pts, 2.0);
-        assert_eq!(outline.len(), 6);
-        // Left edge (y = +1) forward, right edge (y = -1) back.
-        assert_eq!(outline[0][0], 0.0);
-        assert_eq!(outline[2][0], 20.0);
-        assert!((outline[2][1] - 1.0).abs() < 1e-4);
-        assert_eq!(outline[3][0], 20.0);
-        assert!((outline[3][1] + 1.0).abs() < 1e-4);
-        assert_eq!(outline[5][0], 0.0);
-        // A dot is a quad.
-        assert_eq!(
-            ribbon_outline(Tool::Pen, &[fpt(1.0, 1.0, 1.0)], 2.0).len(),
-            4
-        );
-        assert!(ribbon_outline(Tool::Pen, &[], 2.0).is_empty());
     }
 
     #[test]

@@ -79,19 +79,26 @@ extension IndexedMesh {
     }
 
     /// The triangles as one CGPath (one closed subpath each) for
-    /// CoreGraphics fills, e.g. thumbnails. Fill with the winding rule and
-    /// antialiasing off: adjacent antialiased triangles leave hairline seams.
+    /// CoreGraphics fills, e.g. thumbnails. Every triangle is wound the
+    /// same way so a non-zero fill of a self-overlapping stroke adds up
+    /// instead of cancelling into holes. Fill with antialiasing off:
+    /// adjacent antialiased triangles leave hairline seams.
     var cgPath: CGPath {
         let path = CGMutablePath()
         var i = 0
         while i + 2 < indices.count {
-            let a = Int(indices[i]) * 2
-            let b = Int(indices[i + 1]) * 2
-            let c = Int(indices[i + 2]) * 2
-            guard c + 1 < positions.count, a >= 0, b >= 0 else { break }
-            path.move(to: CGPoint(x: CGFloat(positions[a]), y: CGFloat(positions[a + 1])))
-            path.addLine(to: CGPoint(x: CGFloat(positions[b]), y: CGFloat(positions[b + 1])))
-            path.addLine(to: CGPoint(x: CGFloat(positions[c]), y: CGFloat(positions[c + 1])))
+            let ia = Int(indices[i]) * 2
+            let ib = Int(indices[i + 1]) * 2
+            let ic = Int(indices[i + 2]) * 2
+            guard max(ia, ib, ic) + 1 < positions.count else { break }
+            let a = CGPoint(x: CGFloat(positions[ia]), y: CGFloat(positions[ia + 1]))
+            var b = CGPoint(x: CGFloat(positions[ib]), y: CGFloat(positions[ib + 1]))
+            var c = CGPoint(x: CGFloat(positions[ic]), y: CGFloat(positions[ic + 1]))
+            let twiceArea = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+            if twiceArea < 0 { swap(&b, &c) }
+            path.move(to: a)
+            path.addLine(to: b)
+            path.addLine(to: c)
             path.closeSubpath()
             i += 3
         }
