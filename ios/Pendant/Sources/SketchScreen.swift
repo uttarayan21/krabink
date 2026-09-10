@@ -143,7 +143,7 @@ private enum StrokeRecorder {
         try? text.write(to: dir.appendingPathComponent("stroke-\(stamp).txt"), atomically: true, encoding: .utf8)
         // Also to the console, so an attached `devicectl --console` captures
         // the stroke without a trip through Files.
-        NSLog("recorded %d samples to strokes/stroke-%d.txt\n--- begin stroke-%d.txt ---\n%@--- end ---", samples.count, stamp, stamp, text)
+        NSLog("recorded %d samples to strokes/stroke-%ld.txt\n--- begin stroke-%ld.txt ---\n%@--- end ---", samples.count, stamp, stamp, text)
     }
 }
 
