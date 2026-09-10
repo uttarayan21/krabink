@@ -18,7 +18,8 @@
 // Draw-and-hold: a pen still for `holdDelay` asks the core to recognise
 // the stroke so far; a hit previews the snapped outline (with a haptic)
 // and pen-up commits a shape element under the same wet id instead of a
-// stroke. Moving again drops the snap and the stroke goes on as ink.
+// stroke. Dragging on after the snap resizes the shape from the point the
+// pen held (the core's `resizeShape`), so the snap is never lost.
 // Erasing: the eraser tool's samples hit-test whole elements in the core.
 // Remote elements: wet batches render through `wetMesh`; strokesChanged
 // diffs the CRDT into meshes — deferred while a local pen is down.
@@ -118,6 +119,13 @@ private struct LiveStroke {
     var holdTask: Task<Void, Never>?
     /// The shape this stroke will commit as, once a hold recognised one.
     var snap: Recognition?
+    /// Where the pen was when the shape snapped; dragging away from here
+    /// resizes the snapped shape instead of discarding it.
+    var snapPen: RawSample?
+    /// The snapped shape after the drag so far.
+    var resized: PendantCore.Shape?
+    /// The shape to preview and commit.
+    var shape: PendantCore.Shape? { resized ?? snap?.shape }
     /// Raw samples kept for `-recordStrokes 1`.
     var recording: [RawSample]?
 }
@@ -252,8 +260,8 @@ final class SketchModel {
     // MARK: draw-and-hold
 
     /// Keep the hold timer running while the pen stays within `holdRadius`
-    /// of where it came to rest; any larger move re-anchors, restarts the
-    /// timer and drops a snap already shown.
+    /// of where it came to rest; any larger move re-anchors and restarts
+    /// the timer. Once a shape has snapped, moving resizes it instead.
     private func armHold(at sample: RawSample) {
         guard live != nil else { return }
         let zoom = Float(max(renderer?.viewport.zoom ?? 1, 0.01))
@@ -263,9 +271,14 @@ final class SketchModel {
         {
             return
         }
+        if let snap = live!.snap, let from = live!.snapPen {
+            live!.resized = resizeShape(
+                shape: snap.shape, from: Point2(x: from.x, y: from.y),
+                to: Point2(x: sample.x, y: sample.y))
+            return
+        }
         live!.holdTask?.cancel()
         live!.holdAnchor = sample
-        live!.snap = nil
         let id = live!.id
         live!.holdTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: holdDelay)
@@ -285,6 +298,8 @@ final class SketchModel {
             return
         }
         live!.snap = rec
+        live!.snapPen = live!.holdAnchor
+        live!.resized = nil
         NSLog("hold snapped to %@ (confidence %.2f)", String(describing: rec.shape), rec.confidence)
         showLive(predicted: [])
         snapHaptic()
@@ -326,10 +341,10 @@ final class SketchModel {
         }
         let createdMs = UInt64(max(0, Date().timeIntervalSince1970 * 1000))
         let element: Element
-        if let snap = stroke.snap {
+        if let snapped = stroke.shape {
             // Same id as the wet stream: receivers swap ink for shape.
             let shape = ShapeElement(
-                id: stroke.id, shape: snap.shape, tool: stroke.tool, color: stroke.color,
+                id: stroke.id, shape: snapped, tool: stroke.tool, color: stroke.color,
                 width: stroke.baseWidth, start: nil, end: nil, createdMs: createdMs)
             try? session.finishShape(sketch: sketchId, shape: shape)
             element = .shape(shape)
@@ -349,9 +364,9 @@ final class SketchModel {
 
     private func showLive(predicted: [RawSample]) {
         guard let stroke = live else { return }
-        if let snap = stroke.snap {
+        if let shape = stroke.shape {
             renderer?.setLocalShape(
-                snap.shape, tool: stroke.tool, color: stroke.color, baseWidth: stroke.baseWidth)
+                shape, tool: stroke.tool, color: stroke.color, baseWidth: stroke.baseWidth)
             return
         }
         let points = stroke.modeler.points() + stroke.modeler.predict(samples: predicted)

@@ -238,6 +238,105 @@ impl Shape {
     }
 }
 
+impl Shape {
+    /// The shape after the pen, held at `from` when the shape snapped, is
+    /// dragged to `to`: a line or arrow moves the endpoint under the pen; a
+    /// rectangle drags the side (both sides at a corner) under the pen
+    /// with the opposite side fixed; an ellipse scales about the point
+    /// opposite the pen, so a circle stays a circle. Call with the same
+    /// snapped shape and `from` for every move so jitter never accumulates.
+    pub fn resized(self, from: P, to: P) -> Self {
+        match self {
+            Self::Line { a, b } => {
+                if dist(from, a) < dist(from, b) {
+                    Self::Line { a: to, b }
+                } else {
+                    Self::Line { a, b: to }
+                }
+            }
+            Self::Arrow { a, b } => {
+                if dist(from, a) < dist(from, b) {
+                    Self::Arrow { a: to, b }
+                } else {
+                    Self::Arrow { a, b: to }
+                }
+            }
+            Self::Rect {
+                center,
+                size,
+                angle,
+            } => {
+                let (mut lo, mut hi) = (
+                    [-size[0] / 2.0, -size[1] / 2.0],
+                    [size[0] / 2.0, size[1] / 2.0],
+                );
+                let handle = rotate(sub(from, center), -angle);
+                let target = rotate(sub(to, center), -angle);
+                let reach = CORNER_REACH * size[0].min(size[1]);
+                let to_x = [(handle[0] - lo[0]).abs(), (hi[0] - handle[0]).abs()];
+                let to_y = [(handle[1] - lo[1]).abs(), (hi[1] - handle[1]).abs()];
+                let (nearest_x, nearest_y) = (to_x[0].min(to_x[1]), to_y[0].min(to_y[1]));
+                let corner = nearest_x <= reach && nearest_y <= reach;
+                if corner || nearest_x <= nearest_y {
+                    if to_x[0] <= to_x[1] {
+                        lo[0] = target[0].min(hi[0] - 1.0);
+                    } else {
+                        hi[0] = target[0].max(lo[0] + 1.0);
+                    }
+                }
+                if corner || nearest_y < nearest_x {
+                    if to_y[0] <= to_y[1] {
+                        lo[1] = target[1].min(hi[1] - 1.0);
+                    } else {
+                        hi[1] = target[1].max(lo[1] + 1.0);
+                    }
+                }
+                Self::Rect {
+                    center: add(center, rotate(mid(lo, hi), angle)),
+                    size: sub(hi, lo),
+                    angle,
+                }
+            }
+            Self::Ellipse {
+                center,
+                radii,
+                angle,
+            } => {
+                // Handle: the outline point in the pen's direction; its
+                // opposite stays put and everything scales about it.
+                let q = rotate(sub(from, center), -angle);
+                let u = [q[0] / radii[0], q[1] / radii[1]];
+                let r = norm(u);
+                if r <= f32::EPSILON {
+                    return self;
+                }
+                let unit = scale(u, 1.0 / r);
+                let on_outline = |sign: f32| {
+                    add(
+                        center,
+                        rotate(
+                            [sign * unit[0] * radii[0], sign * unit[1] * radii[1]],
+                            angle,
+                        ),
+                    )
+                };
+                let (handle, opposite) = (on_outline(1.0), on_outline(-1.0));
+                let axis = sub(handle, opposite);
+                let span = norm(axis);
+                if span <= f32::EPSILON {
+                    return self;
+                }
+                let k = (dot(sub(to, opposite), axis) / (span * span)).max(0.05);
+                Self::Ellipse {
+                    center: add(opposite, scale(sub(center, opposite), k)),
+                    radii: scale(radii, k),
+                    angle,
+                }
+            }
+        }
+    }
+}
+
 /// Both pen points, or their midpoint alone when they are close.
 fn pen_points(pen_down: P, pen_now: P, extent: P) -> Vec<P> {
     if dist(pen_down, pen_now) <= NEAR_PENS * extent[0].min(extent[1]) {
@@ -1790,6 +1889,104 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dragging_after_a_snap_resizes() {
+        let line = Shape::Line {
+            a: [0.0, 0.0],
+            b: [100.0, 0.0],
+        };
+        assert_eq!(
+            line.resized([99.0, 1.0], [150.0, 20.0]),
+            Shape::Line {
+                a: [0.0, 0.0],
+                b: [150.0, 20.0]
+            }
+        );
+        let arrow = Shape::Arrow {
+            a: [0.0, 0.0],
+            b: [100.0, 0.0],
+        };
+        assert_eq!(
+            arrow.resized([2.0, -1.0], [-30.0, 0.0]),
+            Shape::Arrow {
+                a: [-30.0, 0.0],
+                b: [100.0, 0.0]
+            }
+        );
+
+        let rect = Shape::Rect {
+            center: [50.0, 30.0],
+            size: [100.0, 60.0],
+            angle: 0.0,
+        };
+        // Holding the right side, drag it out: the left side stays.
+        assert_eq!(
+            rect.resized([99.0, 30.0], [140.0, 33.0]),
+            Shape::Rect {
+                center: [70.0, 30.0],
+                size: [140.0, 60.0],
+                angle: 0.0
+            }
+        );
+        // Holding the bottom-right corner, drag it: both sides follow.
+        assert_eq!(
+            rect.resized([98.0, 58.0], [120.0, 90.0]),
+            Shape::Rect {
+                center: [60.0, 45.0],
+                size: [120.0, 90.0],
+                angle: 0.0
+            }
+        );
+        // Dragging a side through the opposite one keeps a sliver.
+        let Shape::Rect { size, .. } = rect.resized([99.0, 30.0], [-40.0, 30.0]) else {
+            unreachable!()
+        };
+        assert!(size[0] > 0.0);
+        // A rotated rectangle resizes in its own frame.
+        let turned = Shape::Rect {
+            center: [0.0, 0.0],
+            size: [100.0, 60.0],
+            angle: FRAC_PI_2,
+        };
+        // Its "right" side (frame +x) points down the canvas: at (0, 50).
+        let Shape::Rect {
+            center,
+            size,
+            angle,
+        } = turned.resized([1.0, 49.0], [2.0, 80.0])
+        else {
+            unreachable!()
+        };
+        assert!(
+            near(size, [130.0, 60.0], 1e-3) && near(center, [0.0, 15.0], 1e-3),
+            "{size:?} {center:?}"
+        );
+        assert_eq!(angle, FRAC_PI_2);
+
+        // A circle held at its right edge and dragged out grows about its
+        // left edge and stays a circle.
+        let circle = Shape::Ellipse {
+            center: [0.0, 0.0],
+            radii: [50.0, 50.0],
+            angle: 0.0,
+        };
+        let Shape::Ellipse { center, radii, .. } = circle.resized([49.0, 2.0], [150.0, 10.0])
+        else {
+            unreachable!()
+        };
+        // The handle sits 2 units off the axis, so the growth axis tilts a
+        // touch with it.
+        assert!(
+            near(radii, [100.0, 100.0], 1.0) && near(center, [50.0, 0.0], 3.0),
+            "{radii:?} {center:?}"
+        );
+        // Dragging inward shrinks; it never inverts.
+        let Shape::Ellipse { radii, .. } = circle.resized([49.0, 0.0], [-80.0, 0.0]) else {
+            unreachable!()
+        };
+        assert!(radii[0] > 0.0 && radii[0] < 5.0, "{radii:?}");
+    }
+
     // ---- negatives ----
 
     #[test]
@@ -2122,6 +2319,16 @@ mod tests {
         ]
     }
 
+    /// Any rotation except within a couple of degrees of the 8° axis-snap
+    /// boundary, where jitter decides whether a copy snaps.
+    fn arb_angle_off_the_snap_boundary() -> impl Strategy<Value = f32> {
+        (
+            0_u8..4,
+            prop_oneof![-0.09_f32..0.09, 0.19_f32..(FRAC_PI_2 - 0.19)],
+        )
+            .prop_map(|(quarter, offset)| f32::from(quarter) * FRAC_PI_2 + offset)
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -2148,7 +2355,7 @@ mod tests {
         #[test]
         fn clean_shapes_are_recognised_equivariantly(
             path in arb_shape_path(),
-            angle in 0.0_f32..TAU,
+            angle in arb_angle_off_the_snap_boundary(),
             scale_by in 0.6_f32..3.0,
             dx in -1000.0_f32..1000.0,
             dy in -1000.0_f32..1000.0,

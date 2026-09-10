@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use pendant_core as pcore;
 
 use crate::types::{
-    Element, Recognition, Shape, Stroke, StrokePoint, Tilt, Tool, WET_WIDTH_FALLBACK, WetPoint,
-    wet_to_stroke_point,
+    Element, Point2, Recognition, Shape, Stroke, StrokePoint, Tilt, Tool, WET_WIDTH_FALLBACK,
+    WetPoint, wet_to_stroke_point,
 };
 
 /// One raw touch sample, before smoothing.
@@ -216,6 +216,18 @@ pub fn recognize_shape(points: Vec<StrokePoint>, hold_radius: f32) -> Option<Rec
         ..pcore::RecognizerParams::default()
     };
     pcore::recognize_with(&pts, &params).map(Into::into)
+}
+
+/// The snapped shape after the pen, held at `from` when it snapped, is
+/// dragged to `to`: a line or arrow moves the endpoint under the pen, a
+/// rectangle drags the side or corner under the pen with the opposite side
+/// fixed, an ellipse scales about the point opposite the pen. Pass the
+/// original snapped shape and `from` on every move.
+#[uniffi::export]
+pub fn resize_shape(shape: Shape, from: Point2, to: Point2) -> Shape {
+    pcore::Shape::from(shape)
+        .resized(from.into(), to.into())
+        .into()
 }
 
 #[cfg(test)]

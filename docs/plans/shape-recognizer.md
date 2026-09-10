@@ -358,3 +358,15 @@ its far sides. Two recognizer rules changed on the way: the ellipse
 soft-corner pre-check is gone (the radial and straight-run tests already
 separate a pointed ellipse from a D or a lens), and corner candidates within
 one straw window merge (a pointed tip could seed two).
+
+### Resize after the snap (same day)
+
+Moving the pen after a snap no longer discards it: the app regenerates the
+shape every move from the snapped shape, the point the pen held and the
+current pen point (`Shape::resized`, FFI `resize_shape`), so jitter never
+accumulates. A line or arrow moves the endpoint under the pen; a rectangle
+drags the side (both at a corner) under the pen with the opposite side
+fixed, in its own frame; an ellipse scales about the outline point
+opposite the pen, so circles stay circles and an oval keeps its aspect.
+Pen-up commits the resized shape. Changing an oval's aspect by dragging is
+not supported; redraw instead.
