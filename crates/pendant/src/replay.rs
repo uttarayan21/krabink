@@ -4,6 +4,7 @@
 //! This is the latency test rig for the desktop renderer (M5 gate).
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
@@ -149,9 +150,11 @@ async fn replay(args: ReplayArgs) -> Result<()> {
     )
     .await?;
 
-    println!(
+    writeln!(
+        std::io::stdout(),
         "replay note {note_id} / sketch {sketch}; open it in the desktop app (or run with --follow-latest)"
-    );
+    )
+    .change_context(Error)?;
 
     for i in 0..args.strokes {
         stream_stroke(
@@ -167,7 +170,7 @@ async fn replay(args: ReplayArgs) -> Result<()> {
         tokio::time::sleep(PAUSE_BETWEEN).await;
     }
 
-    println!("replayed {} strokes", args.strokes);
+    writeln!(std::io::stdout(), "replayed {} strokes", args.strokes).change_context(Error)?;
     Ok(())
 }
 
@@ -356,6 +359,11 @@ async fn stream_stroke(
     .change_context(Error)?;
     let payload = note.export_updates_since(&before).change_context(Error)?;
     send_all(sink, session.local_update(note_key, payload)).await?;
-    println!("stroke {} committed ({stroke_id})", index + 1);
+    writeln!(
+        std::io::stdout(),
+        "stroke {} committed ({stroke_id})",
+        index + 1
+    )
+    .change_context(Error)?;
     Ok(())
 }

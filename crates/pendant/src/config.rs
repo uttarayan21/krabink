@@ -2,6 +2,7 @@
 //! and dedicated-relay settings from `~/.config/pendant/config.toml`, both
 //! overridable from the CLI so several instances can run side by side.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use pendant_core::{DeviceId, PairInfo};
@@ -84,7 +85,13 @@ pub fn adopt_pair(uri: &str) -> Result<()> {
     let info = PairInfo::parse(uri)
         .ok_or_else(|| Report::new(Error).attach("not a pendant://pair URI"))?;
     let path = persist_pair(&info)?;
-    println!("paired: {} -> {}", info.server, path.display());
+    writeln!(
+        std::io::stdout(),
+        "paired: {} -> {}",
+        info.server,
+        path.display()
+    )
+    .change_context(Error)?;
     Ok(())
 }
 
