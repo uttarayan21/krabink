@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f2043602babfdfddaba9d7eb0f8e3174ae335b787ad47b0440c2c91ae6dd9c0f # shrinks to pts = [StrokePoint { x: 0.0, y: 0.0, force: 0.0, t_ms: 0, tilt: None, size: None }], base = 0.5, tol = 1.9633361

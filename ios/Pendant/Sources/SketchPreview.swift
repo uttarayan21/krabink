@@ -110,7 +110,7 @@ struct SketchPreview: UIViewRepresentable {
         }
 
         /// Render committed strokes to a bounded thumbnail from the core's
-        /// ribbon triangles — the same ink the canvas and the desktop show.
+        /// ribbon outline — the same ink the canvas shows.
         /// Empty sketch → a placeholder box.
         private func thumbnail(id: String, model: NoteModel) -> UIImage {
             let strokes = (try? model.session.strokes(sketch: id)) ?? []

@@ -29,8 +29,8 @@ mod workspace;
 
 pub use export::{ExportAsset, ExportBundle, SKETCH_URI_PREFIX, strokes_to_svg};
 pub use geom::{
-    RibbonMesh, flatten_stroke, hits, nib_ribbon, ribbon, ribbon_for, ribbon_outline,
-    ribbon_triangles,
+    DEFAULT_TOLERANCE, StrokeMesh, flatten_stroke, hits, mesh_triangles, ribbon_outline,
+    stroke_mesh,
 };
 pub use ids::{DeviceId, NoteId, SketchId, StrokeId};
 pub use note::NoteDoc;

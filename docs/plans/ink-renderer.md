@@ -75,6 +75,22 @@ Files: `crates/pendant-core/src/geom.rs` (split into `geom/flatten.rs`,
 Exit: `cargo nextest run --workspace`, clippy, fmt green. Desktop renders
 strokes with round caps/joins (it already goes through `ribbon_for`).
 
+Done (commit after `40278b2`). Decisions taken while implementing:
+- B-spline strokes are flattened first (`flatten_stroke`, 8 samples per
+  span) and fed to lyon as `line_to` segments, so width interpolates
+  linearly along the arc. Lyon's Bézier path is not used; revisit only if
+  the sample count shows up in profiles.
+- Public API: `StrokeMesh`, `stroke_mesh(tool, points, base_width,
+  tolerance)`, `mesh_triangles(..)`, `DEFAULT_TOLERANCE = 0.25`.
+  `ribbon_outline` stays (legacy flat ribbon) for the iPad's CAShapeLayers
+  and is the only caller of the old ribbon code. FFI `stroke_triangles` /
+  `wet_triangles` gained a `tolerance` argument and `default_tolerance()`.
+- Non-finite points are dropped before tessellation; a lyon error logs a
+  warning and yields an empty mesh instead of panicking.
+- Tolerance is clamped to a quarter of the thinnest width in the stroke:
+  lyon drops geometry finer than its tolerance, so a coarse tolerance on
+  hairline ink erased the whole stroke (found by the proptest).
+
 ### Phase 1: brush model in core (input pipeline)
 
 Files: new `crates/pendant-core/src/brush.rs`, `wetink.rs`, FFI `types.rs`.

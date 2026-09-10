@@ -172,21 +172,31 @@ const WET_WIDTH_FALLBACK: f32 = 2.0;
 /// The committed stroke's ink as consistently wound triangles, flat
 /// `[x0, y0, x1, y1, x2, y2, …]` in canvas units. Fill with the non-zero
 /// rule. This is the desktop's exact geometry, so both platforms draw the
-/// same ink.
+/// same ink. `tolerance` bounds cap/join flattening error in canvas units;
+/// pass [`default_tolerance`] divided by the zoom factor.
 #[uniffi::export]
-pub fn stroke_triangles(stroke: Stroke) -> Vec<f32> {
+pub fn stroke_triangles(stroke: Stroke, tolerance: f32) -> Vec<f32> {
     let stroke = pcore::Stroke::from(stroke);
     let flat = pcore::flatten_stroke(&stroke);
-    flatten_xy(pcore::ribbon_triangles(
+    flatten_xy(pcore::mesh_triangles(
         stroke.tool,
         &flat,
         stroke.base_width,
+        tolerance,
     ))
 }
 
+/// Cap/join flattening tolerance for 1:1 zoom, canvas units.
+#[uniffi::export]
+pub fn default_tolerance() -> f32 {
+    pcore::DEFAULT_TOLERANCE
+}
+
 /// The committed stroke's ink as one closed outline polygon, flat
-/// `[x0, y0, x1, y1, …]`. Same geometry as [`stroke_triangles`] but a single
-/// boundary, so path fillers antialias it cleanly. Fill non-zero.
+/// `[x0, y0, x1, y1, …]`, for path fillers that need a single antialiased
+/// boundary. Fill non-zero. Legacy flat-ribbon geometry (butt ends, no
+/// joins), *not* the [`stroke_triangles`] mesh; goes away once the iPad
+/// draws meshes directly (`docs/plans/ink-renderer.md`).
 #[uniffi::export]
 pub fn stroke_outline(stroke: Stroke) -> Vec<f32> {
     let stroke = pcore::Stroke::from(stroke);
@@ -208,12 +218,18 @@ pub fn wet_outline(points: Vec<WetPoint>, tool: Tool, base_width: f32) -> Vec<f3
 /// Provisional (wet) ink for the points received so far, same geometry
 /// as [`stroke_triangles`].
 #[uniffi::export]
-pub fn wet_triangles(points: Vec<WetPoint>, tool: Tool, base_width: f32) -> Vec<f32> {
+pub fn wet_triangles(
+    points: Vec<WetPoint>,
+    tool: Tool,
+    base_width: f32,
+    tolerance: f32,
+) -> Vec<f32> {
     let flat: Vec<pcore::StrokePoint> = points.iter().map(wet_to_stroke_point).collect();
-    flatten_xy(pcore::ribbon_triangles(
+    flatten_xy(pcore::mesh_triangles(
         tool.into(),
         &flat,
         base_width.max(WET_WIDTH_FALLBACK),
+        tolerance,
     ))
 }
 

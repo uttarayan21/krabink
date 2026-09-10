@@ -3,7 +3,7 @@
 //! exposed to egui through a custom `pendant://` texture loader so the
 //! markdown preview embeds it inline.
 //!
-//! Committed CRDT strokes become ribbon meshes; wet ink from the ephemeral
+//! Committed CRDT strokes become ink meshes; wet ink from the ephemeral
 //! channel renders as provisional meshes on top and is dropped once the
 //! authoritative stroke lands (or after a timeout).
 
@@ -18,8 +18,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::TextureUsages;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, EguiUserTextures, egui};
 use pendant_core::{
-    DocKey, PointSize, Rgba, SKETCH_URI_PREFIX, SketchId, StrokeId, StrokePoint, Tilt, Tool,
-    WetInk, WetPoint, flatten_stroke, ribbon_for,
+    DEFAULT_TOLERANCE, DocKey, PointSize, Rgba, SKETCH_URI_PREFIX, SketchId, StrokeId, StrokePoint,
+    Tilt, Tool, WetInk, WetPoint, flatten_stroke, stroke_mesh,
 };
 
 use crate::docs::{Docs, now_ms};
@@ -225,7 +225,7 @@ fn sync_sketch_scenes(
                 continue;
             }
             let flat = flatten_stroke(stroke);
-            let entity = ribbon_mesh(stroke.tool, &flat, stroke.base_width).map(|mesh| {
+            let entity = ink_mesh(stroke.tool, &flat, stroke.base_width).map(|mesh| {
                 commands
                     .spawn((
                         Mesh2d(meshes.add(mesh)),
@@ -323,26 +323,22 @@ fn color_of(rgba: Rgba) -> ColorMaterial {
     ColorMaterial::from(Color::srgba_u8(r, g, b, a))
 }
 
-/// Canvas-space ribbon → bevy mesh (y flipped into bevy's y-up space).
+/// Canvas-space stroke mesh → bevy mesh (y flipped into bevy's y-up space).
 /// `None` when there is nothing to draw: bevy's mesh allocator never
 /// allocates a zero-vertex mesh but still tries to upload it, logging a
 /// "Use-after-free" error every frame the mesh is extracted.
-fn ribbon_mesh(tool: Tool, points: &[StrokePoint], base_width: f32) -> Option<Mesh> {
-    let ribbon = ribbon_for(tool, points, base_width);
-    if ribbon.positions.is_empty() {
+fn ink_mesh(tool: Tool, points: &[StrokePoint], base_width: f32) -> Option<Mesh> {
+    let ink = stroke_mesh(tool, points, base_width, DEFAULT_TOLERANCE);
+    if ink.is_empty() {
         return None;
     }
-    let positions: Vec<[f32; 3]> = ribbon
-        .positions
-        .iter()
-        .map(|[x, y]| [*x, -*y, 0.0])
-        .collect();
+    let positions: Vec<[f32; 3]> = ink.positions.iter().map(|[x, y]| [*x, -*y, 0.0]).collect();
     let mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
     )
     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_indices(Indices::U32(ribbon.indices));
+    .with_inserted_indices(Indices::U32(ink.indices));
     Some(mesh)
 }
 
@@ -430,8 +426,7 @@ fn apply_wet_ink(
                         size: p.width.map(|w| PointSize { w, h: w }),
                     })
                     .collect();
-                let Some(mesh) =
-                    ribbon_mesh(wet.tool, &flat, wet.base_width.max(WET_WIDTH_FALLBACK))
+                let Some(mesh) = ink_mesh(wet.tool, &flat, wet.base_width.max(WET_WIDTH_FALLBACK))
                 else {
                     continue; // nothing drawable yet
                 };

@@ -1,10 +1,11 @@
 // Full-screen sketch canvas. PencilKit is the *input device only*: a
 // transparent PKCanvasView whose drawing is kept empty provides pen capture,
 // the tool picker and the ruler. Every visible stroke — committed or wet,
-// local or remote — is tessellated by the Rust core (`strokeTriangles` /
-// `wetTriangles`: the same ribbon geometry the desktop renders) and filled
-// into CAShapeLayers on an ink view over the canvas content. Desktop and
-// iPad therefore draw identical ink from identical data.
+// local or remote — is geometry from the Rust core (`strokeOutline` /
+// `wetOutline`) filled into CAShapeLayers on an ink view over the canvas
+// content. That outline is the legacy flat ribbon; the desktop already
+// draws the core's lyon mesh (round caps and joins). The iPad moves to the
+// mesh with its own Metal renderer — see docs/plans/ink-renderer.md.
 //
 // Local strokes: PencilKit renders the live stroke itself (lowest latency)
 // while the active observer streams wet samples onto the ephemeral channel;
@@ -350,9 +351,8 @@ final class SketchModel {
 }
 
 /// All ink on screen: one CAShapeLayer per committed stroke (z = CRDT
-/// order) plus wet overlays on top, each filled with the core's ribbon
-/// outline (one polygon, non-zero rule: same coverage as the desktop mesh,
-/// one clean antialiased edge).
+/// order) plus wet overlays on top, each filled with the core's legacy
+/// ribbon outline (one polygon, non-zero rule, one clean antialiased edge).
 @MainActor
 final class InkView: UIView {
     private var strokes: [String: CAShapeLayer] = [:]

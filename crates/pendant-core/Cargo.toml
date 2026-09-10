@@ -13,6 +13,7 @@ ulid.workspace = true
 tracing.workspace = true
 loro.workspace = true
 redb.workspace = true
+lyon_tessellation.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
