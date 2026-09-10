@@ -18,8 +18,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::TextureUsages;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, EguiUserTextures, egui};
 use pendant_core::{
-    DEFAULT_TOLERANCE, DocKey, PointSize, Rgba, SKETCH_URI_PREFIX, SketchId, StrokeId, StrokePoint,
-    Tilt, Tool, WetInk, WetPoint, stroke_mesh,
+    DEFAULT_TOLERANCE, DocKey, Element, PointSize, Rgba, SKETCH_URI_PREFIX, SketchId, StrokeId,
+    StrokePoint, Tilt, Tool, WetInk, WetPoint, stroke_mesh,
 };
 
 use crate::docs::{Docs, now_ms};
@@ -63,7 +63,7 @@ struct SketchScene {
     image: Handle<Image>,
     camera: Entity,
     size: UVec2,
-    /// Committed stroke id → mesh entity (`None` for strokes with no ink).
+    /// Committed element id → mesh entity (`None` for elements with no ink).
     strokes: HashMap<StrokeId, Option<Entity>>,
 }
 
@@ -169,18 +169,21 @@ fn sync_sketch_scenes(
     };
 
     for sketch in note.sketch_ids() {
-        let strokes = match note.strokes(sketch) {
-            Ok(strokes) => strokes,
+        let elements = match note.elements(sketch) {
+            Ok(elements) => elements,
             Err(err) => {
-                tracing::error!(%err, %sketch, "reading strokes failed");
+                tracing::error!(%err, %sketch, "reading elements failed");
                 continue;
             }
         };
+        // Strokes and shapes alike render their outline.
+        let outlines: Vec<(&Element, Vec<StrokePoint>)> =
+            elements.iter().map(|el| (el, el.outline())).collect();
 
         // Content bounds decide the render-target size.
-        let max = strokes
+        let max = outlines
             .iter()
-            .flat_map(|s| &s.points)
+            .flat_map(|(_, pts)| pts)
             .fold((0.0f32, 0.0f32), |(mx, my), p| (mx.max(p.x), my.max(p.y)));
         let desired = UVec2::new(target_extent(max.0), target_extent(max.1));
 
@@ -219,26 +222,27 @@ fn sync_sketch_scenes(
             };
         }
 
-        // Diff committed strokes.
+        // Diff committed elements.
         let mut stale: HashMap<_, _> = scene.strokes.clone();
-        for (z, stroke) in strokes.iter().enumerate() {
-            if stale.remove(&stroke.id).is_some() {
+        for (z, (element, outline)) in outlines.iter().enumerate() {
+            let id = element.id();
+            if stale.remove(&id).is_some() {
                 continue;
             }
-            let flat = stroke.flatten();
-            let entity = ink_mesh(stroke.tool, &flat, stroke.base_width).map(|mesh| {
+            let entity = ink_mesh(element.tool(), outline, element.base_width()).map(|mesh| {
                 commands
                     .spawn((
                         Mesh2d(meshes.add(mesh)),
-                        MeshMaterial2d(materials.add(color_of(stroke.color))),
+                        MeshMaterial2d(materials.add(color_of(element.color()))),
                         Transform::from_xyz(0.0, 0.0, z as f32 * 0.01),
                         RenderLayers::layer(scene.layer),
                     ))
                     .id()
             });
-            scene.strokes.insert(stroke.id, entity);
-            // Committed stroke replaces its wet-ink preview.
-            if let Some(wet) = scenes.wet.remove(&stroke.id)
+            scene.strokes.insert(id, entity);
+            // A committed element (stroke or snapped shape) replaces its
+            // wet-ink preview.
+            if let Some(wet) = scenes.wet.remove(&id)
                 && let Some(entity) = wet.entity
             {
                 commands.entity(entity).despawn();
