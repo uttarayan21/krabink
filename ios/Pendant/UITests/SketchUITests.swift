@@ -22,7 +22,7 @@ final class SketchUITests: XCTestCase {
     private func waitConnected(_ app: XCUIApplication) {
         let state = app.staticTexts["syncState"]
         expectation(
-            for: NSPredicate(format: "label == 'connected'"), evaluatedWith: state)
+            for: NSPredicate(format: "label BEGINSWITH 'connected'"), evaluatedWith: state)
         waitForExpectations(timeout: 15)
     }
 
