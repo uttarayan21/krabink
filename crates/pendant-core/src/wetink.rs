@@ -18,11 +18,15 @@ pub struct WetPoint {
     /// Rendered line width at this sample, canvas units. `None` → receivers
     /// fall back to `base_width * force`.
     pub width: Option<f32>,
+    /// Flat-nib orientation (azimuth + roll, radians) for nib tools.
+    pub nib: Option<f32>,
 }
 
 /// A wet-ink event. `Begin` → `Points`* → `End`, keyed by the stroke id the
 /// authoritative CRDT stroke will use, so receivers can swap provisional ink
-/// for the committed stroke.
+/// for the committed stroke. `Cancel` replaces `End` when no stroke will
+/// follow (the pen manipulated a ruler or a tool, not the ink): receivers
+/// drop the provisional ink at once instead of waiting for a commit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WetInk {
     Begin {
@@ -44,6 +48,9 @@ pub enum WetInk {
     End {
         stroke: StrokeId,
         sent_ms: u64,
+    },
+    Cancel {
+        stroke: StrokeId,
     },
 }
 
@@ -73,12 +80,14 @@ mod tests {
                     y: -2.0,
                     force: 0.5,
                     width: Some(3.25),
+                    nib: Some(1.2),
                 },
                 WetPoint {
                     x: 2.5,
                     y: -1.0,
                     force: 0.75,
                     width: None,
+                    nib: None,
                 },
             ],
         };

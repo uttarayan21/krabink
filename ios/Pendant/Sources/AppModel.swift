@@ -12,6 +12,12 @@ final class AppModel {
     let core: Core
     var notes: [NoteInfo] = []
     var syncState = "offline"
+    private var target: PairInfo?
+    private var discovery: RelayDiscovery?
+    private var graceTask: Task<Void, Never>?
+    private var graceOver = false
+    /// Last direct list handed to the core, to skip no-op reconnects.
+    private var applied: [String]?
     private var open: [String: NoteModel] = [:]
     private var hasServer = false
     private let pathMonitor = NWPathMonitor()
@@ -33,8 +39,12 @@ final class AppModel {
         if let url = defaults.string(forKey: "serverURL"),
             let token = defaults.string(forKey: "token")
         {
-            applyServer(
-                url: url, token: token, fallback: defaults.string(forKey: "fallbackURL"))
+            applyTarget(
+                PairInfo(
+                    server: url, token: token,
+                    fallback: defaults.string(forKey: "fallbackURL"),
+                    alt: defaults.stringArray(forKey: "altURLs") ?? [],
+                    relayId: defaults.string(forKey: "relayId")))
         }
         // `-pairURI pendant://pair?…` takes the same path as a scanned QR;
         // exists so UI tests can exercise pairing without a camera.
@@ -64,29 +74,83 @@ final class AppModel {
         defaults.set(info.server, forKey: "serverURL")
         defaults.set(info.token, forKey: "token")
         defaults.set(info.fallback, forKey: "fallbackURL")
-        applyServer(url: info.server, token: info.token, fallback: info.fallback)
+        defaults.set(info.alt, forKey: "altURLs")
+        defaults.set(info.relayId, forKey: "relayId")
+        applyTarget(info)
         return true
     }
 
-    /// The URI this device shows as a QR code; nil while offline.
-    var pairURI: String? {
+    /// The stored pairing coordinates; nil while offline.
+    var pairInfo: PairInfo? {
         let defaults = UserDefaults.standard
         guard let url = defaults.string(forKey: "serverURL"),
             let token = defaults.string(forKey: "token")
         else { return nil }
-        return buildPairUri(
-            server: url, token: token, fallback: defaults.string(forKey: "fallbackURL"))
+        return PairInfo(
+            server: url, token: token,
+            fallback: defaults.string(forKey: "fallbackURL"),
+            alt: defaults.stringArray(forKey: "altURLs") ?? [],
+            relayId: defaults.string(forKey: "relayId"))
     }
 
-    /// Direct path first, dedicated relay as fallback (see Core.setSyncServer).
-    private func applyServer(url: String, token: String, fallback: String?) {
-        core.setSyncServer(url: url, token: token, fallback: fallback)
+    /// The URI this device shows as a QR code; nil while offline.
+    var pairURI: String? {
+        pairInfo.map(buildPairUri)
+    }
+
+    /// Direct URL Bonjour found for the paired desktop, if any.
+    var discoveredURL: String? { discovery?.url }
+
+    /// Adopt pairing coordinates: start looking for the desktop on the
+    /// local network, then hand the core its candidate list (see
+    /// `retarget`). Registration in the device registry rides along.
+    private func applyTarget(_ info: PairInfo) {
+        target = info
         hasServer = true
-        try? core.connect()
-        syncState = "connecting"
+        applied = nil
+        graceOver = false
+        discovery?.stop()
+        discovery = nil
+        graceTask?.cancel()
+        if let relayId = info.relayId {
+            let finder = RelayDiscovery(relayId: relayId)
+            finder.onChange = { [weak self] in self?.retarget() }
+            finder.start()
+            discovery = finder
+            syncState = "looking for desktop…"
+            // Give Bonjour a moment before committing to the stored
+            // addresses; a hit cancels the wait via onChange.
+            graceTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled else { return }
+                self?.graceOver = true
+                self?.retarget()
+            }
+        } else {
+            graceOver = true
+            retarget()
+        }
         // Announce this device in the synced registry so peers can list it.
         try? core.registerDevice(
             name: UIDevice.current.name, platform: UIDevice.current.model)
+    }
+
+    /// Hand the core its direct candidates (Bonjour hit first, then the
+    /// QR's addresses) plus the fallback relay. The core races the direct
+    /// paths and only uses the fallback when none answers.
+    private func retarget() {
+        guard let target, graceOver || discovery?.url != nil else { return }
+        graceOver = true
+        var direct = [target.server] + target.alt
+        if let found = discovery?.url {
+            direct.removeAll { $0 == found }
+            direct.insert(found, at: 0)
+        }
+        guard direct != applied else { return }
+        applied = direct
+        core.setSyncServer(direct: direct, token: target.token, fallback: target.fallback)
+        try? core.connect()
+        syncState = "connecting"
     }
 
     /// Registry row is gone everywhere once this syncs; note history stays
@@ -101,14 +165,22 @@ final class AppModel {
         core.listDevices()
     }
 
+    /// Forget a paired device everywhere. It comes back if it reconnects
+    /// with the same token; this is housekeeping, not revocation.
+    func removeDevice(id: String) {
+        try? core.removeDevice(id: id)
+    }
+
     /// Foreground / network-return: restart background sync.
     func resume() {
         guard hasServer else { return }
+        discovery?.start()
         try? core.connect()
     }
 
     /// Background: drop the socket so iOS doesn't kill us holding it.
     func suspend() {
+        discovery?.stop()
         core.suspend()
     }
 
@@ -262,6 +334,11 @@ final class NoteModel: Identifiable {
         guard let sketch = wetStrokeSketch.removeValue(forKey: stroke) else { return }
         sketches[sketch]?.remoteWetEnd(stroke: stroke)
     }
+
+    func wetCancel(stroke: String) {
+        guard let sketch = wetStrokeSketch.removeValue(forKey: stroke) else { return }
+        sketches[sketch]?.remoteWetCancel(stroke: stroke)
+    }
 }
 
 // Nonisolated bridges: uniffi calls these from the Rust network thread.
@@ -279,7 +356,7 @@ private final class CoreEvents: CoreListener {
         switch state {
         case .disconnected: label = "offline"
         case .connecting: label = "connecting"
-        case .connected: label = "connected"
+        case .connected(let url): label = "connected via \(url)"
         case .fatal(let message): label = "error: \(message)"
         }
         Task { @MainActor [weak model] in model?.syncState = label }
@@ -323,5 +400,9 @@ private final class NoteEvents: NoteListener {
 
     func wetEnd(stroke: String) {
         Task { @MainActor [weak model] in model?.wetEnd(stroke: stroke) }
+    }
+
+    func wetCancel(stroke: String) {
+        Task { @MainActor [weak model] in model?.wetCancel(stroke: stroke) }
     }
 }

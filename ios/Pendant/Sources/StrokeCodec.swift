@@ -13,6 +13,9 @@ enum StrokeCodec {
         case .pen: .pen
         case .marker: .marker
         case .monoline: .monoline
+        // PencilKit's fountain pen is the one ink that answers to barrel
+        // roll; the core renders it as a flat nib.
+        case .brush: .fountainPen
         }
     }
 
@@ -20,6 +23,7 @@ enum StrokeCodec {
         switch ink {
         case .marker: .marker
         case .monoline: .monoline
+        case .fountainPen: .brush
         default: .pen
         }
     }
@@ -43,16 +47,22 @@ enum StrokeCodec {
             alpha: CGFloat(v & 0xff) / 255)
     }
 
-    static func encode(_ stroke: PKStroke, id: String) -> Stroke {
-        let baseWidth = Float(stroke.path.first?.size.width ?? 10)
+    /// `samples` are the raw pen samples the observer saw for this stroke;
+    /// PencilKit's control points carry azimuth/altitude but not barrel
+    /// roll, so roll is looked up from the nearest sample by location.
+    static func encode(_ stroke: PKStroke, id: String, samples: [PenSample] = []) -> Stroke {
+        let scale = Float(renderedWidthScale(stroke))
+        let baseWidth = Float(stroke.path.first?.size.width ?? 10) * scale
         let points = stroke.path.map { p in
             StrokePoint(
                 x: Float(p.location.x),
                 y: Float(p.location.y),
                 force: Float(p.force),
                 tMs: UInt32(max(0, p.timeOffset * 1000)),
-                tilt: Tilt(azimuth: Float(p.azimuth), altitude: Float(p.altitude)),
-                size: PointSize(w: Float(p.size.width), h: Float(p.size.height)))
+                tilt: Tilt(
+                    azimuth: Float(p.azimuth), altitude: Float(p.altitude),
+                    roll: Float(nearestRoll(to: p.location, in: samples))),
+                size: PointSize(w: Float(p.size.width) * scale, h: Float(p.size.height) * scale))
         }
         return Stroke(
             id: id,
@@ -62,6 +72,34 @@ enum StrokeCodec {
             kind: .bsplineControl,
             points: points,
             createdMs: UInt64(max(0, stroke.path.creationDate.timeIntervalSince1970 * 1000)))
+    }
+
+    /// PencilKit draws some inks (the marker's chisel nib above all) wider
+    /// than the point sizes it stores. Its own render bounds tell how wide
+    /// the ink really is; scale the stored sizes so every renderer of the
+    /// shared model draws what PencilKit drew.
+    private static func renderedWidthScale(_ stroke: PKStroke) -> CGFloat {
+        let widths = stroke.path.map { $0.size.width }
+        guard let maxWidth = widths.max(), maxWidth > 0, !stroke.path.isEmpty else { return 1 }
+        var box = CGRect.null
+        for p in stroke.path { box = box.union(CGRect(origin: p.location, size: .zero)) }
+        let rendered = stroke.renderBounds
+        // Each side of the render bounds extends ~half the rendered width
+        // beyond the path on the axis where the ink is widest.
+        let extra = max(rendered.width - box.width, rendered.height - box.height)
+        guard extra > 0 else { return 1 }
+        return min(4, max(0.5, extra / maxWidth))
+    }
+
+    private static func nearestRoll(to location: CGPoint, in samples: [PenSample]) -> CGFloat {
+        var best: (d2: CGFloat, roll: CGFloat) = (.greatestFiniteMagnitude, 0)
+        for s in samples {
+            let dx = s.location.x - location.x
+            let dy = s.location.y - location.y
+            let d2 = dx * dx + dy * dy
+            if d2 < best.d2 { best = (d2, s.roll) }
+        }
+        return best.roll
     }
 
     static func decode(_ stroke: Stroke) -> PKStroke {

@@ -21,6 +21,10 @@ pub enum Tool {
     Pen,
     Marker,
     Monoline,
+    /// Flat calligraphy nib: `base_width` wide, oriented by the pen's
+    /// azimuth + barrel roll (Apple Pencil Pro), so the ink is broad across
+    /// the nib and thin along it.
+    Brush,
 }
 
 impl Tool {
@@ -29,7 +33,14 @@ impl Tool {
             Self::Pen => "pen",
             Self::Marker => "marker",
             Self::Monoline => "monoline",
+            Self::Brush => "brush",
         }
+    }
+
+    /// Does this tool's ink follow the nib orientation rather than the
+    /// direction of motion?
+    pub fn has_nib(self) -> bool {
+        matches!(self, Self::Brush)
     }
 }
 
@@ -41,6 +52,7 @@ impl core::str::FromStr for Tool {
             "pen" => Ok(Self::Pen),
             "marker" => Ok(Self::Marker),
             "monoline" => Ok(Self::Monoline),
+            "brush" => Ok(Self::Brush),
             other => Err(Error::Schema(format!("unknown tool {other:?}"))),
         }
     }
@@ -76,13 +88,23 @@ impl core::str::FromStr for PointKind {
     }
 }
 
-/// Pen tilt, PencilKit-authored strokes only.
+/// Pen orientation, PencilKit-authored strokes only.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Tilt {
     /// Radians, 0..2π.
     pub azimuth: f32,
     /// Radians, 0 (flat) .. π/2 (perpendicular).
     pub altitude: f32,
+    /// Barrel roll, radians -π..π; 0 for pens that cannot report it.
+    pub roll: f32,
+}
+
+impl Tilt {
+    /// Orientation of a flat nib on the canvas: where the barrel points,
+    /// turned by how far it was rolled.
+    pub fn nib_angle(self) -> f32 {
+        self.azimuth + self.roll
+    }
 }
 
 /// Rendered point size in canvas units, PencilKit-authored strokes only.
@@ -121,6 +143,7 @@ impl StrokePoint {
             tilt: self.tilt.map(|t| Tilt {
                 azimuth: unpack_azimuth(pack_azimuth(t.azimuth)),
                 altitude: unpack_altitude(pack_altitude(t.altitude)),
+                roll: unpack_roll(pack_roll(t.roll)),
             }),
             size: self.size.map(|s| PointSize {
                 w: unpack_size(pack_size(s.w)),
@@ -172,6 +195,49 @@ struct ChunkRepr {
     tilts: Option<Vec<(u8, u8)>>,
     /// Quantised (w, h) per point, parallel run like `tilts`.
     sizes: Option<Vec<(u16, u16)>>,
+    /// Quantised barrel roll per point, parallel to `tilts` (present iff
+    /// `tilts` is). Added after the first data shipped; see `ChunkReprV1`.
+    rolls: Option<Vec<u8>>,
+}
+
+/// Chunk layout before `rolls` existed. Postcard is not self-describing,
+/// so old bytes are decoded through this and read as roll 0.
+#[derive(Debug, Deserialize)]
+struct ChunkReprV1 {
+    qx0: i32,
+    qy0: i32,
+    t0_ms: u32,
+    force0: u8,
+    deltas: Vec<(i16, i16, u8, u16)>,
+    tilts: Option<Vec<(u8, u8)>>,
+    sizes: Option<Vec<(u16, u16)>>,
+}
+
+impl From<ChunkReprV1> for ChunkRepr {
+    fn from(v1: ChunkReprV1) -> Self {
+        let rolls = v1.tilts.as_ref().map(|t| vec![pack_roll(0.0); t.len()]);
+        Self {
+            qx0: v1.qx0,
+            qy0: v1.qy0,
+            t0_ms: v1.t0_ms,
+            force0: v1.force0,
+            deltas: v1.deltas,
+            tilts: v1.tilts,
+            sizes: v1.sizes,
+            rolls,
+        }
+    }
+}
+
+/// Roll in 1/256 turns as a two's-complement byte, so 0 is exact and
+/// -π..π covers -128..127 (about 1.4° per step).
+fn pack_roll(v: f32) -> u8 {
+    let steps = (v / core::f32::consts::TAU * 256.0).round();
+    (steps.clamp(-128.0, 127.0) as i8) as u8
+}
+
+fn unpack_roll(v: u8) -> f32 {
+    f32::from(v as i8) / 256.0 * core::f32::consts::TAU
 }
 
 fn pack_azimuth(rad: f32) -> u8 {
@@ -218,29 +284,11 @@ pub fn encode_chunks(points: &[StrokePoint]) -> Result<Vec<Vec<u8>>> {
             t0_ms: first.t_ms,
             force0: (first.force.clamp(0.0, 1.0) * 255.0).round() as u8,
             deltas: Vec::new(),
-            tilts: with_tilt.then(|| {
-                vec![(
-                    pack_azimuth(
-                        first
-                            .tilt
-                            .unwrap_or(Tilt {
-                                azimuth: 0.0,
-                                altitude: 0.0,
-                            })
-                            .azimuth,
-                    ),
-                    pack_altitude(
-                        first
-                            .tilt
-                            .unwrap_or(Tilt {
-                                azimuth: 0.0,
-                                altitude: 0.0,
-                            })
-                            .altitude,
-                    ),
-                )]
-            }),
+            tilts: first
+                .tilt
+                .map(|t| vec![(pack_azimuth(t.azimuth), pack_altitude(t.altitude))]),
             sizes: first.size.map(|s| vec![(pack_size(s.w), pack_size(s.h))]),
+            rolls: first.tilt.map(|t| vec![pack_roll(t.roll)]),
         };
         let (mut prev_qx, mut prev_qy, mut prev_t) = (repr.qx0, repr.qy0, repr.t0_ms);
 
@@ -267,6 +315,9 @@ pub fn encode_chunks(points: &[StrokePoint]) -> Result<Vec<Vec<u8>>> {
             if let (Some(tilts), Some(tilt)) = (repr.tilts.as_mut(), next.tilt) {
                 tilts.push((pack_azimuth(tilt.azimuth), pack_altitude(tilt.altitude)));
             }
+            if let (Some(rolls), Some(tilt)) = (repr.rolls.as_mut(), next.tilt) {
+                rolls.push(pack_roll(tilt.roll));
+            }
             if let (Some(sizes), Some(size)) = (repr.sizes.as_mut(), next.size) {
                 sizes.push((pack_size(size.w), pack_size(size.h)));
             }
@@ -284,11 +335,19 @@ pub fn decode_chunks<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> Result<V
     let mut points = Vec::new();
 
     for bytes in chunks {
-        let repr: ChunkRepr = postcard::from_bytes(bytes)?;
+        let repr: ChunkRepr = match postcard::from_bytes::<ChunkRepr>(bytes) {
+            Ok(repr) => repr,
+            Err(_) => postcard::from_bytes::<ChunkReprV1>(bytes)?.into(),
+        };
         if let Some(tilts) = &repr.tilts
             && tilts.len() != repr.deltas.len() + 1
         {
             return Err(Error::Schema("tilt run length mismatch".into()));
+        }
+        if let Some(rolls) = &repr.rolls
+            && rolls.len() != repr.deltas.len() + 1
+        {
+            return Err(Error::Schema("roll run length mismatch".into()));
         }
         if let Some(sizes) = &repr.sizes
             && sizes.len() != repr.deltas.len() + 1
@@ -300,6 +359,7 @@ pub fn decode_chunks<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> Result<V
             repr.tilts.as_ref().map(|t| Tilt {
                 azimuth: unpack_azimuth(t[i].0),
                 altitude: unpack_altitude(t[i].1),
+                roll: repr.rolls.as_ref().map_or(0.0, |r| unpack_roll(r[i])),
             })
         };
         let size_at = |i: usize| {
@@ -427,6 +487,7 @@ mod tests {
                 tilt: Some(Tilt {
                     azimuth: 1.0 + i as f32,
                     altitude: 0.3,
+                    roll: -1.25,
                 }),
                 ..pt(i as f32, i as f32, 0.8, i * 16)
             })
@@ -435,5 +496,72 @@ mod tests {
         let chunks = encode_chunks(&points).unwrap();
         let decoded = decode_chunks(chunks.iter().map(Vec::as_slice)).unwrap();
         assert_eq!(points, decoded);
+    }
+
+    #[test]
+    fn roll_roundtrips_and_legacy_chunks_decode_as_roll_zero() {
+        let tilt = Tilt {
+            azimuth: 1.0,
+            altitude: 0.7,
+            roll: 2.0,
+        };
+        let points = vec![
+            StrokePoint {
+                x: 1.0,
+                y: 2.0,
+                force: 0.5,
+                t_ms: 0,
+                tilt: Some(tilt),
+                size: None,
+            },
+            StrokePoint {
+                x: 3.0,
+                y: 2.5,
+                force: 0.6,
+                t_ms: 8,
+                tilt: Some(Tilt { roll: -3.0, ..tilt }),
+                size: None,
+            },
+        ];
+        let chunks = encode_chunks(&points).unwrap();
+        let back = decode_chunks(chunks.iter().map(Vec::as_slice)).unwrap();
+        for (a, b) in points.iter().zip(&back) {
+            let (ra, rb) = (a.tilt.unwrap().roll, b.tilt.unwrap().roll);
+            assert!((ra - rb).abs() < 0.03, "roll {ra} vs {rb}");
+        }
+
+        // Bytes written before the roll channel existed.
+        let v1 = ChunkReprV1 {
+            qx0: 8,
+            qy0: 16,
+            t0_ms: 0,
+            force0: 128,
+            deltas: vec![(8, 0, 128, 4)],
+            tilts: Some(vec![(10, 20), (10, 20)]),
+            sizes: None,
+        };
+        #[derive(Serialize)]
+        struct V1Out {
+            qx0: i32,
+            qy0: i32,
+            t0_ms: u32,
+            force0: u8,
+            deltas: Vec<(i16, i16, u8, u16)>,
+            tilts: Option<Vec<(u8, u8)>>,
+            sizes: Option<Vec<(u16, u16)>>,
+        }
+        let bytes = postcard::to_stdvec(&V1Out {
+            qx0: v1.qx0,
+            qy0: v1.qy0,
+            t0_ms: v1.t0_ms,
+            force0: v1.force0,
+            deltas: v1.deltas.clone(),
+            tilts: v1.tilts.clone(),
+            sizes: v1.sizes.clone(),
+        })
+        .unwrap();
+        let back = decode_chunks([bytes.as_slice()]).unwrap();
+        assert_eq!(back.len(), 2);
+        assert!(back.iter().all(|p| p.tilt.unwrap().roll == 0.0));
     }
 }

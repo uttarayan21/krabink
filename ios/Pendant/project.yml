@@ -29,6 +29,10 @@ targets:
             CFBundleURLSchemes: [pendant]
         NSCameraUsageDescription: >-
           Pendant uses the camera to scan another device's pairing QR code.
+        NSLocalNetworkUsageDescription: >-
+          Pendant looks for your paired desktop on the local network to sync
+          directly with it.
+        NSBonjourServices: [_pendant._tcp]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.darksailor.pendant

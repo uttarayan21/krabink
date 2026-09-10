@@ -13,9 +13,7 @@ use pendant_core::{DeviceId, DocKey, Flush, NoteId, NoteMeta, SketchId, Store, W
 use tokio::sync::mpsc;
 
 use crate::net::{self, Cmd};
-use crate::types::{
-    DeviceInfo, NoteInfo, Stroke, StrokePoint, SyncState, Tool, WetPoint, rgba_from_u32,
-};
+use crate::types::{DeviceInfo, NoteInfo, Stroke, SyncState, Tool, WetPoint, rgba_from_u32};
 
 /// Errors crossing the FFI boundary. Flattened to message-carrying variants;
 /// Swift rarely needs more than "which kind" + a human-readable cause.
@@ -64,6 +62,8 @@ pub trait NoteListener: Send + Sync {
     /// pen — latency telemetry only, meaningless across skewed clocks.
     fn wet_points(&self, stroke: String, sent_ms: u64, points: Vec<WetPoint>);
     fn wet_end(&self, stroke: String);
+    /// No stroke will follow: drop the provisional ink immediately.
+    fn wet_cancel(&self, stroke: String);
 }
 
 pub(crate) struct OpenNote {
@@ -79,11 +79,12 @@ pub(crate) struct State {
     pub server: Option<SyncTarget>,
 }
 
-/// Where background sync connects: direct path first, dedicated relay as
-/// fallback; both take the same token.
+/// Where background sync connects: every direct path is raced, the
+/// dedicated relay is only used when none of them answers; all take the
+/// same token.
 #[derive(Clone)]
 pub(crate) struct SyncTarget {
-    pub url: String,
+    pub direct: Vec<String>,
     pub token: String,
     pub fallback: Option<String>,
 }
@@ -281,12 +282,14 @@ impl Core {
         }))
     }
 
-    /// `url` is tried first on every (re)connect; `fallback` on the attempt
-    /// after a failed one, so a device that cannot reach the desktop
-    /// directly ends up on the dedicated relay within one backoff step.
-    pub fn set_sync_server(&self, url: String, token: String, fallback: Option<String>) {
+    /// Every `direct` path is dialled in parallel on each (re)connect and
+    /// the first handshake wins; `fallback` is only used when none of them
+    /// answers within a few seconds. While on the fallback the direct paths
+    /// are re-probed periodically and the session moves over as soon as
+    /// one answers.
+    pub fn set_sync_server(&self, direct: Vec<String>, token: String, fallback: Option<String>) {
         self.shared.lock_state().server = Some(SyncTarget {
-            url,
+            direct,
             token,
             fallback,
         });
@@ -351,6 +354,23 @@ impl Core {
     }
 
     /// Every device that ever joined this workspace, most recent first.
+    /// Forget a device in the synced registry (every peer's list loses the
+    /// row). Not revocation: it re-registers if it reconnects with a valid
+    /// token.
+    pub fn remove_device(&self, id: String) -> Result<()> {
+        let payload = {
+            let mut state = self.shared.lock_state();
+            commit_workspace(&mut state, |ws| ws.remove_device(&id))?
+        };
+        if let Some(payload) = payload {
+            let _ = self.shared.cmd.send(Cmd::Update {
+                doc: DocKey::WORKSPACE,
+                payload,
+            });
+        }
+        Ok(())
+    }
+
     pub fn list_devices(&self) -> Vec<DeviceInfo> {
         let state = self.shared.lock_state();
         state
@@ -545,6 +565,7 @@ impl NoteSession {
                     y: p.y,
                     force: p.force,
                     width: p.width,
+                    nib: p.nib,
                 })
                 .collect(),
         })
@@ -559,20 +580,41 @@ impl NoteSession {
             stroke.id.parse().map_err(|_| PendantError::MalformedId {
                 id: stroke.id.clone(),
             })?;
-        let committed = pcore::Stroke {
-            id: stroke_id,
-            tool: stroke.tool.into(),
-            color: rgba_from_u32(stroke.color),
-            base_width: stroke.base_width,
-            kind: stroke.kind.into(),
-            points: stroke.points.into_iter().map(StrokePoint::into).collect(),
-            created_ms: stroke.created_ms,
-        };
+        let committed = pcore::Stroke::from(stroke);
         self.commit(Flush::Immediate, |doc| doc.add_stroke(sketch, &committed))?;
         self.send_wet(pcore::WetInk::End {
             stroke: stroke_id,
             sent_ms: now_ms(),
         })
+    }
+
+    /// Eraser sample: remove every stroke whose ink a circle of `radius` at
+    /// (`x`, `y`) touches; returns their ids so the view can drop them. The
+    /// hit test lives in the core so erasing matches on every platform.
+    pub fn erase_at(&self, sketch: String, x: f32, y: f32, radius: f32) -> Result<Vec<String>> {
+        let sketch_id = self.parse_sketch(&sketch)?;
+        let hit: Vec<pcore::StrokeId> = self.read(|doc| {
+            Ok(doc
+                .strokes(sketch_id)?
+                .iter()
+                .filter(|s| pcore::hits(&pcore::flatten_stroke(s), s.base_width, x, y, radius))
+                .map(|s| s.id)
+                .collect())
+        })?;
+        for id in &hit {
+            self.commit(Flush::Immediate, |doc| doc.remove_stroke(sketch_id, *id))?;
+        }
+        Ok(hit.iter().map(ToString::to_string).collect())
+    }
+
+    /// The wet stream opened by [`Self::begin_stroke`] ends without a
+    /// stroke (the pen moved a ruler, not ink): tell receivers to drop the
+    /// provisional ink immediately.
+    pub fn cancel_stroke(&self, stroke: String) -> Result<()> {
+        let stroke_id: pcore::StrokeId = stroke
+            .parse()
+            .map_err(|_| PendantError::MalformedId { id: stroke })?;
+        self.send_wet(pcore::WetInk::Cancel { stroke: stroke_id })
     }
 
     pub fn remove_stroke(&self, sketch: String, stroke: String) -> Result<()> {

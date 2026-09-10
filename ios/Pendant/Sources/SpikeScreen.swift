@@ -265,7 +265,7 @@ struct SpikeCanvas: UIViewRepresentable {
                     y: Float(p.location.y),
                     force: Float(p.force),
                     tMs: UInt32(max(0, p.timeOffset * 1000)),
-                    tilt: Tilt(azimuth: Float(p.azimuth), altitude: Float(p.altitude)),
+                    tilt: Tilt(azimuth: Float(p.azimuth), altitude: Float(p.altitude), roll: 0),
                     size: PointSize(w: Float(p.size.width), h: Float(p.size.height)))
             }
             let rebuilt = encoded.map { q in

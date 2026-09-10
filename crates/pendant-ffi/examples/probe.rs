@@ -52,6 +52,7 @@ impl NoteListener for Recorder {
         wet.points += p.len();
         eprintln!("wet batch: points={} latency_ms={}", p.len(), latency);
     }
+    fn wet_cancel(&self, _stroke: String) {}
     fn wet_end(&self, _s: String) {
         self.wet.lock().unwrap().ends += 1;
     }
@@ -118,7 +119,7 @@ fn main() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let core = Core::new(dir.path().to_str().unwrap().into()).expect("core");
-    core.set_sync_server(args.server.clone(), args.token.clone(), None);
+    core.set_sync_server(vec![args.server.clone()], args.token.clone(), None);
     core.connect().expect("connect");
 
     let newest = wait_for("a note in the workspace", args.timeout, || {

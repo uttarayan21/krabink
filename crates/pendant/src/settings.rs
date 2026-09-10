@@ -45,9 +45,11 @@ fn apply_adopted(
         Err(err) => tracing::error!(%err, "persisting pairing failed"),
     }
     relay.add_token(&info.token);
+    // Desktop-to-desktop takes the preferred direct path + fallback only;
+    // the alternates are for mobile clients that hop networks.
     transport.replace_remotes(
         runtime.0.handle(),
-        info.endpoints().into_iter().map(str::to_string),
+        std::iter::once(info.server.clone()).chain(info.fallback.clone()),
         &info.token,
     );
     // Our QR keeps advertising our own relay as the direct path; the
@@ -56,13 +58,24 @@ fn apply_adopted(
         server: relay.advertised.clone(),
         token: info.token.clone(),
         fallback: Some(info.fallback.clone().unwrap_or_else(|| info.server.clone())),
+        alt: relay.alt.clone(),
+        relay_id: Some(transport.device().to_string()),
     });
+}
+
+/// What the user asked for from the window this frame.
+pub enum SettingsAction {
+    /// Join the workspace behind a pasted pairing URI.
+    Join(PairInfo),
+    /// Forget a device (by id) in the synced registry.
+    RemoveDevice(String),
 }
 
 /// Read-only snapshot the window renders each frame; gathered by the
 /// caller because it spans several ECS resources.
 pub struct SettingsView {
     pub links: Vec<LinkStatus>,
+    pub mdns_name: Option<String>,
     pub this_device: String,
     pub devices: Vec<DeviceMeta>,
     pub now_ms: u64,
@@ -77,6 +90,8 @@ pub struct Settings {
     texture: Option<egui::TextureHandle>,
     join_uri: String,
     join_error: bool,
+    /// Device id whose "remove" was clicked once; second click confirms.
+    pending_remove: Option<String>,
 }
 
 impl Settings {
@@ -87,6 +102,7 @@ impl Settings {
             texture: None,
             join_uri: String::new(),
             join_error: false,
+            pending_remove: None,
         }
     }
 
@@ -111,15 +127,16 @@ impl Settings {
         Some(t)
     }
 
-    /// Show the settings window when toggled open; returns the parsed info
-    /// when the user submits a URI to join.
-    pub fn window(&mut self, ctx: &egui::Context, view: &SettingsView) -> Option<PairInfo> {
+    /// Show the settings window when toggled open; returns what the user
+    /// asked for, if anything.
+    pub fn window(&mut self, ctx: &egui::Context, view: &SettingsView) -> Option<SettingsAction> {
         if !self.open {
+            self.pending_remove = None;
             return None;
         }
         let texture = self.qr_texture(ctx);
         let mut open = self.open;
-        let mut joined = None;
+        let mut action = None;
         egui::Window::new("settings")
             .open(&mut open)
             .resizable(false)
@@ -128,13 +145,17 @@ impl Settings {
                     .max_height(640.0)
                     .show(ui, |ui| {
                         self.sync_section(ui, view);
-                        self.devices_section(ui, view);
+                        if let Some(id) = self.devices_section(ui, view) {
+                            action = Some(SettingsAction::RemoveDevice(id));
+                        }
                         self.pair_section(ui, texture.as_ref());
-                        joined = self.join_section(ui);
+                        if let Some(info) = self.join_section(ui) {
+                            action = Some(SettingsAction::Join(info));
+                        }
                     });
             });
         self.open = open;
-        joined
+        action
     }
 
     fn sync_section(&self, ui: &mut egui::Ui, view: &SettingsView) {
@@ -161,6 +182,16 @@ impl Settings {
                 ui.end_row();
             }
         });
+        if !self.info.alt.is_empty() {
+            ui.weak("also reachable at:");
+            for alt in &self.info.alt {
+                ui.monospace(alt);
+            }
+        }
+        ui.weak(match &view.mdns_name {
+            Some(name) => format!("mDNS: {name}"),
+            None => "mDNS: off (advertising failed)".to_string(),
+        });
         if view.links.len() == 1 {
             ui.weak("no dedicated relay: devices must reach this desktop directly.");
             ui.weak("add one with --server / config.toml to sync across networks.");
@@ -183,30 +214,60 @@ impl Settings {
         ui.separator();
     }
 
-    fn devices_section(&self, ui: &mut egui::Ui, view: &SettingsView) {
+    /// Returns the id of a device the user confirmed removing.
+    fn devices_section(&mut self, ui: &mut egui::Ui, view: &SettingsView) -> Option<String> {
         ui.heading("paired devices");
         let others: Vec<&DeviceMeta> = view
             .devices
             .iter()
             .filter(|d| d.id != view.this_device)
             .collect();
+        let mut removed = None;
         if others.is_empty() {
             ui.label("none yet — devices appear here once they connect");
             ui.label("to the same workspace.");
         } else {
+            // A row vanishing from the registry cancels its pending removal.
+            if let Some(pending) = &self.pending_remove
+                && !others.iter().any(|d| &d.id == pending)
+            {
+                self.pending_remove = None;
+            }
             egui::Grid::new("devices")
-                .num_columns(3)
+                .num_columns(4)
                 .striped(true)
                 .show(ui, |ui| {
                     for d in others {
                         ui.label(&d.name);
                         ui.label(&d.platform);
                         ui.weak(format!("seen {}", ago(view.now_ms, d.last_seen_ms)));
+                        if self.pending_remove.as_deref() == Some(d.id.as_str()) {
+                            ui.horizontal(|ui| {
+                                let confirm = egui::Button::new(
+                                    egui::RichText::new("confirm remove")
+                                        .color(egui::Color32::LIGHT_RED),
+                                );
+                                if ui.add(confirm).clicked() {
+                                    removed = Some(d.id.clone());
+                                }
+                                if ui.small_button("cancel").clicked() {
+                                    self.pending_remove = None;
+                                }
+                            });
+                        } else if ui.small_button("remove").clicked() {
+                            self.pending_remove = Some(d.id.clone());
+                        }
                         ui.end_row();
                     }
                 });
+            ui.weak("removing only forgets the row; the device re-appears if");
+            ui.weak("it reconnects with the same token.");
+        }
+        if removed.is_some() {
+            self.pending_remove = None;
         }
         ui.separator();
+        removed
     }
 
     fn pair_section(&self, ui: &mut egui::Ui, texture: Option<&egui::TextureHandle>) {

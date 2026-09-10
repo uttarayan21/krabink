@@ -93,6 +93,8 @@ impl NoteListener for RecNote {
             .push(format!("points:{stroke}:{}", points.len()));
     }
 
+    fn wet_cancel(&self, _stroke: String) {}
+
     fn wet_end(&self, stroke: String) {
         self.wet.lock().unwrap().push(format!("end:{stroke}"));
     }
@@ -179,7 +181,7 @@ fn two_cores_converge_through_relay() {
     let note_a = core_a.clone().create_note("shared".into()).unwrap();
     let rec_a = Arc::new(RecNote::default());
     note_a.set_listener(rec_a.clone());
-    core_a.set_sync_server(url.clone(), "secret".into(), None);
+    core_a.set_sync_server(vec![url.clone()], "secret".into(), None);
     core_a.connect().unwrap();
     wait_for("A note synced", || *rec_a.synced.lock().unwrap() > 0);
 
@@ -187,7 +189,7 @@ fn two_cores_converge_through_relay() {
     let core_b = Core::new(dir.path().join("b").to_str().unwrap().into()).unwrap();
     let rec_core_b = Arc::new(RecCore::default());
     core_b.set_listener(rec_core_b.clone());
-    core_b.set_sync_server(url, "secret".into(), None);
+    core_b.set_sync_server(vec![url], "secret".into(), None);
     core_b.connect().unwrap();
     wait_for("B discovers the note", || {
         core_b.list_notes().iter().any(|n| n.title == "shared")
@@ -197,7 +199,8 @@ fn two_cores_converge_through_relay() {
             .states
             .lock()
             .unwrap()
-            .contains(&SyncState::Connected)
+            .iter()
+            .any(|s| matches!(s, SyncState::Connected { .. }))
     );
 
     let note_b = core_b.clone().open_note(note_a.id()).unwrap();
@@ -234,12 +237,14 @@ fn two_cores_converge_through_relay() {
                     y: 0.0,
                     force: 0.5,
                     width: None,
+                    nib: None,
                 },
                 WetPoint {
                     x: 3.0,
                     y: 1.0,
                     force: 0.6,
                     width: None,
+                    nib: None,
                 },
             ],
         )

@@ -18,8 +18,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::TextureUsages;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, EguiUserTextures, egui};
 use pendant_core::{
-    DocKey, PointSize, Rgba, SKETCH_URI_PREFIX, SketchId, StrokeId, StrokePoint, WetInk, WetPoint,
-    flatten_stroke, ribbon,
+    DocKey, PointSize, Rgba, SKETCH_URI_PREFIX, SketchId, StrokeId, StrokePoint, Tilt, Tool,
+    WetInk, WetPoint, flatten_stroke, ribbon_for,
 };
 
 use crate::docs::{Docs, now_ms};
@@ -44,8 +44,12 @@ pub struct WetInkFrame {
 pub struct SketchTextures(Arc<Mutex<HashMap<String, (egui::TextureId, egui::Vec2)>>>);
 
 struct WetStroke {
-    entity: Entity,
-    mesh: Handle<Mesh>,
+    /// Spawned on the first batch with drawable geometry.
+    entity: Option<Entity>,
+    mesh: Option<Handle<Mesh>>,
+    layer: usize,
+    tool: Tool,
+    color: Rgba,
     base_width: f32,
     points: Vec<WetPoint>,
     last_seq: u32,
@@ -58,8 +62,8 @@ struct SketchScene {
     image: Handle<Image>,
     camera: Entity,
     size: UVec2,
-    /// Committed stroke id → mesh entity.
-    strokes: HashMap<StrokeId, Entity>,
+    /// Committed stroke id → mesh entity (`None` for strokes with no ink).
+    strokes: HashMap<StrokeId, Option<Entity>>,
 }
 
 #[derive(Resource, Default)]
@@ -221,23 +225,28 @@ fn sync_sketch_scenes(
                 continue;
             }
             let flat = flatten_stroke(stroke);
-            let mesh = meshes.add(ribbon_mesh(&flat, stroke.base_width));
-            let entity = commands
-                .spawn((
-                    Mesh2d(mesh),
-                    MeshMaterial2d(materials.add(color_of(stroke.color))),
-                    Transform::from_xyz(0.0, 0.0, z as f32 * 0.01),
-                    RenderLayers::layer(scene.layer),
-                ))
-                .id();
+            let entity = ribbon_mesh(stroke.tool, &flat, stroke.base_width).map(|mesh| {
+                commands
+                    .spawn((
+                        Mesh2d(meshes.add(mesh)),
+                        MeshMaterial2d(materials.add(color_of(stroke.color))),
+                        Transform::from_xyz(0.0, 0.0, z as f32 * 0.01),
+                        RenderLayers::layer(scene.layer),
+                    ))
+                    .id()
+            });
             scene.strokes.insert(stroke.id, entity);
             // Committed stroke replaces its wet-ink preview.
-            if let Some(wet) = scenes.wet.remove(&stroke.id) {
-                commands.entity(wet.entity).despawn();
+            if let Some(wet) = scenes.wet.remove(&stroke.id)
+                && let Some(entity) = wet.entity
+            {
+                commands.entity(entity).despawn();
             }
         }
         for (id, entity) in stale {
-            commands.entity(entity).despawn();
+            if let Some(entity) = entity {
+                commands.entity(entity).despawn();
+            }
             scene.strokes.remove(&id);
         }
     }
@@ -315,19 +324,26 @@ fn color_of(rgba: Rgba) -> ColorMaterial {
 }
 
 /// Canvas-space ribbon → bevy mesh (y flipped into bevy's y-up space).
-fn ribbon_mesh(points: &[StrokePoint], base_width: f32) -> Mesh {
-    let ribbon = ribbon(points, base_width);
+/// `None` when there is nothing to draw: bevy's mesh allocator never
+/// allocates a zero-vertex mesh but still tries to upload it, logging a
+/// "Use-after-free" error every frame the mesh is extracted.
+fn ribbon_mesh(tool: Tool, points: &[StrokePoint], base_width: f32) -> Option<Mesh> {
+    let ribbon = ribbon_for(tool, points, base_width);
+    if ribbon.positions.is_empty() {
+        return None;
+    }
     let positions: Vec<[f32; 3]> = ribbon
         .positions
         .iter()
         .map(|[x, y]| [*x, -*y, 0.0])
         .collect();
-    Mesh::new(
+    let mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
     )
     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_indices(Indices::U32(ribbon.indices))
+    .with_inserted_indices(Indices::U32(ribbon.indices));
+    Some(mesh)
 }
 
 // ---- wet ink ----
@@ -358,34 +374,29 @@ fn apply_wet_ink(
             WetInk::Begin {
                 sketch,
                 stroke,
+                tool,
                 color,
                 base_width,
-                ..
             } => {
-                let Some(scene) = scenes.scenes.get(&sketch) else {
+                let Some(layer) = scenes.scenes.get(&sketch).map(|s| s.layer) else {
                     continue; // sketch not on screen yet; CRDT commit will cover it
                 };
-                let mesh = meshes.add(ribbon_mesh(&[], base_width));
-                let entity = commands
-                    .spawn((
-                        Mesh2d(mesh.clone()),
-                        MeshMaterial2d(materials.add(color_of(color))),
-                        Transform::from_xyz(0.0, 0.0, 500.0),
-                        RenderLayers::layer(scene.layer),
-                    ))
-                    .id();
-                if let Some(old) = scenes.wet.insert(
+                let old = scenes.wet.insert(
                     stroke,
                     WetStroke {
-                        entity,
-                        mesh,
+                        entity: None,
+                        mesh: None,
+                        layer,
+                        tool,
+                        color,
                         base_width,
                         points: Vec::new(),
                         last_seq: 0,
                         expires_ms: None,
                     },
-                ) {
-                    commands.entity(old.entity).despawn();
+                );
+                if let Some(entity) = old.and_then(|w| w.entity) {
+                    commands.entity(entity).despawn();
                 }
             }
             WetInk::Points {
@@ -411,15 +422,38 @@ fn apply_wet_ink(
                         y: p.y,
                         force: p.force,
                         t_ms: 0,
-                        tilt: None,
+                        tilt: p.nib.map(|angle| Tilt {
+                            azimuth: angle,
+                            altitude: 0.0,
+                            roll: 0.0,
+                        }),
                         size: p.width.map(|w| PointSize { w, h: w }),
                     })
                     .collect();
-                if let Err(err) = meshes.insert(
-                    &wet.mesh,
-                    ribbon_mesh(&flat, wet.base_width.max(WET_WIDTH_FALLBACK)),
-                ) {
-                    tracing::error!(%err, "wet-ink mesh update failed");
+                let Some(mesh) =
+                    ribbon_mesh(wet.tool, &flat, wet.base_width.max(WET_WIDTH_FALLBACK))
+                else {
+                    continue; // nothing drawable yet
+                };
+                match &wet.mesh {
+                    Some(handle) => {
+                        if let Err(err) = meshes.insert(handle, mesh) {
+                            tracing::error!(%err, "wet-ink mesh update failed");
+                        }
+                    }
+                    None => {
+                        let handle = meshes.add(mesh);
+                        let entity = commands
+                            .spawn((
+                                Mesh2d(handle.clone()),
+                                MeshMaterial2d(materials.add(color_of(wet.color))),
+                                Transform::from_xyz(0.0, 0.0, 500.0),
+                                RenderLayers::layer(wet.layer),
+                            ))
+                            .id();
+                        wet.mesh = Some(handle);
+                        wet.entity = Some(entity);
+                    }
                 }
             }
             WetInk::End { stroke, sent_ms } => {
@@ -428,6 +462,12 @@ fn apply_wet_ink(
                     wet.expires_ms = Some(now_ms() + WET_TTL_MS);
                 }
                 report_latency(&mut latency);
+            }
+            // No stroke is coming (ruler drag, tool fiddling): drop it now.
+            WetInk::Cancel { stroke } => {
+                if let Some(entity) = scenes.wet.remove(&stroke).and_then(|w| w.entity) {
+                    commands.entity(entity).despawn();
+                }
             }
         }
     }
@@ -441,8 +481,8 @@ fn apply_wet_ink(
         .map(|(id, _)| *id)
         .collect();
     for id in expired {
-        if let Some(wet) = scenes.wet.remove(&id) {
-            commands.entity(wet.entity).despawn();
+        if let Some(entity) = scenes.wet.remove(&id).and_then(|w| w.entity) {
+            commands.entity(entity).despawn();
         }
     }
 }

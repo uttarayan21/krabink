@@ -1,22 +1,29 @@
 //! Device pairing via a shareable URI:
-//! `pendant://pair?server=…&token=…[&fallback=…]`.
+//! `pendant://pair?server=…&token=…[&alt=…]*[&fallback=…][&relay=…]`.
 //! One device renders the URI as a QR code; the other opens it and adopts
 //! the sync server + token. The URI carries no identity — possession of the
 //! token is the whole credential, same trust model as the config file.
 //!
-//! `server` is the direct path (the sharing desktop's embedded relay on the
-//! LAN); `fallback` is an optional dedicated relay to route through when the
-//! direct path is unreachable. Both accept the same token.
+//! `server` and every `alt` are direct paths to the sharing desktop's
+//! embedded relay (one per interface: LAN, Tailscale, …); `fallback` is an
+//! optional dedicated relay to route through when no direct path answers;
+//! `relay` is the desktop's device id so a client can also find it through
+//! mDNS (`_pendant._tcp`, TXT `id=`) when the addresses went stale. All
+//! paths accept the same token.
 
 /// Sync coordinates carried by a pairing URI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PairInfo {
-    /// Relay endpoint, e.g. `ws://192.168.0.162:8722/ws`.
+    /// Preferred direct path, e.g. `ws://192.168.0.162:8722/ws`.
     pub server: String,
-    /// Bearer token the relay accepts.
+    /// Bearer token every path accepts.
     pub token: String,
-    /// Dedicated relay to use when `server` cannot be reached.
+    /// Dedicated relay to use when no direct path can be reached.
     pub fallback: Option<String>,
+    /// Further direct paths to the same relay (other interfaces).
+    pub alt: Vec<String>,
+    /// Device id of the desktop behind the direct paths, for mDNS matching.
+    pub relay_id: Option<String>,
 }
 
 const SCHEME_AND_PATH: &str = "pendant://pair?";
@@ -28,18 +35,33 @@ impl PairInfo {
             percent_encode(&self.server),
             percent_encode(&self.token)
         );
+        for alt in &self.alt {
+            uri.push_str("&alt=");
+            uri.push_str(&percent_encode(alt));
+        }
         if let Some(fallback) = &self.fallback {
             uri.push_str("&fallback=");
             uri.push_str(&percent_encode(fallback));
         }
+        if let Some(relay_id) = &self.relay_id {
+            uri.push_str("&relay=");
+            uri.push_str(&percent_encode(relay_id));
+        }
         uri
     }
 
-    /// Every endpoint to try, direct path first.
-    pub fn endpoints(&self) -> Vec<&str> {
+    /// Every direct path, preferred first.
+    pub fn direct(&self) -> Vec<&str> {
         std::iter::once(self.server.as_str())
-            .chain(self.fallback.as_deref())
+            .chain(self.alt.iter().map(String::as_str))
             .collect()
+    }
+
+    /// Every endpoint to try, direct paths first, fallback last.
+    pub fn endpoints(&self) -> Vec<&str> {
+        let mut out = self.direct();
+        out.extend(self.fallback.as_deref());
+        out
     }
 
     /// Parse a pairing URI. Returns `None` for anything that is not a
@@ -49,12 +71,21 @@ impl PairInfo {
         let mut server = None;
         let mut token = None;
         let mut fallback = None;
+        let mut relay_id = None;
+        let mut alt = Vec::new();
         for kv in query.split('&') {
             let (key, value) = kv.split_once('=')?;
             match key {
                 "server" => server = Some(percent_decode(value)?),
                 "token" => token = Some(percent_decode(value)?),
                 "fallback" => fallback = Some(percent_decode(value)?),
+                "relay" => relay_id = Some(percent_decode(value)?),
+                "alt" => {
+                    let value = percent_decode(value)?;
+                    if !value.is_empty() {
+                        alt.push(value);
+                    }
+                }
                 _ => {} // ignore unknown params so the format can grow
             }
         }
@@ -62,6 +93,8 @@ impl PairInfo {
             server: server.filter(|s| !s.is_empty())?,
             token: token?,
             fallback: fallback.filter(|s| !s.is_empty()),
+            alt,
+            relay_id: relay_id.filter(|s| !s.is_empty()),
         })
     }
 }
@@ -106,7 +139,7 @@ mod tests {
         let info = PairInfo {
             server: "ws://192.168.0.162:8722/ws".into(),
             token: "demo".into(),
-            fallback: None,
+            ..Default::default()
         };
         let uri = info.to_uri();
         assert_eq!(
@@ -121,9 +154,42 @@ mod tests {
         let info = PairInfo {
             server: "wss://relay.example.com/ws".into(),
             token: "a&b=c %/ü".into(),
-            fallback: None,
+            ..Default::default()
         };
         assert_eq!(PairInfo::parse(&info.to_uri()), Some(info));
+    }
+
+    #[test]
+    fn roundtrip_alt_and_relay() {
+        let info = PairInfo {
+            server: "ws://192.168.0.162:8722/ws".into(),
+            token: "demo".into(),
+            fallback: Some("wss://relay.example.com/ws".into()),
+            alt: vec![
+                "ws://100.64.0.7:8722/ws".into(),
+                "ws://10.0.0.5:8722/ws".into(),
+            ],
+            relay_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".into()),
+        };
+        let parsed = PairInfo::parse(&info.to_uri()).unwrap();
+        assert_eq!(parsed, info);
+        assert_eq!(
+            parsed.direct(),
+            vec![
+                "ws://192.168.0.162:8722/ws",
+                "ws://100.64.0.7:8722/ws",
+                "ws://10.0.0.5:8722/ws"
+            ]
+        );
+        assert_eq!(
+            parsed.endpoints().last(),
+            Some(&"wss://relay.example.com/ws")
+        );
+        // Empty alt entries are dropped, empty relay reads as absent.
+        let parsed =
+            PairInfo::parse("pendant://pair?server=ws%3A%2F%2Fh%2Fws&token=t&alt=&relay=").unwrap();
+        assert!(parsed.alt.is_empty());
+        assert_eq!(parsed.relay_id, None);
     }
 
     #[test]
@@ -132,6 +198,7 @@ mod tests {
             server: "ws://192.168.0.162:8722/ws".into(),
             token: "demo".into(),
             fallback: Some("wss://relay.example.com/ws".into()),
+            ..Default::default()
         };
         let uri = info.to_uri();
         assert!(uri.ends_with("&fallback=wss%3A%2F%2Frelay.example.com%2Fws"));
@@ -161,7 +228,7 @@ mod tests {
             Some(PairInfo {
                 server: "ws://h/ws".into(),
                 token: "t".into(),
-                fallback: None,
+                ..Default::default()
             })
         );
     }

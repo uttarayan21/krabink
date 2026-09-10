@@ -24,8 +24,11 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
       a consumer needs cursor-stable patches.
 
 ### iPad
-- [ ] Stroke identity keyed by `PKStrokePath.creationDate` (whole-ms for decoded
-      remote strokes → theoretical collision). Give strokes a stable id side-band.
+- [x] Stroke identity keyed by `PKStrokePath.creationDate` — gone: PencilKit is
+      input-only, ink layers are keyed by CRDT stroke id.
+- [ ] Eraser is whole-stroke only (core hit test); PencilKit's pixel eraser
+      (stroke splitting) is not reproduced.
+- [ ] Lasso tool does nothing (no PKDrawing to select from).
 - [ ] Remotely-created empty sketch is invisible until its first stroke lands.
 - [ ] Marker translucency not round-tripped through the stroke schema.
 - [ ] IME / marked-text composition not guarded in the remote-apply path of the
@@ -33,8 +36,8 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
 - [ ] No markdown syntax highlighting in the source editor.
 - [ ] Preview is a separate read-only mode, not inline editable images — the
       UITextView↔CRDT offset mapping requires view text == CRDT text.
-- [ ] Inbound remote wet ink renders at constant width (no per-point size on the
-      wet channel yet); committed stroke replaces it with true pressure width.
+- [ ] Wet ink carries no per-point size yet; receivers (desktop and iPad, same
+      ribbon code) fall back to `base_width * force` until the commit lands.
 
 ### Desktop
 - [ ] Cursor can jump when a remote edit lands while typing in the same note

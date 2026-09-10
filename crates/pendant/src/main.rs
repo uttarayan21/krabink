@@ -72,6 +72,7 @@ fn run_app(args: cli::Cli) -> Result<()> {
             .into_iter()
             .filter(|t| !t.is_empty())
             .collect(),
+        config.device,
     )?;
 
     let mut transport = SyncTransport::new(config.device);
@@ -98,6 +99,8 @@ fn run_app(args: cli::Cli) -> Result<()> {
         server: relay.advertised.clone(),
         token: config.pair_token(),
         fallback: config.server.clone(),
+        alt: relay.alt.clone(),
+        relay_id: Some(config.device.to_string()),
     };
 
     App::new()
@@ -131,5 +134,10 @@ fn setup(mut commands: Commands, relay: Res<EmbeddedRelay>) {
     commands.spawn(Camera2d);
     // Bevy's LogPlugin owns the subscriber; anything logged before App::run
     // is lost, so announce the relay here.
-    info!(advertised = %relay.advertised, "embedded relay up");
+    info!(
+        advertised = %relay.advertised,
+        alt = ?relay.alt,
+        mdns = relay.mdns_name.as_deref().unwrap_or("off"),
+        "embedded relay up"
+    );
 }

@@ -119,6 +119,16 @@ impl Docs {
         Ok(payload)
     }
 
+    /// Drop `id` from the synced device registry; returns the workspace
+    /// payload for the wire.
+    pub fn remove_device(&mut self, id: &str) -> pendant_core::Result<Vec<u8>> {
+        let before = self.workspace.version();
+        self.workspace.remove_device(id)?;
+        let payload = self.workspace.export_updates_since(&before)?;
+        self.persist(DocKey::WORKSPACE, &payload)?;
+        Ok(payload)
+    }
+
     /// Keep the workspace registry's title/updated fresh for `id`.
     /// Returns a payload when something changed.
     pub fn refresh_meta(&mut self, id: NoteId) -> pendant_core::Result<Option<Vec<u8>>> {

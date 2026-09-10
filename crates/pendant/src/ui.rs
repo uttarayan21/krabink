@@ -78,18 +78,33 @@ fn editor_ui(
     mut subscribes: MessageWriter<SubscribeNeeded>,
     mut settings: ResMut<Settings>,
     transport: Res<SyncTransport>,
+    relay: Res<crate::relay::EmbeddedRelay>,
     mut adopted: MessageWriter<crate::settings::PairAdopted>,
     follow: Res<FollowLatest>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     let view = crate::settings::SettingsView {
         links: transport.links(),
+        mdns_name: relay.mdns_name.clone(),
         this_device: transport.device().to_string(),
         devices: docs.workspace.devices(),
         now_ms: crate::docs::now_ms(),
     };
-    if let Some(info) = settings.window(ctx, &view) {
-        adopted.write(crate::settings::PairAdopted(info));
+    match settings.window(ctx, &view) {
+        Some(crate::settings::SettingsAction::Join(info)) => {
+            adopted.write(crate::settings::PairAdopted(info));
+        }
+        Some(crate::settings::SettingsAction::RemoveDevice(id)) => match docs.remove_device(&id) {
+            Ok(payload) if !payload.is_empty() => {
+                commits.write(LocalCommit {
+                    doc: DocKey::WORKSPACE,
+                    payload,
+                });
+            }
+            Ok(_) => {}
+            Err(err) => tracing::error!(%err, id, "removing device failed"),
+        },
+        None => {}
     }
 
     if follow.0
