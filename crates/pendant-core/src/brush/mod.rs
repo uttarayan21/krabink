@@ -2,12 +2,14 @@
 //! rendered width, so every platform draws the same ink from the same
 //! input. One [`BrushModeler`] lives per stroke in progress.
 //!
-//! Per sample: streamline (an exponential moving average that trails the
-//! pen and smooths hand jitter), a smoothed speed estimate, width from
-//! force and speed, start taper. [`BrushModeler::finish`] flushes the
-//! smoothing lag by landing on the last raw sample exactly and applies the
-//! end taper. [`BrushModeler::predict`] runs the same maths on a scratch
-//! copy for the renderer's predicted-touch tail.
+//! Two stages. [`input`] smooths raw samples into the points a stroke
+//! stores ([`EmaModel`]). [`dynamics`] folds those points into tip states,
+//! the width at each point from force, speed and the tapers
+//! ([`TipEvaluator`]). The modeler runs both and hands out points with
+//! their sizes; [`BrushModeler::finish`] flushes the smoothing lag by
+//! landing on the last raw sample exactly and applies the end taper.
+//! [`BrushModeler::predict`] runs the same maths on a scratch copy for the
+//! renderer's predicted-touch tail.
 //!
 //! ```
 //! use pendant_core::{BrushModeler, RawSample, Tool};
@@ -21,132 +23,13 @@
 //! assert!(points.iter().all(|p| p.size.is_some()));
 //! ```
 
-use crate::stroke::{PointSize, StrokePoint, Tilt, Tool};
+mod dynamics;
+mod input;
 
-/// One raw input sample, before smoothing.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RawSample {
-    pub x: f32,
-    pub y: f32,
-    /// Normalised pressure, 0..=1. Pens without pressure report 1.
-    pub force: f32,
-    /// Milliseconds on any monotonic clock; only differences matter.
-    pub t_ms: f64,
-    pub tilt: Option<Tilt>,
-}
+pub use dynamics::{BrushParams, TipEvaluator, TipState};
+pub use input::{EmaModel, InputParams, RawSample};
 
-/// How a tool turns samples into ink. Constants live here so both
-/// platforms agree.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct BrushParams {
-    /// Full ink width in canvas units.
-    pub size: f32,
-    /// How much force and speed narrow the ink: 0 (constant width) ..= 1.
-    pub thinning: f32,
-    /// Streamline factor: 0 follows the pen exactly, 1 never moves. The
-    /// smoothed point covers `1 - streamline` of the distance to each raw
-    /// sample.
-    pub streamline: f32,
-    /// Speed (canvas units per ms) at which speed thinning saturates.
-    pub speed_ref: f32,
-    /// Ink never gets narrower than this fraction of `size`.
-    pub min_width: f32,
-    /// Length of the lead-in taper in canvas units (0 = none).
-    pub taper_start: f32,
-    /// Length of the tail taper in canvas units (0 = none).
-    pub taper_end: f32,
-    /// Pressure below this counts as this, so a light touch still inks.
-    pub min_force: f32,
-    /// Smoothed samples closer than this to the previous emitted point are
-    /// dropped: a slow pen at 240 Hz would otherwise emit near-duplicates.
-    pub min_distance: f32,
-}
-
-/// Fraction of the width speed thinning can remove at full `thinning`.
-const SPEED_THINNING: f32 = 0.5;
-/// EMA factor for the speed estimate: share of each new measurement.
-const SPEED_SMOOTHING: f32 = 0.5;
-
-impl BrushParams {
-    /// The tuned parameters for `tool` at `size` canvas units wide.
-    pub fn for_tool(tool: Tool, size: f32) -> Self {
-        let size = size.max(0.0);
-        let base = Self {
-            size,
-            thinning: 0.0,
-            streamline: 0.3,
-            speed_ref: 1.5,
-            min_width: 0.25,
-            taper_start: 0.0,
-            taper_end: 0.0,
-            min_force: 0.15,
-            min_distance: 0.25,
-        };
-        match tool {
-            Tool::Pen => Self {
-                thinning: 0.5,
-                streamline: 0.5,
-                taper_end: size * 1.5,
-                ..base
-            },
-            Tool::Marker => Self {
-                streamline: 0.35,
-                min_distance: 0.5,
-                ..base
-            },
-            Tool::Monoline => Self {
-                streamline: 0.2,
-                ..base
-            },
-            // The nib's width comes from its orientation, not from force.
-            Tool::Brush => base,
-        }
-    }
-
-    /// Rendered width at `force`, moving at `speed` (canvas units per ms),
-    /// `arc` canvas units into the stroke.
-    fn width(&self, force: f32, speed: f32, arc: f32) -> f32 {
-        let force = force.clamp(self.min_force, 1.0);
-        let pressure = 1.0 + (force - 1.0) * self.thinning;
-        let saturation = if self.speed_ref > 0.0 {
-            (speed / self.speed_ref).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let velocity = 1.0 - self.thinning * SPEED_THINNING * saturation;
-        let lead_in = taper_factor(arc, self.taper_start);
-        (self.size * pressure * velocity * lead_in).max(self.size * self.min_width)
-    }
-
-    fn floor(&self) -> f32 {
-        self.size * self.min_width
-    }
-}
-
-/// 0 at the taper's start, 1 once `distance` reaches `length`; 1 when
-/// there is no taper.
-fn taper_factor(distance: f32, length: f32) -> f32 {
-    if length > 0.0 {
-        (distance / length).clamp(0.0, 1.0)
-    } else {
-        1.0
-    }
-}
-
-/// Everything the smoothing needs to continue from; small so
-/// [`BrushModeler::predict`] can clone it per frame.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct State {
-    /// Timestamp of the first sample; emitted `t_ms` count from here.
-    origin_ms: f64,
-    /// Last emitted (smoothed) position.
-    prev: [f32; 2],
-    last_raw: RawSample,
-    /// Smoothed speed, canvas units per ms.
-    speed: f32,
-    /// Arc length of the smoothed path so far.
-    arc: f32,
-}
+use crate::stroke::{PointSize, StrokePoint, Tool};
 
 /// Turns one stroke's raw samples into modelled [`StrokePoint`]s. Owns the
 /// points emitted so far; renderers draw [`points`](Self::points) plus a
@@ -155,11 +38,11 @@ struct State {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BrushModeler {
     tool: Tool,
-    params: BrushParams,
-    state: Option<State>,
+    input: EmaModel,
+    tip: TipEvaluator,
+    /// Emitted points with their tip size applied.
     points: Vec<StrokePoint>,
-    /// Arc length at each emitted point, for the end taper.
-    arcs: Vec<f32>,
+    states: Vec<TipState>,
 }
 
 impl BrushModeler {
@@ -171,10 +54,10 @@ impl BrushModeler {
     pub fn with_params(tool: Tool, params: BrushParams) -> Self {
         Self {
             tool,
-            params,
-            state: None,
+            input: EmaModel::new(params.input()),
+            tip: TipEvaluator::new(params),
             points: Vec::new(),
-            arcs: Vec::new(),
+            states: Vec::new(),
         }
     }
 
@@ -183,7 +66,7 @@ impl BrushModeler {
     }
 
     pub fn params(&self) -> &BrushParams {
-        &self.params
+        self.tip.params()
     }
 
     /// Points emitted so far, without the end taper.
@@ -194,25 +77,22 @@ impl BrushModeler {
     /// Feed one raw sample; the point it produced, if it moved far enough
     /// from the previous one to be worth emitting.
     pub fn push(&mut self, raw: RawSample) -> Option<StrokePoint> {
-        let (state, point) = self.step(self.state, raw);
-        self.state = Some(state);
-        if let Some(p) = point {
-            self.points.push(p);
-            self.arcs.push(state.arc);
-        }
-        point
+        let point = self.input.push(raw)?;
+        let state = self.tip.push(&point);
+        let sized = sized(point, state);
+        self.points.push(sized);
+        self.states.push(state);
+        Some(sized)
     }
 
     /// The points `raw` would produce if pushed now, without pushing them.
     /// For Apple's predicted touches: draw as a tail, discard next frame.
     pub fn predict(&self, raw: &[RawSample]) -> Vec<StrokePoint> {
-        let mut state = self.state;
-        raw.iter()
-            .filter_map(|&sample| {
-                let (next, point) = self.step(state, sample);
-                state = Some(next);
-                point
-            })
+        let mut tip = self.tip;
+        self.input
+            .predict(raw)
+            .into_iter()
+            .map(|p| sized(p, tip.push(&p)))
             .collect()
     }
 
@@ -220,111 +100,33 @@ impl BrushModeler {
     /// landed exactly (streamline always lags the pen), and the end taper.
     pub fn finish(&self) -> Vec<StrokePoint> {
         let mut points = self.points.clone();
-        let mut arcs = self.arcs.clone();
-        if let Some(state) = self.state
-            && [state.last_raw.x, state.last_raw.y] != state.prev
-        {
-            let raw = state.last_raw;
-            let arc = state.arc + distance(state.prev, [raw.x, raw.y]);
-            points.push(self.point(&state, raw, [raw.x, raw.y], arc));
-            arcs.push(arc);
+        let mut states = self.states.clone();
+        if let Some(landing) = self.input.landing() {
+            let mut tip = self.tip;
+            let state = tip.push(&landing);
+            points.push(sized(landing, state));
+            states.push(state);
         }
-        self.taper_end(&mut points, &arcs);
+        TipEvaluator::taper_end(self.params(), &mut states);
         points
-    }
-
-    /// Narrow the tail over the last `taper_end` canvas units, or half the
-    /// stroke when it is shorter than that, so a dot or a short tick keeps
-    /// its width instead of vanishing into the floor.
-    fn taper_end(&self, points: &mut [StrokePoint], arcs: &[f32]) {
-        let Some(&total) = arcs.last() else {
-            return;
-        };
-        let length = self.params.taper_end.min(total / 2.0);
-        if length <= 0.0 {
-            return;
-        }
-        let floor = self.params.floor();
-        for (p, &arc) in points.iter_mut().zip(arcs) {
-            let factor = taper_factor(total - arc, length);
-            if let Some(size) = p.size.as_mut() {
-                size.w = (size.w * factor).max(floor);
-                size.h = (size.h * factor).max(floor);
-            }
-        }
-    }
-
-    /// Advance `state` by one sample. Pure: the caller decides whether to
-    /// keep the new state, which is what lets `predict` share the code.
-    fn step(&self, state: Option<State>, raw: RawSample) -> (State, Option<StrokePoint>) {
-        let Some(prev) = state else {
-            let state = State {
-                origin_ms: raw.t_ms,
-                prev: [raw.x, raw.y],
-                last_raw: raw,
-                speed: 0.0,
-                arc: 0.0,
-            };
-            let point = self.point(&state, raw, [raw.x, raw.y], 0.0);
-            return (state, Some(point));
-        };
-
-        let dt = raw.t_ms - prev.last_raw.t_ms;
-        let moved_raw = distance([prev.last_raw.x, prev.last_raw.y], [raw.x, raw.y]);
-        let mut state = State {
-            last_raw: raw,
-            ..prev
-        };
-        if dt > 0.0 {
-            // f64 -> f32 has no trait conversion; a millisecond delta fits
-            // f32 with room to spare.
-            let speed = moved_raw / dt as f32; // ast-grep-ignore: no-as-cast
-            state.speed += (speed - state.speed) * SPEED_SMOOTHING;
-        }
-
-        let follow = 1.0 - self.params.streamline.clamp(0.0, 1.0);
-        let smoothed = [
-            prev.prev[0] + (raw.x - prev.prev[0]) * follow,
-            prev.prev[1] + (raw.y - prev.prev[1]) * follow,
-        ];
-        let moved = distance(prev.prev, smoothed);
-        if moved < self.params.min_distance {
-            return (state, None);
-        }
-        state.prev = smoothed;
-        state.arc += moved;
-        let point = self.point(&state, raw, smoothed, state.arc);
-        (state, Some(point))
-    }
-
-    fn point(&self, state: &State, raw: RawSample, at: [f32; 2], arc: f32) -> StrokePoint {
-        let width = self.params.width(raw.force, state.speed, arc);
-        StrokePoint {
-            x: at[0],
-            y: at[1],
-            force: raw.force.clamp(0.0, 1.0),
-            t_ms: ms_since(state.origin_ms, raw.t_ms),
-            tilt: raw.tilt,
-            size: Some(PointSize { w: width, h: width }),
-        }
+            .into_iter()
+            .zip(states)
+            .map(|(p, s)| sized(p, s))
+            .collect()
     }
 }
 
-fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
-    (b[0] - a[0]).hypot(b[1] - a[1])
-}
-
-/// Whole milliseconds from `origin` to `t`, clamped into the point's
-/// `t_ms`. Float-to-int has no `From`/`TryFrom`; `as` saturates, which is
-/// the clamp we want for a clock that ran backwards or a stroke held for
-/// 49 days.
-fn ms_since(origin: f64, t: f64) -> u32 {
-    (t - origin).round() as u32 // ast-grep-ignore: no-as-cast
+fn sized(p: StrokePoint, s: TipState) -> StrokePoint {
+    StrokePoint {
+        size: Some(PointSize { w: s.w, h: s.h }),
+        ..p
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stroke::Tilt;
     use proptest::prelude::*;
 
     fn raw(x: f32, y: f32, force: f32, t_ms: f64) -> RawSample {
@@ -488,6 +290,26 @@ mod tests {
         assert!(w[w.len() - 1] >= 1.0, "taper stops at the floor: {w:?}");
         // Points before the taper zone are untouched.
         assert_eq!(w[..5], widths(&live)[..5]);
+    }
+
+    /// The widths a receiver computes from the stored points alone equal
+    /// the widths the sender drew: the fold depends on nothing but the
+    /// points.
+    #[test]
+    fn stored_points_reproduce_live_widths() {
+        let mut m = BrushModeler::new(Tool::Pen, 4.0);
+        for s in line(30, 2.0, 8.0, 0.8) {
+            m.push(s);
+        }
+        let inputs: Vec<StrokePoint> = m
+            .points()
+            .iter()
+            .map(|p| StrokePoint { size: None, ..*p })
+            .collect();
+        let refolded = TipEvaluator::evaluate(*m.params(), &inputs);
+        let live = widths(m.points());
+        let again: Vec<f32> = refolded.iter().map(|s| s.w).collect();
+        assert_eq!(live, again);
     }
 
     #[test]

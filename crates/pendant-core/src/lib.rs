@@ -30,10 +30,12 @@ mod sync_doc;
 mod wetink;
 mod workspace;
 
-pub use brush::{BrushModeler, BrushParams, RawSample};
+pub use brush::{
+    BrushModeler, BrushParams, EmaModel, InputParams, RawSample, TipEvaluator, TipState,
+};
 pub use element::{Binding, Element, ShapeElement, Style};
 pub use export::{ExportAsset, ExportBundle, SKETCH_URI_PREFIX, elements_to_svg};
-pub use geom::{DEFAULT_TOLERANCE, StrokeMesh, hits, stroke_mesh};
+pub use geom::{DEFAULT_TOLERANCE, InkMesh, InkVertex, hits, stroke_mesh};
 pub use ids::{DeviceId, ElementId, NoteId, SketchId, StrokeId};
 pub use note::NoteDoc;
 pub use pair::PairInfo;

@@ -1,0 +1,7 @@
+pen-s-curve vertices=185 indices=549 fnv=308289a9170b77e7
+pen-slow-line vertices=84 indices=246 fnv=986f54869976ef69
+pen-dot vertices=8 indices=18 fnv=5f1074521f76543f
+pen-hairpin vertices=24 indices=60 fnv=a2be3e7eb4f2173a
+marker-s-curve vertices=195 indices=579 fnv=e5df6ff75869c965
+monoline-line vertices=126 indices=372 fnv=def3a76ed3633762
+brush-nib-s-curve vertices=122 indices=360 fnv=9b759a5d27ee4e4f

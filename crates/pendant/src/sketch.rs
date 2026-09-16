@@ -340,7 +340,7 @@ fn ink_mesh(tool: Tool, points: &[StrokePoint], base_width: f32) -> Option<Mesh>
     if ink.is_empty() {
         return None;
     }
-    let positions: Vec<[f32; 3]> = ink.positions.iter().map(|[x, y]| [*x, -*y, 0.0]).collect();
+    let positions: Vec<[f32; 3]> = ink.positions().map(|[x, y]| [x, -y, 0.0]).collect();
     let mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),

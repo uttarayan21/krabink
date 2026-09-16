@@ -122,10 +122,10 @@ pub struct IndexedMesh {
     pub indices: Vec<u32>,
 }
 
-impl From<pcore::StrokeMesh> for IndexedMesh {
-    fn from(m: pcore::StrokeMesh) -> Self {
+impl From<pcore::InkMesh> for IndexedMesh {
+    fn from(m: pcore::InkMesh) -> Self {
         Self {
-            positions: m.positions.into_iter().flatten().collect(),
+            positions: m.positions().flatten().collect(),
             indices: m.indices,
         }
     }

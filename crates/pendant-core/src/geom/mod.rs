@@ -3,16 +3,18 @@
 //! Two stages. [`Stroke::flatten`] evaluates PencilKit-authored uniform cubic
 //! B-spline *control points* into a polyline (polyline-sampled strokes pass
 //! through unchanged). [`stroke_mesh`] then tessellates that polyline into
-//! triangles: round tools go through lyon's stroker with a per-point width
-//! attribute, round caps and round joins; the flat-nib brush keeps its own
-//! orientation-driven ribbon, which lyon has no notion of. Every renderer
-//! (bevy on the desktop, Metal/CoreGraphics on iPad, the SVG exporter)
-//! draws the same mesh, so ink looks identical everywhere.
+//! an [`InkMesh`]: round tools go through lyon's stroker with a per-point
+//! width attribute, round caps and round joins ([`continuous`]); the
+//! flat-nib brush keeps its own orientation-driven ribbon, which lyon has no
+//! notion of ([`nib`]). Every renderer (bevy on the desktop, Metal on iPad,
+//! the SVG exporter) draws the same mesh, so ink looks identical everywhere.
 
-use lyon_tessellation::{
-    BuffersBuilder, LineCap, LineJoin, StrokeOptions, StrokeTessellator, StrokeVertex,
-    VertexBuffers, math::point, path::Path,
-};
+mod continuous;
+mod mesh;
+mod nib;
+
+pub use mesh::{InkMesh, InkVertex};
+pub use nib::nib_ribbon;
 
 use crate::stroke::{PointKind, Stroke, StrokePoint, Tool};
 
@@ -109,52 +111,21 @@ fn eval_segment(w: &[StrokePoint], t: f32) -> StrokePoint {
 /// Pressure below this still leaves visible ink.
 const MIN_FORCE: f32 = 0.15;
 /// Points closer than this (canvas units) are merged before tessellation.
-const MIN_SEGMENT: f32 = 0.05;
+pub(crate) const MIN_SEGMENT: f32 = 0.05;
 /// Narrowest ink that still gets a mesh, canvas units (half width).
-const MIN_HALF_WIDTH: f32 = 0.05;
+pub(crate) const MIN_HALF_WIDTH: f32 = 0.05;
 /// Flattening tolerance for caps and joins at 1:1 zoom, canvas units.
 /// Callers zoomed in by `z` should pass `DEFAULT_TOLERANCE / z`.
 pub const DEFAULT_TOLERANCE: f32 = 0.25;
 
-/// A stroke tessellated into triangles, in canvas space (x right, y down).
-/// Renderers flip y as their convention requires.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct StrokeMesh {
-    pub positions: Vec<[f32; 2]>,
-    /// Triangle list into `positions`.
-    pub indices: Vec<u32>,
-}
-
-impl StrokeMesh {
-    /// Nothing to draw.
-    pub fn is_empty(&self) -> bool {
-        self.indices.is_empty()
-    }
-
-    /// Axis-aligned bounds as `(min, max)`, or `None` when empty.
-    pub fn bounds(&self) -> Option<([f32; 2], [f32; 2])> {
-        self.positions.iter().fold(None, |acc, [x, y]| {
-            let (lo, hi) = acc.unwrap_or(([*x, *y], [*x, *y]));
-            Some((
-                [lo[0].min(*x), lo[1].min(*y)],
-                [hi[0].max(*x), hi[1].max(*y)],
-            ))
-        })
-    }
-}
-
 /// Half the rendered width at `p`: the point's own `size.w` when present
 /// (PencilKit-authored), otherwise `base_width * force`.
-fn half_width(p: &StrokePoint, base_width: f32) -> f32 {
+pub(crate) fn half_width(p: &StrokePoint, base_width: f32) -> f32 {
     match p.size {
         Some(s) => (s.w / 2.0).max(MIN_HALF_WIDTH),
         None => (base_width * p.force.clamp(MIN_FORCE, 1.0) / 2.0).max(MIN_HALF_WIDTH),
     }
 }
-
-/// Thinnest a flat nib gets when dragged along its own length, as a
-/// fraction of `base_width`.
-const NIB_MIN_FRACTION: f32 = 0.08;
 
 /// Tessellate a flattened polyline for `tool`. Round tools get lyon's
 /// variable-width stroker with round caps and joins ([`round_mesh`]); a nib
@@ -162,138 +133,12 @@ const NIB_MIN_FRACTION: f32 = 0.08;
 /// what makes calligraphic strokes thick across the nib and thin along it.
 /// `tolerance` bounds the flattening error of caps and joins in canvas
 /// units; see [`DEFAULT_TOLERANCE`].
-pub fn stroke_mesh(
-    tool: Tool,
-    points: &[StrokePoint],
-    base_width: f32,
-    tolerance: f32,
-) -> StrokeMesh {
+pub fn stroke_mesh(tool: Tool, points: &[StrokePoint], base_width: f32, tolerance: f32) -> InkMesh {
     if tool.has_nib() {
         nib_ribbon(points, base_width)
     } else {
-        round_mesh(points, base_width, tolerance)
+        continuous::round_mesh(points, base_width, tolerance)
     }
-}
-
-/// Variable-width stroke through lyon: width per point is the point's own
-/// `size.w` when present, otherwise `base_width * force`; caps and joins
-/// are round. A single point (or all-coincident points) becomes a dot of
-/// the point's width.
-fn round_mesh(points: &[StrokePoint], base_width: f32, tolerance: f32) -> StrokeMesh {
-    let pts = dedupe(points);
-    let Some(first) = pts.first() else {
-        return StrokeMesh::default();
-    };
-    let width = |p: &StrokePoint| 2.0 * half_width(p, base_width);
-
-    let mut builder = Path::builder_with_attributes(1);
-    builder.begin(point(first.x, first.y), &[width(first)]);
-    if pts.len() == 1 {
-        // A zero-length segment is skipped by the stroker; nudge the end so
-        // the two round caps meet as a circle.
-        builder.line_to(point(first.x + MIN_SEGMENT, first.y), &[width(first)]);
-    }
-    for p in pts.iter().skip(1) {
-        builder.line_to(point(p.x, p.y), &[width(p)]);
-    }
-    builder.end(false);
-    let path = builder.build();
-
-    // Lyon drops geometry finer than its tolerance, so a coarse tolerance
-    // on hairline ink would erase the stroke: never exceed a quarter of the
-    // thinnest width in play.
-    let finest = pts.iter().map(width).fold(f32::INFINITY, f32::min);
-    let tolerance = tolerance.clamp(1e-3, (finest / 4.0).max(1e-3));
-    let options = StrokeOptions::tolerance(tolerance)
-        .with_line_width(1.0)
-        .with_variable_line_width(0)
-        .with_line_cap(LineCap::Round)
-        .with_line_join(LineJoin::Round);
-    let mut buffers: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
-    let result = StrokeTessellator::new().tessellate_path(
-        &path,
-        &options,
-        &mut BuffersBuilder::new(&mut buffers, |v: StrokeVertex| {
-            let p = v.position();
-            [p.x, p.y]
-        }),
-    );
-    if let Err(err) = result {
-        tracing::warn!(?err, points = pts.len(), "stroke tessellation failed");
-        return StrokeMesh::default();
-    }
-    StrokeMesh {
-        positions: buffers.vertices,
-        indices: buffers.indices,
-    }
-}
-
-/// Flat-nib tessellation: each point becomes the two ends of a `base_width`
-/// long nib turned to `tilt.nib_angle()` (azimuth + barrel roll). Points
-/// without orientation fall back to the motion normal, so a stroke from a
-/// pen that cannot report roll still renders.
-pub fn nib_ribbon(points: &[StrokePoint], base_width: f32) -> StrokeMesh {
-    let pts = dedupe(points);
-    let half = (base_width / 2.0).max(MIN_HALF_WIDTH);
-    let floor = (base_width * NIB_MIN_FRACTION / 2.0).max(MIN_HALF_WIDTH);
-    match pts.as_slice() {
-        [] => return StrokeMesh::default(),
-        [p] => {
-            // A nib touched down without moving: a square dot of its width.
-            let h = half;
-            return StrokeMesh {
-                positions: vec![
-                    [p.x - h, p.y - h],
-                    [p.x + h, p.y - h],
-                    [p.x - h, p.y + h],
-                    [p.x + h, p.y + h],
-                ],
-                indices: vec![0, 1, 2, 2, 1, 3],
-            };
-        }
-        _ => {}
-    }
-    let mut positions = Vec::with_capacity(pts.len() * 2);
-    for (i, p) in pts.iter().enumerate() {
-        let prev = &pts[i.saturating_sub(1)];
-        let next = &pts[(i + 1).min(pts.len() - 1)];
-        let (dx, dy) = (next.x - prev.x, next.y - prev.y);
-        let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
-        let (nx, ny) = (-dy / len, dx / len);
-        let (ox, oy) = match p.tilt {
-            Some(tilt) => {
-                let angle = tilt.nib_angle();
-                let (ux, uy) = (angle.cos(), angle.sin());
-                // Keep the nib's side that faces the motion normal first so
-                // the strip never twists when the nib crosses the path.
-                let side = if ux * nx + uy * ny < 0.0 { -1.0 } else { 1.0 };
-                // Guarantee a minimum thickness across the path.
-                let across = (ux * nx + uy * ny).abs() * half;
-                if across < floor {
-                    (nx * floor, ny * floor)
-                } else {
-                    (ux * half * side, uy * half * side)
-                }
-            }
-            None => (nx * half, ny * half),
-        };
-        positions.push([p.x + ox, p.y + oy]);
-        positions.push([p.x - ox, p.y - oy]);
-    }
-    StrokeMesh {
-        indices: strip_indices(pts.len()),
-        positions,
-    }
-}
-
-/// Triangle-list indices for a strip of `points` (left, right) vertex pairs.
-fn strip_indices(points: usize) -> Vec<u32> {
-    (0..points.saturating_sub(1) as u32)
-        .flat_map(|i| {
-            let base = i * 2;
-            [base, base + 1, base + 2, base + 2, base + 1, base + 3]
-        })
-        .collect()
 }
 
 /// Whole-stroke hit test: does a circle of `radius` at (`x`, `y`) touch the
@@ -375,11 +220,11 @@ mod tests {
         }
     }
 
-    fn pen(points: &[StrokePoint], base_width: f32) -> StrokeMesh {
+    fn pen(points: &[StrokePoint], base_width: f32) -> InkMesh {
         stroke_mesh(Tool::Pen, points, base_width, DEFAULT_TOLERANCE)
     }
 
-    fn bounds(mesh: &StrokeMesh) -> ([f32; 2], [f32; 2]) {
+    fn bounds(mesh: &InkMesh) -> ([f32; 2], [f32; 2]) {
         mesh.bounds().expect("mesh has vertices")
     }
 
@@ -435,9 +280,7 @@ mod tests {
         // A cap is an arc, not a butt: some vertex lies beyond x=10 but
         // strictly inside the full width.
         assert!(
-            mesh.positions
-                .iter()
-                .any(|[x, y]| *x > 10.05 && y.abs() < 0.95),
+            mesh.positions().any(|[x, y]| x > 10.05 && y.abs() < 0.95),
             "no cap arc vertex"
         );
     }
@@ -453,14 +296,12 @@ mod tests {
     fn width_varies_along_the_stroke() {
         let mesh = pen(&[fpt(0.0, 0.0, 0.25), fpt(40.0, 0.0, 1.0)], 4.0);
         let thin = mesh
-            .positions
-            .iter()
+            .positions()
             .filter(|[x, _]| (0.0..5.0).contains(x))
             .map(|[_, y]| y.abs())
             .fold(0.0_f32, f32::max);
         let thick = mesh
-            .positions
-            .iter()
+            .positions()
             .filter(|[x, _]| (35.0..=40.0).contains(x))
             .map(|[_, y]| y.abs())
             .fold(0.0_f32, f32::max);
@@ -536,7 +377,7 @@ mod tests {
         let pts = [fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0)];
         let coarse = stroke_mesh(Tool::Pen, &pts, 8.0, 1.0);
         let fine = stroke_mesh(Tool::Pen, &pts, 8.0, 0.01);
-        assert!(fine.positions.len() > coarse.positions.len());
+        assert!(fine.vertices.len() > coarse.vertices.len());
     }
 
     #[test]
@@ -553,12 +394,15 @@ mod tests {
         let half_pi = core::f32::consts::FRAC_PI_2;
         // Nib across the motion (pointing +y on a horizontal stroke): full width.
         let across = nib_ribbon(&[with_nib(0.0, half_pi), with_nib(10.0, half_pi)], 8.0);
-        let w = (across.positions[0][1] - across.positions[1][1]).abs();
+        let w = (across.vertices[0].pos[1] - across.vertices[1].pos[1]).abs();
         assert!((w - 8.0).abs() < 1e-3, "across width {w}");
         // Nib along the motion: only the thin floor remains.
         let along = nib_ribbon(&[with_nib(0.0, 0.0), with_nib(10.0, 0.0)], 8.0);
-        let w = (along.positions[0][1] - along.positions[1][1]).abs();
-        assert!((w - 8.0 * NIB_MIN_FRACTION).abs() < 1e-3, "along width {w}");
+        let w = (along.vertices[0].pos[1] - along.vertices[1].pos[1]).abs();
+        assert!(
+            (w - 8.0 * nib::NIB_MIN_FRACTION).abs() < 1e-3,
+            "along width {w}"
+        );
         // Roll turns the nib: azimuth 0 rolled by π/2 is across again.
         let rolled = |x: f32| StrokePoint {
             tilt: Some(Tilt {
@@ -569,7 +413,7 @@ mod tests {
             ..fpt(x, 0.0, 1.0)
         };
         let rolled = nib_ribbon(&[rolled(0.0), rolled(10.0)], 8.0);
-        let w = (rolled.positions[0][1] - rolled.positions[1][1]).abs();
+        let w = (rolled.vertices[0].pos[1] - rolled.vertices[1].pos[1]).abs();
         assert!((w - 8.0).abs() < 1e-3, "rolled width {w}");
         // The brush tool routes to the nib; round tools ignore it.
         let nib_pts = [with_nib(0.0, 0.0), with_nib(10.0, 0.0)];
@@ -581,6 +425,43 @@ mod tests {
             stroke_mesh(Tool::Pen, &nib_pts, 8.0, DEFAULT_TOLERANCE),
             pen(&[fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0)], 8.0)
         );
+    }
+
+    #[test]
+    fn stroke_space_uv_runs_along_and_across() {
+        let mesh = pen(&[fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0)], 2.0);
+        let u_max = mesh
+            .vertices
+            .iter()
+            .map(|v| v.uv[0])
+            .fold(0.0_f32, f32::max);
+        assert!(
+            (u_max - 10.0).abs() < 1e-3,
+            "u spans the arc length, got {u_max}"
+        );
+        assert!(
+            mesh.vertices
+                .iter()
+                .all(|v| v.uv[1] == 1.0 || v.uv[1] == -1.0)
+        );
+        // Left and right edges lie on opposite sides of the path.
+        let left = mesh
+            .vertices
+            .iter()
+            .filter(|v| v.uv[1] < 0.0)
+            .map(|v| v.pos[1])
+            .sum::<f32>();
+        let right = mesh
+            .vertices
+            .iter()
+            .filter(|v| v.uv[1] > 0.0)
+            .map(|v| v.pos[1])
+            .sum::<f32>();
+        assert!(
+            left * right < 0.0,
+            "sides should straddle the path: {left} {right}"
+        );
+        assert!(mesh.vertices.iter().all(|v| v.opacity == 1.0));
     }
 
     #[test]
@@ -622,8 +503,8 @@ mod tests {
             for tool in [Tool::Pen, Tool::Marker, Tool::Monoline, Tool::Brush] {
                 let mesh = stroke_mesh(tool, &pts, base, tol);
                 prop_assert_eq!(mesh.indices.len() % 3, 0);
-                prop_assert!(mesh.positions.iter().all(|[x, y]| x.is_finite() && y.is_finite()));
-                prop_assert!(mesh.indices.iter().all(|i| (*i as usize) < mesh.positions.len()));
+                prop_assert!(mesh.vertices.iter().all(|v| v.pos.iter().chain(&v.uv).all(|c| c.is_finite()) && (0.0..=1.0).contains(&v.opacity)));
+                prop_assert!(mesh.indices.iter().all(|i| (*i as usize) < mesh.vertices.len()));
                 prop_assert_eq!(mesh.is_empty(), pts.is_empty());
             }
         }
