@@ -33,6 +33,7 @@ final class AppModel {
         notes = core.listNotes()
         core.setListener(listener: CoreEvents(model: self))
         BrushLibrary.shared.attach(core)
+        InkAssets.shared.setShared(core.listAssets())
 
         // Server config via UserDefaults; launch arguments like
         // `-serverURL ws://… -token demo` populate these automatically.
@@ -356,6 +357,10 @@ private final class CoreEvents: CoreListener {
 
     func brushesChanged(brushes: [BrushInfo]) {
         Task { @MainActor in BrushLibrary.shared.setShared(brushes) }
+    }
+
+    func assetsChanged(assets: [AssetInfo]) {
+        Task { @MainActor in InkAssets.shared.setShared(assets) }
     }
 
     func syncState(state: SyncState) {

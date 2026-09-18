@@ -16,6 +16,75 @@ use super::input::InputParams;
 use crate::stroke::Tool;
 use crate::{Error, Result};
 
+/// Identifies an image a brush samples (a tip mask or a paper grain): the
+/// content hash of its PNG bytes, so the same picture imported twice is
+/// one asset and a stroke names exactly the pixels it was drawn with.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AssetId(pub String);
+
+impl AssetId {
+    /// The id of these bytes: `a:` + 16 hex digits of FNV-1a 64.
+    pub fn of(bytes: &[u8]) -> Self {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        Self(format!("a:{h:016x}"))
+    }
+}
+
+impl core::fmt::Display for AssetId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// What an image asset is for; renderers keep masks in a clamped array
+/// and grains in a repeating one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AssetKind {
+    Mask,
+    Grain,
+}
+
+/// An image asset: greyscale PNG bytes and what they are for. Bundled
+/// ones come from [`BrushSpec::builtin_assets`]; the workspace document
+/// carries the rest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Asset {
+    pub id: AssetId,
+    pub name: String,
+    pub kind: AssetKind,
+    pub png: Vec<u8>,
+}
+
+/// Largest PNG the workspace accepts, bytes.
+pub const MAX_ASSET_BYTES: usize = 64 * 1024;
+
+impl Asset {
+    /// An asset from PNG bytes, id derived from them; rejects anything
+    /// that is not a PNG or is over [`MAX_ASSET_BYTES`].
+    pub fn from_png(name: String, kind: AssetKind, png: Vec<u8>) -> Result<Self> {
+        const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        if !png.starts_with(&SIGNATURE) {
+            return Err(Error::Schema("asset is not a PNG".into()));
+        }
+        if png.len() > MAX_ASSET_BYTES {
+            return Err(Error::Schema(format!(
+                "asset is {} bytes, over the {MAX_ASSET_BYTES} limit",
+                png.len()
+            )));
+        }
+        Ok(Self {
+            id: AssetId::of(&png),
+            name,
+            kind,
+            png,
+        })
+    }
+}
+
 /// Identifies a custom brush; `builtin:` ids are bundled with the app.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BrushId(pub String);
@@ -106,7 +175,7 @@ pub struct BuiltinBrush {
 }
 
 /// The shape the tip leaves at one point, before dynamics.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tip {
     /// Height over width of the footprint: 1 is round (or square), 0.25 a
     /// chisel, 0.15 a flat nib.
@@ -122,6 +191,18 @@ pub struct Tip {
     /// The tip never gets smaller than this fraction of `base_width`,
     /// whatever the dynamics say.
     pub min_size: f32,
+    /// The footprint's shape: the rounded superellipse from `aspect` and
+    /// `corner`, or a greyscale image. Images only apply to stamped
+    /// brushes; a continuous ribbon ignores them.
+    pub mask: Mask,
+}
+
+/// What cuts a dab's shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Mask {
+    Shape,
+    /// A greyscale image over the tip rectangle, white where the ink is.
+    Image(AssetId),
 }
 
 /// Which way the tip's long axis points.
@@ -212,7 +293,7 @@ pub enum Target {
 }
 
 /// How the ink is composited.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Paint {
     /// 0..=1, multiplied into the stroke colour's alpha.
     pub opacity: f32,
@@ -225,7 +306,7 @@ pub struct Paint {
 /// A texture that thins the ink where the paper's tooth would hold it
 /// off: pencil, crayon. Evaluated in the fragment shader, so it costs no
 /// geometry and does not change with zoom buckets.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Grain {
     pub source: GrainSource,
     pub mapping: GrainMapping,
@@ -237,11 +318,13 @@ pub struct Grain {
 }
 
 /// Where the grain texture comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GrainSource {
     /// Smooth value noise from an integer hash: identical on every
-    /// platform, needs no asset. Image grains come with the brush library.
+    /// platform, needs no asset.
     Noise,
+    /// A tileable greyscale image, white where the paper takes ink.
+    Image(AssetId),
 }
 
 /// What the grain texture is anchored to.
@@ -280,7 +363,14 @@ pub enum Blend {
 
 /// Bump when the serialised layout changes; older readers fall back to the
 /// tool's preset.
-const SPEC_VERSION: u8 = 3;
+const SPEC_VERSION: u8 = 4;
+
+/// A soft chalk: the bundled chalk mask stamped over the bundled paper.
+pub const BUILTIN_CHALK: &str = "builtin:chalk";
+/// Bundled greyscale PNGs, embedded in the core so every platform has
+/// them without a workspace.
+const PAPER_PNG: &[u8] = include_bytes!("../../assets/paper.png");
+const CHALK_PNG: &[u8] = include_bytes!("../../assets/chalk.png");
 
 /// A wide, soft, stamped tip with paper grain, [`Tool::Pencil`]'s cousin.
 pub const BUILTIN_CRAYON: &str = "builtin:crayon";
@@ -289,9 +379,30 @@ pub const BUILTIN_CRAYON: &str = "builtin:crayon";
 pub const BUILTIN_PENCIL_GRAINY: &str = "builtin:pencil-grainy";
 
 impl BrushSpec {
+    /// The image assets bundled with the app: a paper grain and a chalk
+    /// tip mask.
+    pub fn builtin_assets() -> Vec<Asset> {
+        vec![
+            Asset {
+                id: AssetId::of(PAPER_PNG),
+                name: "Paper".into(),
+                kind: AssetKind::Grain,
+                png: PAPER_PNG.to_vec(),
+            },
+            Asset {
+                id: AssetId::of(CHALK_PNG),
+                name: "Chalk".into(),
+                kind: AssetKind::Mask,
+                png: CHALK_PNG.to_vec(),
+            },
+        ]
+    }
+
     /// Every brush bundled with the app.
     pub fn builtins() -> Vec<BuiltinBrush> {
         let pencil = Self::preset(Tool::Pencil);
+        let paper = AssetId::of(PAPER_PNG);
+        let chalk = AssetId::of(CHALK_PNG);
         vec![
             BuiltinBrush {
                 id: BrushId(BUILTIN_CRAYON.into()),
@@ -299,7 +410,7 @@ impl BrushSpec {
                 spec: Self {
                     tip: Tip {
                         hardness: 0.6,
-                        ..pencil.tip
+                        ..pencil.tip.clone()
                     },
                     dynamics: vec![
                         Behavior {
@@ -339,7 +450,7 @@ impl BrushSpec {
                             scale: 2.0,
                             strength: 0.6,
                         }),
-                        ..pencil.paint
+                        ..pencil.paint.clone()
                     },
                     ..pencil.clone()
                 },
@@ -355,10 +466,71 @@ impl BrushSpec {
                         size_jitter: 0.05,
                         opacity_jitter: 0.1,
                     }),
+                    ..pencil.clone()
+                },
+            },
+            BuiltinBrush {
+                id: BrushId(BUILTIN_CHALK.into()),
+                name: "Chalk",
+                spec: Self {
+                    tip: Tip {
+                        hardness: 1.0,
+                        mask: Mask::Image(chalk),
+                        ..pencil.tip.clone()
+                    },
+                    dynamics: vec![
+                        Behavior {
+                            source: Source::Pressure,
+                            curve: Curve::Linear,
+                            range: [0.8, 1.0],
+                            target: Target::Size,
+                            damping_ms: 0.0,
+                        },
+                        Behavior {
+                            source: Source::Pressure,
+                            curve: Curve::Pow(0.7),
+                            range: [0.4, 1.0],
+                            target: Target::Opacity,
+                            damping_ms: 0.0,
+                        },
+                    ],
+                    emit: Emit::Stamped(Stamped {
+                        spacing: 0.12,
+                        scatter: 0.03,
+                        rotation_jitter: core::f32::consts::PI,
+                        size_jitter: 0.1,
+                        opacity_jitter: 0.2,
+                    }),
+                    paint: Paint {
+                        opacity: 0.85,
+                        grain: Some(Grain {
+                            source: GrainSource::Image(paper),
+                            mapping: GrainMapping::Canvas,
+                            scale: 48.0,
+                            strength: 0.7,
+                        }),
+                        ..pencil.paint.clone()
+                    },
                     ..pencil
                 },
             },
         ]
+    }
+
+    /// The image assets this spec samples, for a renderer to resolve.
+    pub fn assets(&self) -> Vec<AssetId> {
+        let mut out = Vec::new();
+        if let Mask::Image(id) = &self.tip.mask {
+            out.push(id.clone());
+        }
+        if let Some(Grain {
+            source: GrainSource::Image(id),
+            ..
+        }) = &self.paint.grain
+        {
+            out.push(id.clone());
+        }
+        out
     }
 
     /// The bundled brush with this id, if there is one.
@@ -379,6 +551,7 @@ impl BrushSpec {
             hardness: 1.0,
             max_size_rate: 2.0,
             min_size: 0.25,
+            mask: Mask::Shape,
         };
         let opaque = Paint {
             opacity: 1.0,
@@ -399,7 +572,7 @@ impl BrushSpec {
                     streamline: 0.5,
                     ..input
                 },
-                tip: round,
+                tip: round.clone(),
                 dynamics: vec![
                     behavior(
                         Source::Pressure,
@@ -426,13 +599,13 @@ impl BrushSpec {
                     ),
                 ],
                 emit: Emit::Continuous,
-                paint: opaque,
+                paint: opaque.clone(),
             },
             Tool::Pencil => Self {
                 input,
                 tip: Tip {
                     hardness: 0.7,
-                    ..round
+                    ..round.clone()
                 },
                 dynamics: vec![
                     behavior(Source::Tilt, Curve::Linear, [1.0, 2.2], Target::Size, 0.0),
@@ -468,7 +641,7 @@ impl BrushSpec {
                         scale: 1.5,
                         strength: 0.55,
                     }),
-                    ..opaque
+                    ..opaque.clone()
                 },
             },
             Tool::Marker => Self {
@@ -483,7 +656,7 @@ impl BrushSpec {
                     orient: Orient::Nib {
                         fallback: core::f32::consts::FRAC_PI_4,
                     },
-                    ..round
+                    ..round.clone()
                 },
                 dynamics: Vec::new(),
                 emit: Emit::Continuous,
@@ -499,10 +672,10 @@ impl BrushSpec {
                     streamline: 0.2,
                     ..input
                 },
-                tip: round,
+                tip: round.clone(),
                 dynamics: Vec::new(),
                 emit: Emit::Continuous,
-                paint: opaque,
+                paint: opaque.clone(),
             },
             Tool::Fountain => Self {
                 input,
@@ -534,8 +707,8 @@ impl BrushSpec {
 
     /// The editable numbers of this spec.
     pub fn knobs(&self) -> BrushKnobs {
-        let stamped = match self.emit {
-            Emit::Stamped(s) => Some(s),
+        let stamped = match &self.emit {
+            Emit::Stamped(s) => Some(*s),
             Emit::Continuous => None,
         };
         BrushKnobs {
@@ -545,8 +718,8 @@ impl BrushSpec {
             scatter: stamped.map(|s| s.scatter),
             size_jitter: stamped.map(|s| s.size_jitter),
             opacity_jitter: stamped.map(|s| s.opacity_jitter),
-            grain_strength: self.paint.grain.map(|g| g.strength),
-            grain_scale: self.paint.grain.map(|g| g.scale),
+            grain_strength: self.paint.grain.as_ref().map(|g| g.strength),
+            grain_scale: self.paint.grain.as_ref().map(|g| g.scale),
         }
     }
 
@@ -590,7 +763,7 @@ impl BrushSpec {
             spec.emit = Emit::Stamped(s);
         }
         if knobs.grain_strength.is_some() || knobs.grain_scale.is_some() {
-            let mut g = spec.paint.grain.unwrap_or(Grain {
+            let mut g = spec.paint.grain.clone().unwrap_or(Grain {
                 source: GrainSource::Noise,
                 mapping: GrainMapping::Canvas,
                 scale: 1.5,
@@ -687,9 +860,30 @@ mod tests {
     }
 
     #[test]
+    fn assets_hash_their_bytes_and_are_validated() {
+        let assets = BrushSpec::builtin_assets();
+        assert_eq!(assets.len(), 2);
+        for a in &assets {
+            assert_eq!(a.id, AssetId::of(&a.png));
+            assert!(a.png.len() <= MAX_ASSET_BYTES, "{}", a.name);
+            let again = Asset::from_png(a.name.clone(), a.kind, a.png.clone()).unwrap();
+            assert_eq!(&again, a);
+        }
+        assert!(Asset::from_png("x".into(), AssetKind::Mask, vec![1, 2, 3]).is_err());
+        let mut big = assets[0].png.clone();
+        big.resize(MAX_ASSET_BYTES + 1, 0);
+        assert!(Asset::from_png("x".into(), AssetKind::Grain, big).is_err());
+        let chalk = BrushSpec::builtin(BUILTIN_CHALK).unwrap().spec;
+        let ids = chalk.assets();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().all(|id| assets.iter().any(|a| &a.id == id)));
+        assert!(BrushSpec::preset(Tool::Pen).assets().is_empty());
+    }
+
+    #[test]
     fn builtins_are_stamped_and_findable_by_id() {
         let all = BrushSpec::builtins();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 3);
         for b in &all {
             assert!(b.id.0.starts_with("builtin:"), "{}", b.id);
             assert!(b.spec.is_stamped(), "{}", b.id);

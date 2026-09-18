@@ -11,8 +11,8 @@
 use std::path::Path;
 
 use pendant_core::{
-    BUILTIN_CRAYON, BUILTIN_PENCIL_GRAINY, BrushModeler, BrushSpec, DEFAULT_TOLERANCE, Ink,
-    InkMesh, RawSample, Rgba, Tilt, Tool,
+    BUILTIN_CHALK, BUILTIN_CRAYON, BUILTIN_PENCIL_GRAINY, BrushModeler, BrushSpec,
+    DEFAULT_TOLERANCE, Ink, InkMesh, RawSample, Rgba, Tilt, Tool,
 };
 
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/mesh.txt");
@@ -110,6 +110,11 @@ fn cases() -> Vec<(&'static str, Ink<'static>, Vec<RawSample>)> {
             "pencil-grainy-hairpin",
             builtin(BUILTIN_PENCIL_GRAINY, 3.0),
             hairpin,
+        ),
+        (
+            "chalk-slow-line",
+            builtin(BUILTIN_CHALK, 12.0),
+            line(30, 1.0, 16.0),
         ),
     ]
 }

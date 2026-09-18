@@ -11,8 +11,9 @@
 // Colour: the render target is sRGB-encoded and blending happens in
 // linear light; output is premultiplied `(rgb·a, a)`.
 //
-// This phase has no texture arrays: mask kind 2 (image) and grain kind 2
-// (image) are not handled here yet.
+// Image masks (kind 2) and grains (kind 2) sample the two texture arrays
+// built by ink_assets.rs; a style names its layer in mask_layer /
+// grain_layer.
 
 #import bevy_sprite::mesh2d_functions as mesh_functions
 
@@ -46,6 +47,10 @@ const EDGE_SEED: u32 = 0x9e37u;
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<storage, read> styles: array<StrokeStyle>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var<uniform> params: InkParams;
+@group(#{MATERIAL_BIND_GROUP}) @binding(2) var masks: texture_2d_array<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(3) var mask_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(4) var grains: texture_2d_array<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(5) var grain_sampler: sampler;
 
 struct Vertex {
     @builtin(instance_index) instance_index: u32,
@@ -110,6 +115,12 @@ fn value_noise(p: vec2<f32>, s: u32) -> f32 {
 @fragment
 fn fragment(in: InkOutput) -> @location(0) vec4<f32> {
     let s = styles[in.stroke];
+    // Sampled in uniform control flow (derivatives for mip selection);
+    // only the branches below use the results.
+    let grain_anchor = select(in.canvas, in.uv, (s.flags & FLAG_GRAIN_STROKE) != 0u);
+    let grain_p = grain_anchor / max(s.grain.x, 1e-3);
+    let mask_sample = textureSample(masks, mask_sampler, in.uv * 0.5 + 0.5, s.mask_layer).r;
+    let grain_sample = textureSample(grains, grain_sampler, grain_p, s.grain_layer).r;
     var m = 1.0;
     switch (s.flags & MASK_KIND) {
         case 1u: {
@@ -127,6 +138,21 @@ fn fragment(in: InkOutput) -> @location(0) vec4<f32> {
                 }
             } else {
                 m = 1.0 - smoothstep(-w, 0.0, d);
+            }
+        }
+        case 2u: {
+            // Greyscale image over the dab, white is ink. Write-once ink
+            // cannot carry the partial coverage, so it keeps a fragment
+            // with probability equal to the coverage instead.
+            if (any(abs(in.uv) > vec2<f32>(1.0))) {
+                discard;
+            }
+            if ((s.flags & FLAG_DISCARD) != 0u) {
+                if (hash_corner(floor(in.canvas / EDGE_CELL), EDGE_SEED) > mask_sample) {
+                    discard;
+                }
+            } else {
+                m = mask_sample;
             }
         }
         case 3u: {
@@ -150,11 +176,13 @@ fn fragment(in: InkOutput) -> @location(0) vec4<f32> {
         default: {}
     }
     var g = 1.0;
-    if ((s.flags & GRAIN_KIND) == 4u) {
-        let anchor = select(in.canvas, in.uv, (s.flags & FLAG_GRAIN_STROKE) != 0u);
-        let p = anchor / max(s.grain.x, 1e-3);
-        let n = value_noise(p, s.grain_layer);
+    let grain_kind = s.flags & GRAIN_KIND;
+    if (grain_kind == 4u) {
+        let n = value_noise(grain_p, s.grain_layer);
         g = mix(1.0, n, s.grain.y * saturate(s.grain.x * params.zoom / 1.5));
+    } else if (grain_kind == 8u) {
+        // Mipmapped, so no fade is needed as the view zooms out.
+        g = mix(1.0, grain_sample, s.grain.y);
     }
     let a = s.color.a * in.opacity * m * g;
     if (a < 1.0 / 255.0) {

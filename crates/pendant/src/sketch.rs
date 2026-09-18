@@ -26,6 +26,7 @@ use pendant_core::{
 };
 
 use crate::docs::{Docs, now_ms};
+use crate::ink_assets::{InkAssets, sync_assets};
 use crate::ink_material::{
     ATTRIBUTE_INK_OPACITY, ATTRIBUTE_INK_UV, InkMaterial, InkMaterialPlugin, InkPalette, InkParams,
     InkSlot,
@@ -107,6 +108,8 @@ struct SketchScene {
     layer: usize,
     target: SceneTarget,
     palette: InkPalette,
+    /// The `InkAssets` generation the strokes were styled against.
+    assets_generation: u32,
     /// Committed element id → ink entity (`None` for elements with no ink).
     strokes: HashMap<StrokeId, Option<InkEntity>>,
     /// Committed elements spawned so far; the next one's z slot.
@@ -160,9 +163,16 @@ impl Plugin for SketchPlugin {
             .init_resource::<SketchScenes>()
             .init_resource::<SketchTextures>()
             .init_resource::<WetLatency>()
+            .add_systems(PreStartup, init_ink_assets)
             .add_systems(
                 Update,
-                (sync_sketch_scenes, apply_wet_ink, flush_palettes).chain(),
+                (
+                    sync_assets,
+                    sync_sketch_scenes,
+                    apply_wet_ink,
+                    flush_palettes,
+                )
+                    .chain(),
             )
             .add_systems(EguiPrimaryContextPass, install_loader);
     }
@@ -238,6 +248,7 @@ fn sync_sketch_scenes(
     mut materials: ResMut<Assets<InkMaterial>>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut egui_textures: ResMut<EguiUserTextures>,
+    ink_assets: Res<InkAssets>,
 ) {
     let Some(note_id) = editor.open else { return };
     let Some(note) = docs.note(note_id) else {
@@ -276,13 +287,19 @@ fn sync_sketch_scenes(
                 layer,
                 desired,
             );
-            let palette = InkPalette::new(&mut buffers, &mut materials, InkParams::new(ZOOM));
+            let palette = InkPalette::new(
+                &mut buffers,
+                &mut materials,
+                InkParams::new(ZOOM),
+                &ink_assets,
+            );
             scenes.scenes.insert(
                 sketch,
                 SketchScene {
                     layer,
                     target,
                     palette,
+                    assets_generation: ink_assets.generation,
                     strokes: HashMap::new(),
                     committed: 0,
                     wet_serial: 0,
@@ -305,6 +322,17 @@ fn sync_sketch_scenes(
             );
         }
 
+        // New texture arrays: every stroke's layers may have moved, so
+        // restyle them all by respawning.
+        if scene.assets_generation != ink_assets.generation {
+            scene.assets_generation = ink_assets.generation;
+            scene.palette.set_assets(&mut materials, &ink_assets);
+            for drawn in scene.strokes.drain().filter_map(|(_, d)| d) {
+                commands.entity(drawn.entity).despawn();
+                scene.palette.remove(drawn.slot);
+            }
+        }
+
         // Diff committed elements.
         let mut stale: HashMap<_, _> = scene.strokes.clone();
         for (element, outline) in &outlines {
@@ -314,7 +342,7 @@ fn sync_sketch_scenes(
             }
             let drawn =
                 ink_mesh(&element.ink(), outline, StrokeEnd::Complete).map(|(mesh, style)| {
-                    let slot = scene.palette.insert(style);
+                    let slot = scene.palette.insert(&style, &ink_assets);
                     let z = committed_z(scene.committed);
                     scene.committed = scene.committed.saturating_add(1);
                     let (tag, material) = scene.palette.components(slot);
@@ -475,6 +503,7 @@ fn apply_wet_ink(
     mut scenes: ResMut<SketchScenes>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut latency: ResMut<WetLatency>,
+    ink_assets: Res<InkAssets>,
 ) {
     let open_doc = editor.open.map(DocKey::from);
 
@@ -562,7 +591,7 @@ fn apply_wet_ink(
                         let Some(scene) = scenes.scenes.get_mut(&wet.sketch) else {
                             continue; // sketch went away; the commit will cover it
                         };
-                        let slot = scene.palette.insert(style);
+                        let slot = scene.palette.insert(&style, &ink_assets);
                         let z = wet_z(scene.wet_serial);
                         scene.wet_serial = (scene.wet_serial + 1) % WET_Z_SLOTS;
                         let (tag, material) = scene.palette.components(slot);
@@ -634,4 +663,9 @@ fn report_latency(latency: &mut WetLatency) {
         max_ms = sorted.last().copied().unwrap_or(0.0),
         "wet-ink receive latency (sender clock -> local clock)"
     );
+}
+
+/// The ink texture arrays, before any scene exists.
+fn init_ink_assets(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+    commands.insert_resource(InkAssets::new(&mut images));
 }

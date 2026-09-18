@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pendant_ffi::{
-    BrushInfo, Core, CoreListener, Element, NoteInfo, NoteListener, Point2, PointKind, Shape,
-    ShapeElement, Stroke, StrokePoint, SyncState, Tool,
+    AssetInfo, AssetKind, BrushInfo, Core, CoreListener, Element, NoteInfo, NoteListener, Point2,
+    PointKind, Shape, ShapeElement, Stroke, StrokePoint, SyncState, Tool,
 };
 
 fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
@@ -44,6 +44,7 @@ fn start_server(dir: &std::path::Path, token: &str) -> String {
 struct RecCore {
     notes: Mutex<Vec<NoteInfo>>,
     brushes: Mutex<Vec<BrushInfo>>,
+    assets: Mutex<Vec<AssetInfo>>,
     states: Mutex<Vec<SyncState>>,
 }
 
@@ -54,6 +55,10 @@ impl CoreListener for RecCore {
 
     fn brushes_changed(&self, brushes: Vec<BrushInfo>) {
         *self.brushes.lock().unwrap() = brushes;
+    }
+
+    fn assets_changed(&self, assets: Vec<AssetInfo>) {
+        *self.assets.lock().unwrap() = assets;
     }
 
     fn sync_state(&self, state: SyncState) {
@@ -246,6 +251,33 @@ fn two_cores_converge_through_relay() {
     );
     core_a.remove_brush("user:soft".into()).unwrap();
     wait_for("removal reaches B", || core_b.list_brushes().is_empty());
+
+    // Assets: PNG bytes sync with their content id; junk is rejected.
+    let paper = pendant_ffi::builtin_assets()[0].clone();
+    let id = core_a
+        .put_asset("paper copy".into(), AssetKind::Grain, paper.png.clone())
+        .unwrap();
+    assert_eq!(id, paper.id, "id is the content hash");
+    assert!(
+        core_a
+            .put_asset("junk".into(), AssetKind::Mask, vec![1, 2, 3])
+            .is_err()
+    );
+    wait_for("asset reaches B", || {
+        core_b.list_assets().iter().any(|a| a.id == id)
+    });
+    assert!(
+        rec_core_b
+            .assets
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|a| a.png == paper.png)
+    );
+    core_a.remove_asset(id).unwrap();
+    wait_for("asset removal reaches B", || {
+        core_b.list_assets().is_empty()
+    });
 
     // Text: A types, B observes via listener and direct read.
     note_a

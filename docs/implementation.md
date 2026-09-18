@@ -128,12 +128,15 @@ corner, orient: Motion | Nib{fallback} | Fixed, hardness, max_size_rate,
 min_size}`, `dynamics: Vec<Behavior>`, `emit: Continuous |
 Stamped{spacing, scatter, rotation_jitter, size_jitter, opacity_jitter}`,
 `paint: Paint{opacity, overlap: Accumulate | Discard, blend: Normal |
-Multiply, grain: Option<Grain{source: Noise, mapping: Canvas | Stroke,
-scale, strength}>}`. Specs serialise with `SPEC_VERSION` 3 for custom
+Multiply, grain: Option<Grain{source: Noise | Image(AssetId), mapping:
+Canvas | Stroke, scale, strength}>}`; `tip.mask` is `Shape` or
+`Image(AssetId)`. Specs serialise with `SPEC_VERSION` 4 for custom
 brushes carried inside a stroke, a wet `Begin`, or the workspace's
 `brushes` map (`BrushMeta`). `BrushSpec::builtins()` bundles
-`builtin:crayon` and `builtin:pencil-grainy`; `BrushKnobs` is the editor's
-view of a spec (`knobs()` / `with_knobs()`).
+`builtin:crayon`, `builtin:pencil-grainy` and `builtin:chalk`;
+`BrushSpec::builtin_assets()` the paper grain and chalk mask PNGs
+(`AssetId` = content hash, `Asset::from_png` validates ≤ 64 KiB);
+`BrushKnobs` is the editor's view of a spec (`knobs()` / `with_knobs()`).
 
 Presets (`BrushSpec::preset`):
 
@@ -147,8 +150,8 @@ Presets (`BrushSpec::preset`):
 
 `InkMesh` is `vertices: Vec<InkVertex{pos, uv, opacity}>`, `indices`,
 `zoom_independent`, and one `InkStyle{color, opacity, blend, overlap,
-hardness, mask: Ribbon | Shape{corner}, grain: Option<GrainStyle{mapping,
-scale, strength, seed}>}`. On a ribbon `uv.x` is arc length in canvas units
+hardness, mask: Ribbon | Shape{corner} | Image{asset, corner}, grain:
+Option<GrainStyle{image, mapping, scale, strength, seed}>}`. On a ribbon `uv.x` is arc length in canvas units
 and `uv.y` the side in −1..1; on a dab `uv` is the tip space `[-1, 1]²`;
 that is what the shaders map masks and grain through. `DEFAULT_TOLERANCE`
 is 0.25.
@@ -211,6 +214,10 @@ Bevy app with egui UI. Modules:
   `pendant://` texture loader. Committed elements are ink meshes at z
   `k/100`; remote wet strokes at `990 + j/100` are dropped when the commit
   lands or on timeout.
+- `ink_assets.rs`: `InkAssets` resource, the mask and grain `r8` texture
+  arrays (CPU box mips, `image` crate decoding) from the bundled PNGs and
+  the workspace's assets, rebuilt when `asset_ids()` changes; scenes
+  respawn their strokes when its generation moves.
 - `ink_material.rs` + `ink.wgsl`: the desktop twin of the Metal pipeline.
   One `Material2d` per `InkCombo` (blend × overlap, four per sketch)
   sharing one `InkPalette` storage buffer of `StrokeStyle`; each mesh
@@ -234,9 +241,12 @@ UniFFI proc macros (`uniffi::setup_scaffolding!("pendant")`), no UDL.
   come back through the foreign traits `CoreListener` (`notes_changed`,
   `brushes_changed`, `sync_state`) and `NoteListener` (`synced`,
   `text_changed`, `strokes_changed`, `wet_begin` / `wet_points` /
-  `wet_end` / `wet_cancel`). `Core` also owns the shared brush library
-  (`list_brushes` / `upsert_brush` / `remove_brush`) next to
-  `builtin_brushes()` and the `brush_knobs` / `brush_with_knobs` helpers.
+  `wet_end` / `wet_cancel`, `assets_changed`). `Core` also owns the shared
+  brush library (`list_brushes` / `upsert_brush` / `remove_brush`) and
+  asset library (`list_assets` / `put_asset` / `remove_asset`) next to
+  `builtin_brushes()`, `builtin_assets()` and the `brush_knobs` /
+  `brush_with_knobs` / `brush_with_mask` / `brush_with_grain_image`
+  helpers.
 - `net.rs`: the single-socket sync task. Every direct path (desktop
   addresses plus mDNS finds) is dialled in parallel and the first handshake
   wins; the fallback relay is dialled only when none answers, and direct
@@ -294,7 +304,11 @@ Bonjour usage strings, file sharing for recordings).
 - `BrushLibrary.swift` + `BrushAttributesView.swift`: bundled brushes plus
   the workspace's (`brushesChanged`), one custom picker item each with the
   brush drawn as its icon and width swatches, and a popover of `BrushKnobs`
-  sliders persisted per brush in `UserDefaults` (`brush.<id>.knobs`).
+  sliders, tip-mask and paper menus and picture import, persisted per
+  brush in `UserDefaults` (`brush.<id>.knobs|mask|grain`).
+- `InkAssets.swift`: the mask and grain `r8` texture arrays (mipmapped)
+  from the bundled PNGs and the workspace's assets (`assetsChanged`);
+  `AssetImport` shrinks a picked picture to a greyscale PNG ≤ 64 KiB.
 - `InkRenderer.swift` + `Shaders.metal`: `MTKViewDelegate`, demand-driven.
   Committed ink is one batched upload drawn as runs split only where the
   pipeline changes; wet, live, hover and settling strokes are separate

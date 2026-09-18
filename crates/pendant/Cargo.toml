@@ -32,6 +32,7 @@ egui_commonmark.workspace = true
 directories.workspace = true
 gethostname = "0.5"
 qrcode = { version = "0.14", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
 futures.workspace = true
 serde.workspace = true
 tokio.workspace = true
