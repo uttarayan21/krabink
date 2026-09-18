@@ -159,6 +159,27 @@ impl BrushModeler {
     pub fn pending_estimates(&self) -> Vec<u32> {
         self.lock().pending_estimates()
     }
+
+    /// The live stroke's ink: every point so far plus the tail `predict`
+    /// would add, meshed here so no point crosses the boundary per touch
+    /// event. Same geometry as [`points_mesh`] with `StrokeEnd::Live`.
+    pub fn live_mesh(
+        &self,
+        predict: Vec<RawSample>,
+        brush: BrushRef,
+        color: u32,
+        tolerance: f32,
+    ) -> InkMesh {
+        let raw: Vec<pcore::RawSample> = predict.into_iter().map(Into::into).collect();
+        let inner = self.lock();
+        let mut points = inner.points().to_vec();
+        points.extend(inner.predict(&raw));
+        drop(inner);
+        brush
+            .ink(color)
+            .mesh(&points, pcore::StrokeEnd::Live, tolerance)
+            .into()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -212,28 +233,34 @@ impl From<pcore::InkStyle> for InkStyle {
 /// Floats per vertex in [`InkMesh::vertices`].
 pub const INK_VERTEX_FLOATS: u32 = 5;
 
-/// An indexed triangle mesh in canvas units (x right, y down).
-/// `vertices` is `[x, y, u, v, opacity]` per vertex, interleaved
-/// ([`INK_VERTEX_FLOATS`] floats each): `u` is arc length along the
-/// stroke, `v` the side in -1..=1, `opacity` 0..=1. `indices` is a
-/// triangle list into it. Upload both as-is to a vertex and index buffer;
-/// apply `style` per draw.
+/// An indexed triangle mesh in canvas units (x right, y down), as the
+/// bytes a GPU buffer takes so the boundary is one copy, not a per-element
+/// lift. `vertices` is little-endian `f32` `[x, y, u, v, opacity]` per
+/// vertex ([`INK_VERTEX_FLOATS`] floats each): `u` is arc length along the
+/// stroke, `v` the side in -1..=1, `opacity` 0..=1. `indices` is
+/// little-endian `u32`, a triangle list into it. Upload both as-is; apply
+/// `style` per draw.
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct InkMesh {
-    pub vertices: Vec<f32>,
-    pub indices: Vec<u32>,
+    pub vertices: Vec<u8>,
+    pub indices: Vec<u8>,
+    pub vertex_count: u32,
+    pub index_count: u32,
     pub style: InkStyle,
 }
 
 impl From<pcore::InkMesh> for InkMesh {
     fn from(m: pcore::InkMesh) -> Self {
         Self {
+            vertex_count: u32::try_from(m.vertices.len()).unwrap_or(u32::MAX),
+            index_count: u32::try_from(m.indices.len()).unwrap_or(u32::MAX),
             vertices: m
                 .vertices
                 .iter()
                 .flat_map(|v| [v.pos[0], v.pos[1], v.uv[0], v.uv[1], v.opacity])
+                .flat_map(f32::to_le_bytes)
                 .collect(),
-            indices: m.indices,
+            indices: m.indices.iter().flat_map(|i| i.to_le_bytes()).collect(),
             style: m.style.into(),
         }
     }
@@ -363,17 +390,33 @@ mod tests {
         assert_eq!(tail.len(), 1);
         assert_eq!(m.points(), live, "predict must not push");
 
-        let done = m.finish();
         let brush = BrushRef {
             tool: Tool::Pen,
             base_width: 4.0,
         };
+        assert_eq!(
+            m.live_mesh(vec![], brush, 0xff, 0.25),
+            points_mesh(m.points(), brush, 0xff, StrokeEnd::Live, 0.25),
+            "live_mesh is points_mesh of the modeler's points"
+        );
+        let done = m.finish();
         let mesh = points_mesh(done.clone(), brush, 0xff, StrokeEnd::Complete, 0.25);
-        assert!(mesh.indices.len() >= 3 && mesh.indices.len().is_multiple_of(3));
-        let stride = usize::try_from(INK_VERTEX_FLOATS).unwrap();
-        assert!(mesh.vertices.len().is_multiple_of(stride));
-        let vertices = u32::try_from(mesh.vertices.len() / stride).unwrap();
-        assert!(mesh.indices.iter().all(|&i| i < vertices));
+        assert!(mesh.index_count >= 3 && mesh.index_count.is_multiple_of(3));
+        assert_eq!(
+            mesh.indices.len(),
+            usize::try_from(mesh.index_count).unwrap() * 4
+        );
+        let stride = usize::try_from(INK_VERTEX_FLOATS).unwrap() * 4;
+        assert_eq!(
+            mesh.vertices.len(),
+            usize::try_from(mesh.vertex_count).unwrap() * stride
+        );
+        let indices: Vec<u32> = mesh
+            .indices
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert!(indices.iter().all(|&i| i < mesh.vertex_count));
         assert_eq!(mesh.style.color, 0xff);
 
         let committed = stroke_mesh(
@@ -455,6 +498,6 @@ mod tests {
             preview, committed,
             "preview and committed ink are the same mesh"
         );
-        assert!(!committed.indices.is_empty());
+        assert!(committed.index_count > 0);
     }
 }

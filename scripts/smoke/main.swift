@@ -28,8 +28,9 @@ func createAndEdit(dir: String) throws -> (note: String, sketch: String, stroke:
     let points = modeler.finish()
     let brush = BrushRef(tool: .pen, baseWidth: 3.0)
     let mesh = pointsMesh(points: points, brush: brush, color: 0x1E3C_C8FF, end: .complete, tolerance: defaultTolerance())
-    guard mesh.indices.count >= 3, mesh.indices.count % 3 == 0 else { fatalError("empty mesh") }
-    guard mesh.vertices.count % Int(inkVertexFloats()) == 0, mesh.style.color == 0x1E3C_C8FF else {
+    guard mesh.indexCount >= 3, mesh.indexCount % 3 == 0, mesh.indices.count == Int(mesh.indexCount) * 4
+    else { fatalError("empty mesh") }
+    guard mesh.vertices.count == Int(mesh.vertexCount) * Int(inkVertexFloats()) * 4, mesh.style.color == 0x1E3C_C8FF else {
         fatalError("mesh layout")
     }
 

@@ -152,6 +152,9 @@ private struct LiveStroke {
     var maxLateMs = 0.0
     var endedAt: Date?
     var settleTask: Task<Void, Never>?
+    /// Live redraws this stroke and the slowest one, ms.
+    var redraws = 0
+    var maxRedrawMs = 0.0
 }
 
 /// Writes raw pen samples to Documents for the core's shape corpus
@@ -225,6 +228,8 @@ final class SketchModel {
     private var settling: [String: LiveStroke] = [:]
     private var flushTask: Task<Void, Never>?
     private var selfTestDone = false
+    /// An estimate update asked for a redraw; done once per run-loop pass.
+    private var liveRedrawPending = false
 
     init(session: NoteSession, sketchId: String) {
         self.session = session
@@ -350,7 +355,7 @@ final class SketchModel {
             if live != nil, live!.modeler.update(estimationId: id, force: sample.force, tilt: sample.tilt) {
                 live!.estUpdated += 1
                 Self.patchRecording(&live!, sample)
-                showLive(predicted: [])
+                scheduleLiveRedraw()
                 continue
             }
             for key in settling.keys
@@ -365,6 +370,17 @@ final class SketchModel {
                 if settling[key]!.modeler.pendingEstimates().isEmpty { commitSettled(key) }
                 break
             }
+        }
+    }
+
+    /// Updates arrive in bursts (hundreds per stroke); redraw once per
+    /// run-loop pass, and not at all when a move event redraws first.
+    private func scheduleLiveRedraw() {
+        guard !liveRedrawPending else { return }
+        liveRedrawPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self, liveRedrawPending else { return }
+            showLive(predicted: [])
         }
     }
 
@@ -509,9 +525,9 @@ final class SketchModel {
         if stroke.estPushed > 0 {
             let waited = stroke.endedAt.map { Date().timeIntervalSince($0) * 1000 } ?? 0
             NSLog(
-                "est: pushed=%d updated=%d late=%d maxLateMs=%.0f waitedMs=%.0f unresolved=%d",
+                "est: pushed=%d updated=%d late=%d maxLateMs=%.0f waitedMs=%.0f unresolved=%d redraws=%d maxRedrawMs=%.1f",
                 stroke.estPushed, stroke.estUpdated, stroke.estLate, stroke.maxLateMs, waited,
-                stroke.modeler.pendingEstimates().count)
+                stroke.modeler.pendingEstimates().count, stroke.redraws, stroke.maxRedrawMs)
         }
         // `show` also drops the settling copy of the same id.
         renderer?.show(element, z: ids.count)
@@ -521,13 +537,21 @@ final class SketchModel {
     }
 
     private func showLive(predicted: [RawSample]) {
-        guard let stroke = live else { return }
+        liveRedrawPending = false
+        guard let stroke = live, let renderer else { return }
+        let started = CFAbsoluteTimeGetCurrent()
         if let shape = stroke.shape {
-            renderer?.setLocalShape(shape, brush: stroke.brush, color: stroke.color)
-            return
+            renderer.setLocalShape(shape, brush: stroke.brush, color: stroke.color)
+        } else {
+            // Meshed inside the modeler: no point crosses the FFI per event.
+            renderer.setLocal(
+                mesh: stroke.modeler.liveMesh(
+                    predict: predicted, brush: stroke.brush, color: stroke.color,
+                    tolerance: renderer.tolerance))
         }
-        let points = stroke.modeler.points() + stroke.modeler.predict(samples: predicted)
-        renderer?.setLocal(points: points, brush: stroke.brush, color: stroke.color)
+        let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
+        live!.redraws += 1
+        live!.maxRedrawMs = max(live!.maxRedrawMs, ms)
     }
 
     private func flushWet() {

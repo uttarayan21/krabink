@@ -143,23 +143,47 @@ struct InkGeometry {
 
     /// Append a mesh as one stroke at `depth`, offsetting its indices past
     /// the vertices so far. Extends the last run when the pipeline state
-    /// matches, so consecutive same-brush strokes are one draw.
+    /// matches, so consecutive same-brush strokes are one draw. The mesh
+    /// arrives as little-endian bytes; they are copied, not decoded.
     mutating func append(_ mesh: InkMesh, depth: Float) {
-        let count = mesh.vertices.count / Self.vertexFloats
-        guard mesh.indices.count >= 3, count >= 3 else { return }
+        let count = Int(mesh.vertexCount)
+        let indexCount = Int(mesh.indexCount)
+        guard indexCount >= 3, count >= 3,
+              mesh.vertices.count == count * Self.vertexFloats * 4,
+              mesh.indices.count == indexCount * 4
+        else { return }
         let base = UInt32(vertexCount)
         let stroke = UInt32(styles.count)
         let style = StrokeStyle(mesh.style, depth: depth)
         styles.append(style)
-        vertices.append(contentsOf: mesh.vertices)
+        vertices.append(contentsOf: mesh.vertices.floats)
         strokeIndex.append(contentsOf: repeatElement(stroke, count: count))
         let start = indices.count
-        indices.reserveCapacity(indices.count + mesh.indices.count)
-        for index in mesh.indices { indices.append(base + index) }
-        if let last = runs.last, last.combo == style.combo {
-            runs[runs.count - 1].indexCount += mesh.indices.count
+        if base == 0 {
+            indices.append(contentsOf: mesh.indices.uint32s)
         } else {
-            runs.append(InkRun(combo: style.combo, indexOffset: start, indexCount: mesh.indices.count))
+            indices.reserveCapacity(indices.count + indexCount)
+            for index in mesh.indices.uint32s { indices.append(base + index) }
+        }
+        if let last = runs.last, last.combo == style.combo {
+            runs[runs.count - 1].indexCount += indexCount
+        } else {
+            runs.append(InkRun(combo: style.combo, indexOffset: start, indexCount: indexCount))
+        }
+    }
+}
+
+extension Data {
+    /// Little-endian `Float`s, one copy (arm64 is little-endian).
+    var floats: [Float] {
+        [Float](unsafeUninitializedCapacity: count / 4) { buffer, filled in
+            filled = copyBytes(to: buffer) / 4
+        }
+    }
+
+    var uint32s: [UInt32] {
+        [UInt32](unsafeUninitializedCapacity: count / 4) { buffer, filled in
+            filled = copyBytes(to: buffer) / 4
         }
     }
 }
@@ -220,12 +244,13 @@ extension InkMesh {
         var minY = Float.infinity
         var maxX = -Float.infinity
         var maxY = -Float.infinity
+        let floats = vertices.floats
         var i = 0
-        while i + 1 < vertices.count {
-            minX = min(minX, vertices[i])
-            maxX = max(maxX, vertices[i])
-            minY = min(minY, vertices[i + 1])
-            maxY = max(maxY, vertices[i + 1])
+        while i + 1 < floats.count {
+            minX = min(minX, floats[i])
+            maxX = max(maxX, floats[i])
+            minY = min(minY, floats[i + 1])
+            maxY = max(maxY, floats[i + 1])
             i += InkGeometry.vertexFloats
         }
         guard minX <= maxX else { return .null }
@@ -420,7 +445,8 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         return pow(2, ceil(log2(zoom)))
     }
 
-    private var tolerance: Float {
+    /// Flattening tolerance for the current zoom bucket, canvas units.
+    var tolerance: Float {
         Float(CGFloat(defaultTolerance()) / meshBucket)
     }
 
@@ -538,11 +564,10 @@ final class InkRenderer: NSObject, MTKViewDelegate {
 
     // MARK: local live stroke
 
-    /// Replace the live stroke's ink: the modeler's points plus its
-    /// predicted tail, re-tessellated whole (well under a millisecond for
-    /// thousands of points).
-    func setLocal(points: [StrokePoint], brush: BrushRef, color: UInt32) {
-        setLocal(pointsMesh(points: points, brush: brush, color: color, end: .live, tolerance: tolerance))
+    /// Replace the live stroke's ink with a mesh the modeler built
+    /// (`BrushModeler.liveMesh` at `tolerance`).
+    func setLocal(mesh: InkMesh) {
+        setLocal(mesh)
     }
 
     /// Replace the live stroke's ink with a snapped shape's outline (the
