@@ -602,9 +602,12 @@ Image assets (second P3 slice):
   and "Import…" which files a picked picture into the workspace as a
   greyscale PNG shrunk until it fits 64 KiB.
 
-Not done in P3: the iOS 17 `BrushSheet` fallback (custom items need
-iOS 18; on 17 the crayon still draws with the bundled brush, the other
-bundled brushes are not offered); the `LiveInk` mesh delta
-(`GPUGeometry.append/truncate`): a stamped stroke at spacing 0.15
-re-uploads a few thousand quads per frame, which has not shown up in the
-redraw timings.
+iOS 17: `BrushSheet` (a "brushes" button in the sketch toolbar, shown
+only below iOS 18) lists the library with each brush drawn as its icon;
+picking one sets the pen to it at the picker's last colour and width and
+a pill names it; any PencilKit tool switches back. Compiled, not run: the
+simulator and the iPad are on 18.
+
+Not done in P3: the `LiveInk` mesh delta (`GPUGeometry.append/truncate`):
+a stamped stroke at spacing 0.15 re-uploads a few thousand quads per
+frame, which has not shown up in the redraw timings.
