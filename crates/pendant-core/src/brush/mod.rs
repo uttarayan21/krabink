@@ -29,6 +29,7 @@ mod spec;
 
 pub(crate) use dynamics::MIN_TIP;
 pub use dynamics::{StrokeEnd, TipEvaluator, TipState};
+pub(crate) use input::distance;
 pub use input::{EmaModel, Estimate, InputParams, RawSample};
 pub use spec::{
     Behavior, Blend, BrushId, BrushSpec, Curve, CustomBrush, Grain, GrainMapping, GrainSource,

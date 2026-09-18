@@ -19,7 +19,7 @@ use std::borrow::Cow;
 
 pub use mesh::{GrainStyle, InkMesh, InkStyle, InkVertex};
 
-use crate::brush::{BrushSpec, StrokeEnd, TipEvaluator, TipState};
+use crate::brush::{BrushSpec, StrokeEnd, TipEvaluator, TipState, distance};
 use crate::stroke::{PointKind, Rgba, Stroke, StrokePoint, Tilt, Tool};
 
 /// Curve samples evaluated per spline segment. 8 keeps a typical pen segment
@@ -130,6 +130,12 @@ fn eval_segment(w: &[StrokePoint], t: f32) -> StrokePoint {
 
 /// Points closer than this (canvas units) are merged before tessellation.
 pub(crate) const MIN_SEGMENT: f32 = 0.05;
+/// Points closer than this fraction of the base width are merged as well:
+/// the input model emits every quarter unit, so a wide tip on a slow,
+/// jittery pen would get a full-width round join at every sub-unit
+/// reversal, and translucent ink darkens wherever those joins overlap
+/// themselves. A fifth of the width is invisible on the outline.
+const SEGMENT_FRACTION: f32 = 0.2;
 /// Flattening tolerance for caps and joins at 1:1 zoom, canvas units.
 /// Callers zoomed in by `z` should pass `DEFAULT_TOLERANCE / z`.
 pub const DEFAULT_TOLERANCE: f32 = 0.25;
@@ -225,7 +231,8 @@ impl Ink<'_> {
 
     /// Deduplicated positions paired with their tip states.
     fn tips(&self, points: &[StrokePoint], end: StrokeEnd) -> Vec<([f32; 2], TipState)> {
-        let clean = dedupe(points);
+        let min_segment = (self.base_width * SEGMENT_FRACTION).max(MIN_SEGMENT);
+        let clean = dedupe(points, min_segment);
         let states = TipEvaluator::evaluate(&self.spec, self.base_width, &clean, end);
         clean.iter().map(|p| [p.x, p.y]).zip(states).collect()
     }
@@ -240,20 +247,36 @@ pub(crate) fn segment_distance2(a: [f32; 2], b: [f32; 2], p: [f32; 2]) -> f32 {
     (cx - p[0]).powi(2) + (cy - p[1]).powi(2)
 }
 
-/// Drop non-finite points and merge runs closer than [`MIN_SEGMENT`].
-pub(crate) fn dedupe(points: &[StrokePoint]) -> Vec<StrokePoint> {
-    points
+/// Drop non-finite points and merge runs closer than `min_segment` to
+/// the last kept point. The final point is always kept (replacing the
+/// last one if it is too close), so the stroke still ends where the pen
+/// lifted.
+pub(crate) fn dedupe(points: &[StrokePoint], min_segment: f32) -> Vec<StrokePoint> {
+    let mut out = points
         .iter()
         .filter(|p| p.x.is_finite() && p.y.is_finite() && p.force.is_finite())
         .fold(Vec::with_capacity(points.len()), |mut out, p| {
             let near = out.last().is_some_and(|last: &StrokePoint| {
-                (p.x - last.x).abs() < MIN_SEGMENT && (p.y - last.y).abs() < MIN_SEGMENT
+                distance([last.x, last.y], [p.x, p.y]) < min_segment
             });
             if !near {
                 out.push(*p);
             }
             out
-        })
+        });
+    if let Some(&last) = points.last().filter(|p| p.x.is_finite() && p.y.is_finite()) {
+        match out.last() {
+            Some(kept) if (kept.x, kept.y) == (last.x, last.y) => {}
+            Some(kept)
+                if out.len() > 1 && distance([kept.x, kept.y], [last.x, last.y]) < min_segment =>
+            {
+                *out.last_mut().expect("non-empty") = last;
+            }
+            Some(_) => out.push(last),
+            None => {}
+        }
+    }
+    out
 }
 
 #[cfg(test)]
