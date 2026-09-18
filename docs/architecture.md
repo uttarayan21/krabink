@@ -117,7 +117,7 @@ flowchart LR
         SS["ServerSession\nBroadcast / Disconnect effects"]
         WS["WorkspaceDoc\nnotes + device registry"]
         PAIR["pair.rs\nPairInfo <-> pendant://pair URI"]
-        INK["brush/ + geom/ + shape.rs\nBrushSpec presets, BrushModeler,\nInkMesh (lyon + nib ribbons);\nshape recognizer; element.rs"]
+        INK["brush/ + geom/ + shape.rs + corpus.rs\nBrushSpec presets, BrushModeler,\nInkMesh + InkStyle (grain, hover dab);\nshape recognizer; element.rs"]
     end
     subgraph desktop["pendant (desktop bin)"]
         BEVY["Bevy app: ui, sketch, docs"]

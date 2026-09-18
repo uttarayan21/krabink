@@ -26,7 +26,7 @@ use bevy::render::render_resource::{
 use bevy::render::storage::ShaderBuffer;
 use bevy::shader::ShaderRef;
 use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dKey, Material2dPlugin};
-use pendant_core::{Blend, InkStyle, Overlap, Rgba};
+use pendant_core::{Blend, GrainMapping, InkStyle, Overlap, Rgba};
 
 /// Stroke-space uv: `u` arc length in canvas units, `v` the side in -1..1.
 pub const ATTRIBUTE_INK_UV: MeshVertexAttribute =
@@ -53,7 +53,7 @@ pub struct StrokeStyle {
     pub color: Vec4,
     /// aspect, corner, hardness, 0
     pub mask: Vec4,
-    /// scale, strength, seed, 0
+    /// scale, strength, 0, 0
     pub grain: Vec4,
     /// NDC z slot on Metal; unused here, z comes from the transform.
     pub depth: f32,
@@ -65,6 +65,11 @@ pub struct StrokeStyle {
 impl StrokeStyle {
     /// Bits 0-1, mask kind 3: feather the ribbon edge by `mask.z`.
     pub const MASK_EDGE: u32 = 3;
+    /// Bits 2-3, grain kind 1: procedural value noise seeded by
+    /// `grain_layer`.
+    pub const GRAIN_NOISE: u32 = 4;
+    /// Bit 4: grain follows the stroke's own uv rather than the canvas.
+    pub const GRAIN_STROKE: u32 = 16;
     /// Bit 5: ink multiplies what is under it.
     pub const MULTIPLY: u32 = 32;
     /// Bit 6: each pixel painted at most once per stroke.
@@ -100,14 +105,28 @@ impl From<InkStyle> for StrokeStyle {
             Overlap::Discard => Self::DISCARD,
             Overlap::Accumulate => 0,
         };
+        let (grain, grain_flags, grain_layer) = match style.grain {
+            Some(g) => {
+                let mapping = match g.mapping {
+                    GrainMapping::Canvas => 0,
+                    GrainMapping::Stroke => Self::GRAIN_STROKE,
+                };
+                (
+                    Vec4::new(g.scale, g.strength, 0.0, 0.0),
+                    Self::GRAIN_NOISE | mapping,
+                    g.seed,
+                )
+            }
+            None => (Vec4::ZERO, 0, 0),
+        };
         Self {
             color: Vec4::new(red, green, blue, alpha * style.opacity),
             mask: Vec4::new(1.0, 0.0, style.hardness, 0.0),
-            grain: Vec4::ZERO,
+            grain,
             depth: 0.0,
-            flags: edge | multiply | discard,
+            flags: edge | multiply | discard | grain_flags,
             mask_layer: 0,
-            grain_layer: 0,
+            grain_layer,
         }
     }
 }

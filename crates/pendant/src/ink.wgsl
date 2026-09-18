@@ -20,11 +20,11 @@
 struct StrokeStyle {
     color: vec4<f32>,       // linear RGBA, straight alpha (opacity folded in)
     mask: vec4<f32>,        // aspect, corner, hardness, 0
-    grain: vec4<f32>,       // scale, strength, seed, 0
+    grain: vec4<f32>,       // scale, strength, 0, 0
     depth: f32,             // unused here: z comes from the entity transform
     flags: u32,             // see MASK_* / FLAG_* below
     mask_layer: u32,
-    grain_layer: u32,
+    grain_layer: u32,       // image layer for grain kind 2, hash seed for kind 1
 };
 
 struct InkParams {
@@ -91,11 +91,10 @@ fn hash_corner(c: vec2<f32>, s: u32) -> f32 {
     return f32(q.x & 0xffffu) / 65535.0;
 }
 
-fn value_noise(p: vec2<f32>, seed: f32) -> f32 {
+fn value_noise(p: vec2<f32>, s: u32) -> f32 {
     let i = floor(p);
     var f = p - i;
     f = f * f * (3.0 - 2.0 * f);
-    let s = u32(seed);
     let a = hash_corner(i, s);
     let b = hash_corner(i + vec2<f32>(1.0, 0.0), s);
     let c = hash_corner(i + vec2<f32>(0.0, 1.0), s);
@@ -130,7 +129,7 @@ fn fragment(in: InkOutput) -> @location(0) vec4<f32> {
     if ((s.flags & GRAIN_KIND) == 4u) {
         let anchor = select(in.canvas, in.uv, (s.flags & FLAG_GRAIN_STROKE) != 0u);
         let p = anchor / max(s.grain.x, 1e-3);
-        let n = value_noise(p, s.grain.z);
+        let n = value_noise(p, s.grain_layer);
         g = mix(1.0, n, s.grain.y * saturate(s.grain.x * params.zoom / 1.5));
     }
     let a = s.color.a * in.opacity * m * g;

@@ -1,6 +1,6 @@
 # Brush engine: stamp/texture brushes for Pendant
 
-Status: P0 and P1 implemented (notes at the end); P2–P4 planned.
+Status: P0, P1 and P2 implemented (notes at the end); P3–P4 planned.
 
 ## Context
 
@@ -421,7 +421,60 @@ works as designed. `PreparedMaterial2d` does not re-prepare after a
 `ShaderBuffer` reallocation, so the palette pads to a power of two and
 re-touches its four materials for two frames after growth.
 
-Not done in P1: real-device check (iPad locked during the session; the
-`est:` log line and the marker/nib feel are unverified on hardware), the
-automated K/A calibration, `cargo mutants`, and the desktop parity
-screenshot script.
+Device follow-up (`b5d1060`, `01214c5`): the fountain pen lagged because
+every estimate update re-meshed through element-wise UniFFI lifts; the
+live mesh is now built inside the modeler (`BrushModeler.live_mesh`),
+meshes cross the FFI as bytes, and estimate redraws coalesce to one per
+run-loop pass (≤ 2 ms at 1000 points). Barrel roll turned the nib the
+wrong way: `Tilt::nib_angle` is `azimuth − roll`. Estimates land within
+~25 ms of pen-up on an iPad Pro M4.
+
+Not done in P1: the automated K/A calibration, `cargo mutants`, and the
+desktop parity screenshot script.
+
+### P2 (done)
+
+Core/FFI:
+
+- `Paint.grain: Option<Grain { source: Noise, mapping: Canvas | Stroke,
+  scale, strength }>`; `SPEC_VERSION` is 2 (no custom specs were stored
+  under 1). `InkStyle.grain: Option<GrainStyle>` carries it to the
+  renderers with the hash seed resolved: 0 for canvas-mapped grain (every
+  stroke reveals the same paper), the element id's low 32 bits
+  (`ElementId::seed`, `Ink.seed`, `BrushRef.seed`, `stroke_seed()`) for
+  stroke-mapped. Pencil preset: noise, canvas, scale 1.5, strength 0.55.
+- The seed rides in the style's `grainLayer` slot (an integer; `grain.z`
+  as `f32` would lose bits), so both shaders take `value_noise(p, uint)`.
+- `Ink::hover_dab(x, y, tilt, tolerance)` / FFI `hover_dab_mesh`: the
+  one-point mesh at force 0.5, a dot for round tips, the nib rectangle for
+  oriented ones.
+- `pendant_core::corpus::parse` reads v1 (4 columns) and v2 (7/8 columns,
+  `nan` tilt, `est` flag) recordings; the shape corpus uses it.
+  `tests/corpus/brush/` holds six fountain strokes with tilt and roll
+  recorded on the iPad; `tests/brush_corpus.rs` prints points, jitter, lag,
+  overshoot, width range and vertex count per file and asserts loose
+  bounds (lag ≤ 4 sizes, overshoot 0, jitter within 1.5× raw).
+- Tilt/pressure behaviours and the hardness feather were already in the
+  P1 presets and shaders; P2 only added grain on top.
+
+iOS:
+
+- `StrokeStyle` sets grain kind 1 + stroke flag + `grainLayer` seed from
+  `InkStyle.grain`; nothing else changed in the pipeline.
+- Hover: a `UIHoverGestureRecognizer` (pencil touch type) on the scroll
+  view feeds `SketchModel.hover`, which draws `hoverDabMesh` at 35 % of
+  the ink's alpha in a dedicated `hover` geometry at depth 0.005; cleared
+  on pen-down, hover end, or with the eraser selected.
+- `-fakeEstimates 1`: finger samples claim a pending estimate that the
+  model revises 60 ms after pen-up, so the settling path runs on the
+  simulator; the status label shows `est=<revised points>` and
+  `testEstimateUpdateDoesNotDuplicateStroke` asserts one stroke, revised,
+  then a second one.
+
+Desktop: `StrokeStyle::from(InkStyle)` fills the grain slots; the WGSL
+noise path was already there.
+
+Not done in P2: pencil recordings with tilt (the corpus has fountain
+strokes only; add pencil ones from the next device session), the
+Pencil Pro hover check on hardware, `InkMesh::zoom_independent` (no
+stamped meshes exist before P3, so nothing to skip yet).
