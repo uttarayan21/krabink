@@ -10,8 +10,7 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use pendant_core::{
     ClientDocs, ClientEffect, ClientMsg, DeviceId, DocKey, NoteDoc, NoteId, NoteMeta, PointKind,
-    Rgba, SKETCH_URI_PREFIX, SketchId, Stroke, StrokeId, StrokePoint, Tool, WetInk, WetPoint,
-    WorkspaceDoc,
+    Rgba, SKETCH_URI_PREFIX, SketchId, Stroke, StrokeId, StrokePoint, Tool, WetInk, WorkspaceDoc,
 };
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
@@ -305,6 +304,7 @@ async fn stream_stroke(
         tool: Tool::Pen,
         color,
         base_width,
+        spec: None,
     }
     .encode()
     .change_context(Error)?;
@@ -313,32 +313,17 @@ async fn stream_stroke(
     // Pace batches in real time: 8 samples per ~66ms tick.
     for (i, batch) in points.chunks(BATCH_EVERY).enumerate() {
         tokio::time::sleep(SAMPLE_DT * batch.len() as u32).await;
-        let payload = WetInk::Points {
-            stroke: stroke_id,
-            seq: i as u32 + 1,
-            sent_ms: now_ms(),
-            points: batch
-                .iter()
-                .map(|p| WetPoint {
-                    x: p.x,
-                    y: p.y,
-                    force: p.force,
-                    width: None,
-                    nib: None,
-                })
-                .collect(),
-        }
-        .encode()
-        .change_context(Error)?;
+        let payload = WetInk::points(stroke_id, i as u32 + 1, now_ms(), batch)
+            .change_context(Error)?
+            .encode()
+            .change_context(Error)?;
         send_all(sink, session.ephemeral(note_key, payload)).await?;
     }
 
-    let end = WetInk::End {
-        stroke: stroke_id,
-        sent_ms: now_ms(),
-    }
-    .encode()
-    .change_context(Error)?;
+    let end = WetInk::end(stroke_id, now_ms(), &[])
+        .change_context(Error)?
+        .encode()
+        .change_context(Error)?;
     send_all(sink, session.ephemeral(note_key, end)).await?;
 
     // Pen-up: commit the authoritative stroke.
@@ -349,6 +334,7 @@ async fn stream_stroke(
         &Stroke {
             id: stroke_id,
             tool: Tool::Pen,
+            brush: None,
             color,
             base_width,
             kind: PointKind::PolylineSample,

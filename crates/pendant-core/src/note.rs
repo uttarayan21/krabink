@@ -5,9 +5,10 @@
 
 use loro::{ExportMode, LoroDoc, LoroList, LoroMap, LoroMovableList, LoroValue, ValueOrContainer};
 
+use crate::brush::{BrushId, BrushSpec, CustomBrush};
 use crate::element::{Binding, Element, ShapeElement, Style};
 use crate::shape::Shape;
-use crate::stroke::{Rgba, Stroke, decode_chunks, encode_chunks};
+use crate::stroke::{Rgba, Stroke, Tool, decode_chunks, encode_chunks};
 use crate::{ElementId, Error, NoteId, Result, SketchId, StrokeId};
 
 const META: &str = "meta";
@@ -122,6 +123,10 @@ impl NoteDoc {
         map.insert("width", f64::from(stroke.base_width))?;
         map.insert("kind", stroke.kind.as_str())?;
         map.insert("created", to_i64(stroke.created_ms))?;
+        if let Some(custom) = &stroke.brush {
+            map.insert("brush", custom.id.to_string())?;
+            map.insert("spec", LoroValue::Binary(custom.spec.encode()?.into()))?;
+        }
         let points = map.insert_container("points", LoroList::new())?;
         for chunk in encode_chunks(&stroke.points)? {
             points.push(LoroValue::Binary(chunk.into()))?;
@@ -294,9 +299,34 @@ impl NoteDoc {
             .filter_map(as_binary)
             .collect();
 
+        // A tool this build does not know still renders, as a pen, rather
+        // than hiding the stroke.
+        let tool_name = get_str(map, "tool")?;
+        let tool = tool_name.parse().unwrap_or_else(|err| {
+            tracing::warn!(%err, "unknown tool; rendering as a pen");
+            Tool::Pen
+        });
+        let brush = match (
+            map.get("brush").and_then(as_string),
+            map.get("spec").and_then(as_binary),
+        ) {
+            (Some(id), Some(bytes)) => match BrushSpec::decode(&bytes) {
+                Ok(spec) => Some(CustomBrush {
+                    id: BrushId(id),
+                    spec,
+                }),
+                Err(err) => {
+                    tracing::warn!(%err, brush = id, tool = tool_name, "unreadable brush spec; using the tool preset");
+                    None
+                }
+            },
+            _ => None,
+        };
+
         Ok(Stroke {
             id: get_str(map, "id")?.parse()?,
-            tool: get_str(map, "tool")?.parse()?,
+            tool,
+            brush,
             color: Rgba::from_packed(get_i64(map, "color")?),
             base_width: get_f32(map, "width")?,
             kind: get_str(map, "kind")?.parse()?,
@@ -364,12 +394,24 @@ impl NoteDoc {
             .ok_or(Error::UnknownSketch(sketch))
     }
 
-    /// Append a raw entry, for tests of the tolerant reader.
+    /// Append a raw entry, for tests of the tolerant reader. `chunks`
+    /// become the `points` list when non-empty.
     #[cfg(test)]
-    fn push_raw(&self, sketch: SketchId, fields: &[(&str, LoroValue)]) -> Result<()> {
+    fn push_raw(
+        &self,
+        sketch: SketchId,
+        fields: &[(&str, LoroValue)],
+        chunks: &[Vec<u8>],
+    ) -> Result<()> {
         let map = self.elements_list(sketch)?.push_container(LoroMap::new())?;
         for (k, v) in fields {
             map.insert(k, v.clone())?;
+        }
+        if !chunks.is_empty() {
+            let points = map.insert_container("points", LoroList::new())?;
+            for chunk in chunks {
+                points.push(LoroValue::Binary(chunk.clone().into()))?;
+            }
         }
         self.doc.commit();
         Ok(())
@@ -471,12 +513,14 @@ fn as_movable_list(v: ValueOrContainer) -> Option<LoroMovableList> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stroke::{PointKind, StrokePoint, Tool};
+    use crate::brush::{Blend, Paint};
+    use crate::stroke::{PointKind, StrokePoint};
 
     fn sample_stroke() -> Stroke {
         Stroke {
             id: StrokeId::new(),
             tool: Tool::Pen,
+            brush: None,
             color: Rgba::BLACK,
             base_width: 2.0,
             kind: PointKind::PolylineSample,
@@ -587,6 +631,7 @@ mod tests {
                 ("id", ElementId::new().to_string().into()),
                 ("elem", "hologram".into()),
             ],
+            &[],
         )
         .unwrap();
         note.push_raw(
@@ -596,6 +641,7 @@ mod tests {
                 ("elem", "shape".into()),
                 ("shape", "rect".into()),
             ],
+            &[],
         )
         .unwrap();
         note.add_shape(
@@ -610,6 +656,70 @@ mod tests {
         assert_eq!(elements.len(), 2);
         assert!(matches!(elements[0], Element::Stroke(_)));
         assert!(matches!(elements[1], Element::Shape(_)));
+    }
+
+    #[test]
+    fn custom_brushes_roundtrip_and_bad_specs_fall_back() {
+        let id = NoteId::new();
+        let a = NoteDoc::new(id);
+        let b = NoteDoc::new(id);
+        let sketch = a.create_sketch(0).unwrap();
+        let mut spec = BrushSpec::preset(Tool::Marker);
+        spec.paint = Paint {
+            opacity: 0.3,
+            blend: Blend::Normal,
+            grain: None,
+            ..spec.paint
+        };
+        let custom = Stroke {
+            brush: Some(CustomBrush {
+                id: BrushId("user:soft-marker".into()),
+                spec: spec.clone(),
+            }),
+            tool: Tool::Marker,
+            ..sample_stroke()
+        };
+        a.add_stroke(sketch, &custom).unwrap();
+        b.import_update(&a.export_updates_since(&[]).unwrap())
+            .unwrap();
+        let read = b.strokes(sketch).unwrap();
+        assert_eq!(read, vec![custom.clone()]);
+        assert_eq!(read[0].spec().as_ref(), &spec);
+
+        // A spec from the future, and a tool this build never heard of,
+        // both still render: as the preset, and as a pen.
+        let chunks = encode_chunks(&custom.points).unwrap();
+        let mut future = spec.encode().unwrap();
+        future[0] = 200;
+        for (tool, spec_bytes) in [("marker", Some(future)), ("laser", None)] {
+            let note = NoteDoc::new(NoteId::new());
+            let sketch = note.create_sketch(0).unwrap();
+            let mut fields: Vec<(&str, LoroValue)> = vec![
+                ("id", StrokeId::new().to_string().into()),
+                ("elem", "stroke".into()),
+                ("tool", tool.into()),
+                ("color", 255_i64.into()),
+                ("width", 2.0_f64.into()),
+                ("kind", "polyline".into()),
+                ("created", 0_i64.into()),
+            ];
+            if let Some(bytes) = spec_bytes {
+                fields.push(("brush", "user:x".into()));
+                fields.push(("spec", LoroValue::Binary(bytes.into())));
+            }
+            note.push_raw(sketch, &fields, &chunks).unwrap();
+            let read = note.strokes(sketch).unwrap();
+            assert_eq!(read.len(), 1, "{tool}");
+            assert!(read[0].brush.is_none(), "{tool}");
+            assert_eq!(
+                read[0].tool,
+                if tool == "laser" {
+                    Tool::Pen
+                } else {
+                    Tool::Marker
+                }
+            );
+        }
     }
 
     #[test]

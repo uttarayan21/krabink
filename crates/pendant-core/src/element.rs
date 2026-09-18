@@ -3,6 +3,7 @@
 //! polyline to stroke) is reachable through [`Element`] without matching on
 //! the variant, so the ink pipeline draws both alike.
 
+use crate::geom::Ink;
 use crate::ids::ElementId;
 use crate::shape::Shape;
 use crate::stroke::{Rgba, Stroke, StrokePoint, Tool};
@@ -86,12 +87,21 @@ impl Element {
     }
 
     /// The polyline to stroke: a stroke's flattened points or the shape's
-    /// [`Shape::outline`]. Feed to [`crate::stroke_mesh`] with
-    /// [`Self::tool`] and [`Self::base_width`].
+    /// [`Shape::outline`]. Feed to [`Ink::mesh`] from [`Self::ink`].
     pub fn outline(&self) -> Vec<StrokePoint> {
         match self {
             Self::Stroke(s) => s.flatten(),
             Self::Shape(s) => s.shape.outline(),
+        }
+    }
+
+    /// How this element is inked.
+    pub fn ink(&self) -> Ink<'_> {
+        match self {
+            Self::Stroke(s) => s.ink(),
+            Self::Shape(s) => {
+                Ink::preset(s.style.tool, s.style.color, s.style.width).with_seed(s.id.seed())
+            }
         }
     }
 }

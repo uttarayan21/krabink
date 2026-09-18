@@ -11,9 +11,11 @@ struct PendantApp: App {
     var body: some Scene {
         WindowGroup {
             // `-spike 1` launch argument shows the iM2 PencilKit spike
-            // screen instead of the real app.
+            // screen instead of the real app; `-brushLab 1` the brush lab.
             if UserDefaults.standard.bool(forKey: "spike") {
                 SpikeScreen()
+            } else if UserDefaults.standard.bool(forKey: "brushLab") {
+                BrushLabScreen()
             } else {
                 ContentView(model: model)
                     .onOpenURL { url in

@@ -16,6 +16,7 @@
 //! ```
 
 mod brush;
+pub mod corpus;
 mod element;
 mod export;
 mod geom;
@@ -30,10 +31,17 @@ mod sync_doc;
 mod wetink;
 mod workspace;
 
-pub use brush::{BrushModeler, BrushParams, RawSample};
+pub use brush::{
+    BUILTIN_CRAYON, BUILTIN_PENCIL_GRAINY, Behavior, Blend, BrushId, BrushKnobs, BrushModeler,
+    BrushSpec, BuiltinBrush, Curve, CustomBrush, EmaModel, Emit, Estimate, Grain, GrainMapping,
+    GrainSource, InputParams, Orient, Overlap, Paint, RawSample, Source, Stamped, StrokeEnd,
+    Target, Tip, TipEvaluator, TipState,
+};
 pub use element::{Binding, Element, ShapeElement, Style};
 pub use export::{ExportAsset, ExportBundle, SKETCH_URI_PREFIX, elements_to_svg};
-pub use geom::{DEFAULT_TOLERANCE, StrokeMesh, hits, stroke_mesh};
+pub use geom::{
+    DEFAULT_TOLERANCE, GrainStyle, Ink, InkMesh, InkStyle, InkVertex, MAX_DABS, MaskStyle,
+};
 pub use ids::{DeviceId, ElementId, NoteId, SketchId, StrokeId};
 pub use note::NoteDoc;
 pub use pair::PairInfo;
@@ -47,8 +55,8 @@ pub use sync::{
     PROTO_VERSION, ServerEffect, ServerMsg, ServerSession,
 };
 pub use sync_doc::SyncDoc;
-pub use wetink::{WetInk, WetPoint};
-pub use workspace::{DeviceMeta, NoteMeta, WorkspaceDoc};
+pub use wetink::WetInk;
+pub use workspace::{BrushMeta, DeviceMeta, NoteMeta, WorkspaceDoc};
 
 /// Errors produced by the core document model.
 #[derive(Debug, thiserror::Error)]

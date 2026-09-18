@@ -7,8 +7,11 @@
 
 use std::fmt::Write as _;
 
+use crate::brush::{Blend, StrokeEnd, TipEvaluator};
 use crate::element::Element;
+use crate::geom::Ink;
 use crate::note::NoteDoc;
+use crate::stroke::StrokePoint;
 use crate::{Result, SketchId};
 
 pub const SKETCH_URI_PREFIX: &str = "pendant://sketch/";
@@ -75,25 +78,31 @@ impl NoteDoc {
 
 /// Render elements to a standalone SVG document.
 ///
-/// Each element's outline becomes a fixed-width polyline path; a stroke's
-/// width is scaled by its mean pressure, a shape's outline carries full
-/// pressure so it gets the element's width. Pressure-varying outlines
-/// would need the tessellator's mesh.
+/// Each element's ink becomes one closed outline polygon filled with the
+/// nonzero rule, so a translucent stroke never darkens where it overlaps
+/// itself (the same look [`crate::Overlap::Discard`] gives on screen).
+/// Per-point opacity is averaged into the fill; grain and soft edges are
+/// not represented.
 pub fn elements_to_svg(elements: &[Element]) -> String {
-    let outlines: Vec<(&Element, Vec<crate::StrokePoint>)> = elements
+    let outlines: Vec<(&Element, Vec<[f32; 2]>, f32)> = elements
         .iter()
-        .map(|el| (el, el.outline()))
-        .filter(|(_, pts)| !pts.is_empty())
+        .map(|el| {
+            let points = el.outline();
+            let ink = el.ink();
+            let opacity = mean_opacity(&ink, &points);
+            (el, ink.outline(&points), opacity)
+        })
+        .filter(|(_, pts, _)| !pts.is_empty())
         .collect();
-    let points = outlines.iter().flat_map(|(_, pts)| pts);
+    let points = outlines.iter().flat_map(|(_, pts, _)| pts);
     let (min_x, min_y, max_x, max_y) = points.fold(
         (f32::MAX, f32::MAX, f32::MIN, f32::MIN),
         |(min_x, min_y, max_x, max_y), p| {
             (
-                min_x.min(p.x),
-                min_y.min(p.y),
-                max_x.max(p.x),
-                max_y.max(p.y),
+                min_x.min(p[0]),
+                min_y.min(p[1]),
+                max_x.max(p[0]),
+                max_y.max(p[1]),
             )
         },
     );
@@ -115,29 +124,40 @@ pub fn elements_to_svg(elements: &[Element]) -> String {
     );
     svg.push('\n');
 
-    for (el, pts) in &outlines {
-        // usize -> f32 has no `From`; a point count is exact in f32.
-        let count = pts.len() as f32; // ast-grep-ignore: no-as-cast
-        let mean_force = pts.iter().map(|p| p.force).sum::<f32>() / count;
-        let width = (el.base_width() * mean_force.clamp(0.3, 1.0)).max(0.1);
-        let [r, g, b, a] = el.color().0;
-
+    for (el, pts, opacity) in &outlines {
+        let style = el.ink().style();
+        let [r, g, b, a] = style.color.0;
         let mut d = String::new();
         for (i, p) in pts.iter().enumerate() {
             let cmd = if i == 0 { 'M' } else { 'L' };
-            write!(d, "{cmd}{x} {y} ", x = p.x, y = p.y).expect("string write");
+            write!(d, "{cmd}{x} {y} ", x = p[0], y = p[1]).expect("string write");
         }
+        d.push('Z');
+        let blend = match style.blend {
+            Blend::Normal => "",
+            Blend::Multiply => r#" style="mix-blend-mode: multiply""#,
+        };
         writeln!(
             svg,
-            r##"<path d="{d}" fill="none" stroke="rgb({r} {g} {b})" stroke-opacity="{op}" stroke-width="{width}" stroke-linecap="round" stroke-linejoin="round"/>"##,
-            d = d.trim_end(),
-            op = f32::from(a) / 255.0,
+            r##"<path d="{d}" fill="rgb({r} {g} {b})" fill-opacity="{op}" fill-rule="nonzero"{blend}/>"##,
+            op = f32::from(a) / 255.0 * style.opacity * opacity,
         )
         .expect("string write");
     }
 
     svg.push_str("</svg>\n");
     svg
+}
+
+/// Mean per-point opacity of the finished ink, 1 for an empty run.
+fn mean_opacity(ink: &Ink<'_>, points: &[StrokePoint]) -> f32 {
+    let states = TipEvaluator::evaluate(&ink.spec, ink.base_width, points, StrokeEnd::Complete);
+    if states.is_empty() {
+        return 1.0;
+    }
+    // usize -> f32 has no `From`; a point count is exact in f32.
+    let count = states.len() as f32; // ast-grep-ignore: no-as-cast
+    states.iter().map(|s| s.opacity).sum::<f32>() / count
 }
 
 #[cfg(test)]
@@ -156,7 +176,8 @@ mod tests {
             sketch,
             &Stroke {
                 id: StrokeId::new(),
-                tool: Tool::Pen,
+                tool: Tool::Monoline,
+                brush: None,
                 color: Rgba::BLACK,
                 base_width: 2.0,
                 kind: PointKind::PolylineSample,
@@ -192,7 +213,7 @@ mod tests {
                     angle: 0.0,
                 },
                 style: Style {
-                    tool: Tool::Pen,
+                    tool: Tool::Marker,
                     color: Rgba([255, 0, 0, 255]),
                     width: 3.0,
                 },
@@ -227,9 +248,18 @@ mod tests {
         assert_eq!(bundle.assets.len(), 1);
         let svg = &bundle.assets[0].svg;
         assert_eq!(svg.matches("<path").count(), 2);
-        // The rect's five outline points at full width, in its colour.
-        assert!(svg.contains(r#"stroke="rgb(255 0 0)""#), "{svg}");
-        assert!(svg.contains(r#"stroke-width="3""#), "{svg}");
-        assert!(svg.contains("M30 40 L70 40 L70 60 L30 60 L30 40"), "{svg}");
+        assert_eq!(svg.matches(r#"fill-rule="nonzero""#).count(), 2);
+        // The monoline stroke: opaque black, closed outline.
+        assert!(
+            svg.contains(r#"fill="rgb(0 0 0)" fill-opacity="1""#),
+            "{svg}"
+        );
+        // The rect drawn with the marker preset: red, translucent, multiply.
+        assert!(
+            svg.contains(r#"fill="rgb(255 0 0)" fill-opacity="0.45""#),
+            "{svg}"
+        );
+        assert!(svg.contains("mix-blend-mode: multiply"), "{svg}");
+        assert!(svg.contains(" Z\""), "{svg}");
     }
 }

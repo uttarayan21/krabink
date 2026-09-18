@@ -3,6 +3,7 @@
 How a desktop, an iPad, and the relays fit together. Source of truth:
 `crates/pendant/src/{relay,sync}.rs`, `crates/pendant-server/src/relay.rs`,
 `crates/pendant-ffi/src/net.rs`, `crates/pendant-core/src/{sync,pair}.rs`.
+For the whole stack and where each piece lives, see `docs/implementation.md`.
 
 ## 1. Topology: two desktops, two iPads, one dedicated relay
 
@@ -117,7 +118,7 @@ flowchart LR
         SS["ServerSession\nBroadcast / Disconnect effects"]
         WS["WorkspaceDoc\nnotes + device registry"]
         PAIR["pair.rs\nPairInfo <-> pendant://pair URI"]
-        INK["brush.rs + geom.rs + shape.rs\nBrushModeler, lyon stroke_mesh,\nshape recognizer; element.rs"]
+        INK["brush/ + geom/ + shape.rs + corpus.rs\nBrushSpec presets + builtins, BrushModeler,\nInkMesh + InkStyle (grain, stamps, hover dab);\nshape recognizer; element.rs"]
     end
     subgraph desktop["pendant (desktop bin)"]
         BEVY["Bevy app: ui, sketch, docs"]
@@ -139,14 +140,28 @@ flowchart LR
     end
 ```
 
-Ink is one pipeline on both platforms: raw pen samples go through the
-core's `BrushModeler` (smoothing, width from force and speed, tapers) into
-`StrokePoint`s that carry their rendered width, and `stroke_mesh` (lyon,
-round caps and joins) turns those into the triangles every renderer draws
-(bevy `Mesh2d` on the desktop, `MTKView` on the iPad, CoreGraphics for
-thumbnails). The live stroke, the committed stroke and every remote copy
-are the same geometry; wet ink carries the width per point so receivers
-draw what the sender drew. See `docs/plans/ink-renderer.md`.
+Ink is one pipeline on both platforms, in three stages inside the core.
+Stage 1 (`brush/input.rs`): raw pen samples are smoothed by `BrushModeler`
+into the `StrokePoint`s the stroke stores (position, force, time, tilt);
+estimated force/tilt is patched in by `update`. Stage 2
+(`brush/dynamics.rs`): a `BrushSpec` — the tool's preset — turns each
+point into a tip state (size, opacity, nib orientation) from pressure,
+speed, tilt and distance to the ends. Stage 3 (`geom/`): the tip states
+become an `InkMesh` — round lyon ribbons, oriented nib hulls, or one quad
+per dab for stamped brushes — whose vertices carry position, stroke-space
+(or tip-space) uv and opacity, plus an `InkStyle` (colour, opacity, blend,
+overlap, hardness, mask) per stroke. A stroke's brush is the tool's preset
+or a custom spec snapshotted on the stroke; the workspace doc carries a
+shared brush library, and the app bundles a stamped crayon and a grainy
+pencil. Renderers upload the mesh verbatim and apply the style in one
+über-shader (Metal on the iPad, WGSL on the desktop): linear-light
+premultiplied blending in an sRGB framebuffer, Multiply for the
+highlighter, and a depth-slot trick that makes `Overlap::Discard` ink
+write once per pixel so a marker never darkens where it crosses itself.
+Thumbnails render through the same Metal pipeline offscreen. The live
+stroke, the committed stroke and every remote copy are the same geometry;
+wet ink carries the stage-1 points so receivers run the same fold. See
+`docs/plans/ink-renderer.md` and `docs/plans/brush-engine.md`.
 
 A sketch is one z-ordered list of `Element`s: freehand `Stroke`s and
 `ShapeElement`s (line, arrow, rectangle, ellipse, with reserved

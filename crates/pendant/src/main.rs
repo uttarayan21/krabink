@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod docs;
 mod errors;
+mod ink_material;
 mod relay;
 mod replay;
 mod settings;

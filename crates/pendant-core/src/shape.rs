@@ -564,7 +564,7 @@ pub fn recognize(points: &[StrokePoint]) -> Option<Recognition> {
 
 /// [`recognize`] with explicit thresholds.
 pub fn recognize_with(points: &[StrokePoint], params: &RecognizerParams) -> Option<Recognition> {
-    let clean = dedupe(points);
+    let clean = dedupe(points, crate::geom::MIN_SEGMENT);
     let (Some(pen_down), Some(pen_now)) = (clean.first(), clean.last()) else {
         return None;
     };
@@ -1480,6 +1480,7 @@ mod tests {
                 force: 0.7,
                 t_ms: 1000.0 + i as f64 * SAMPLE_MS,
                 tilt: None,
+                estimate: None,
             })
             .collect()
     }
@@ -2247,7 +2248,7 @@ mod tests {
             if got != want {
                 fails += 1;
                 // stage info
-                let trimmed = trim_holds(&dedupe(&pts), &params);
+                let trimmed = trim_holds(&dedupe(&pts, crate::geom::MIN_SEGMENT), &params);
                 let p: Vec<P> = trimmed.iter().map(|p| [p.x, p.y]).collect();
                 let (lo, hi) = bbox(&p).unwrap();
                 let diag = dist(lo, hi);

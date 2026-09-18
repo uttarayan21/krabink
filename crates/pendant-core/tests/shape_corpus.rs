@@ -2,74 +2,17 @@
 //! recognizer. Each `tests/corpus/shapes/<name>.txt` holds one stroke as
 //! the iPad recorder writes it with `-recordStrokes 1`:
 //!
-//! ```text
-//! # expect: rect|ellipse|line|arrow|none
-//! # tool: pen size: 4
-//! x y force t_ms
-//! …
-//! ```
-//!
-//! A `# kind: modeled` header marks points that already went through the
-//! brush model (a stroke dumped by the app at hold time); they are fed to
-//! the recognizer as they are.
+//! `# expect: rect|ellipse|line|arrow|none` header, then the format
+//! `pendant_core::corpus` reads. A `# kind: modeled` header marks points
+//! that already went through the brush model (a stroke dumped by the app
+//! at hold time); they are fed to the recognizer as they are.
 //!
 //! Name recordings by what they are (`rect-hand-03`, `letter-s-01`) and
 //! copy them in by hand; every file is asserted.
 
 use std::path::Path;
 
-use pendant_core::{BrushModeler, RawSample, Shape, StrokePoint, Tool, recognize};
-
-struct Case {
-    expect: String,
-    tool: Tool,
-    size: f32,
-    modeled: bool,
-    samples: Vec<RawSample>,
-}
-
-fn parse(text: &str) -> Case {
-    let mut expect = None;
-    let mut tool = Tool::Pen;
-    let mut size = 4.0;
-    let mut modeled = false;
-    let mut samples = Vec::new();
-    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        if let Some(rest) = line.strip_prefix("# expect:") {
-            expect = Some(rest.trim().to_owned());
-        } else if let Some(rest) = line.strip_prefix("# kind:") {
-            modeled = rest.trim() == "modeled";
-        } else if let Some(rest) = line.strip_prefix("# tool:") {
-            let mut words = rest.split_whitespace();
-            tool = words
-                .next()
-                .and_then(|t| t.parse().ok())
-                .unwrap_or(Tool::Pen);
-            if words.next() == Some("size:") {
-                size = words.next().and_then(|s| s.parse().ok()).unwrap_or(4.0);
-            }
-        } else if !line.starts_with('#') {
-            let f: Vec<f32> = line
-                .split_whitespace()
-                .map(|v| v.parse().expect("number"))
-                .collect();
-            samples.push(RawSample {
-                x: f[0],
-                y: f[1],
-                force: f[2],
-                t_ms: f64::from(f[3]),
-                tilt: None,
-            });
-        }
-    }
-    Case {
-        expect: expect.expect("# expect: header"),
-        tool,
-        size,
-        modeled,
-        samples,
-    }
-}
+use pendant_core::{BrushModeler, Shape, StrokePoint, corpus, recognize};
 
 fn variant(shape: Option<Shape>) -> &'static str {
     match shape {
@@ -93,7 +36,9 @@ fn recorded_strokes_recognise_as_expected() {
     assert!(!files.is_empty(), "no corpus files in {}", dir.display());
     let mut failures = Vec::new();
     for path in &files {
-        let case = parse(&std::fs::read_to_string(path).expect("read corpus file"));
+        let case = corpus::parse(&std::fs::read_to_string(path).expect("read corpus file"))
+            .expect("parse corpus file");
+        let expect = case.expect.as_deref().expect("# expect: header");
         let points: Vec<StrokePoint> = if case.modeled {
             case.samples
                 .iter()
@@ -115,11 +60,11 @@ fn recorded_strokes_recognise_as_expected() {
             modeler.points().to_vec()
         };
         let got = variant(recognize(&points).map(|r| r.shape));
-        if got != case.expect {
+        if got != expect {
             failures.push(format!(
                 "{}: expected {}, got {}",
                 path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
-                case.expect,
+                expect,
                 got
             ));
         }

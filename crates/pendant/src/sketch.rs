@@ -3,9 +3,11 @@
 //! exposed to egui through a custom `pendant://` texture loader so the
 //! markdown preview embeds it inline.
 //!
-//! Committed CRDT strokes become ink meshes; wet ink from the ephemeral
-//! channel renders as provisional meshes on top and is dropped once the
-//! authoritative stroke lands (or after a timeout).
+//! Committed CRDT strokes become ink meshes drawn with [`InkMaterial`];
+//! wet ink from the ephemeral channel renders as provisional meshes on top
+//! and is dropped once the authoritative stroke lands (or after a timeout).
+//! Draw order is z order: committed element `k` sits at `k / 100`, remote
+//! wet stroke `j` at `990 + j / 100`, and the ink pipeline writes depth.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -16,13 +18,18 @@ use bevy::camera::{ImageRenderTarget, RenderTarget, ScalingMode};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureUsages;
+use bevy::render::storage::ShaderBuffer;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, EguiUserTextures, egui};
 use pendant_core::{
-    DEFAULT_TOLERANCE, DocKey, Element, PointSize, Rgba, SKETCH_URI_PREFIX, SketchId, StrokeId,
-    StrokePoint, Tilt, Tool, WetInk, WetPoint, stroke_mesh,
+    BrushSpec, DEFAULT_TOLERANCE, DocKey, Element, Ink, InkStyle, Rgba, SKETCH_URI_PREFIX,
+    SketchId, StrokeEnd, StrokeId, StrokePoint, Tool, WetInk,
 };
 
 use crate::docs::{Docs, now_ms};
+use crate::ink_material::{
+    ATTRIBUTE_INK_OPACITY, ATTRIBUTE_INK_UV, InkMaterial, InkMaterialPlugin, InkPalette, InkParams,
+    InkSlot,
+};
 use crate::ui::EditorState;
 
 /// Wet ink lingers this long after `End` if the committed stroke never shows.
@@ -31,7 +38,14 @@ const WET_TTL_MS: u64 = 5_000;
 /// why [`DEFAULT_TOLERANCE`] is the right cap/join flattening tolerance).
 const MIN_TARGET: u32 = 256;
 const MAX_TARGET: u32 = 2048;
-const WET_WIDTH_FALLBACK: f32 = 2.0;
+/// 1 canvas unit = 1 pixel: grain renders at full strength.
+const ZOOM: f32 = 1.0;
+/// z spacing between consecutive strokes.
+const Z_STEP: f32 = 0.01;
+/// Remote wet strokes sit above every committed element.
+const WET_Z_BASE: f32 = 990.0;
+/// Wet z slots wrap here so they stay under the camera's far plane.
+const WET_Z_SLOTS: u16 = 1000;
 
 /// An ephemeral frame relayed by the server (raised by the sync layer).
 #[derive(Message)]
@@ -44,27 +58,61 @@ pub struct WetInkFrame {
 #[derive(Resource, Clone, Default)]
 pub struct SketchTextures(Arc<Mutex<HashMap<String, (egui::TextureId, egui::Vec2)>>>);
 
+/// A spawned ink entity and the palette slot it draws with.
+#[derive(Debug, Clone, Copy)]
+struct InkEntity {
+    entity: Entity,
+    slot: InkSlot,
+}
+
 struct WetStroke {
+    sketch: SketchId,
     /// Spawned on the first batch with drawable geometry.
-    entity: Option<Entity>,
+    drawn: Option<InkEntity>,
     mesh: Option<Handle<Mesh>>,
     layer: usize,
     tool: Tool,
     color: Rgba,
     base_width: f32,
-    points: Vec<WetPoint>,
+    /// A custom brush's spec from `Begin`; `None` draws the tool's preset.
+    spec: Option<BrushSpec>,
+    points: Vec<StrokePoint>,
     last_seq: u32,
     /// Set at `End`: drop at this deadline even without a commit.
     expires_ms: Option<u64>,
 }
 
-struct SketchScene {
-    layer: usize,
+impl WetStroke {
+    fn ink(&self) -> Ink<'_> {
+        match &self.spec {
+            Some(spec) => Ink {
+                spec: std::borrow::Cow::Borrowed(spec),
+                color: self.color,
+                base_width: self.base_width,
+                seed: 0,
+            },
+            None => Ink::preset(self.tool, self.color, self.base_width),
+        }
+    }
+}
+
+/// The off-screen image a sketch renders into and the camera drawing it.
+struct SceneTarget {
     image: Handle<Image>,
     camera: Entity,
     size: UVec2,
-    /// Committed element id → mesh entity (`None` for elements with no ink).
-    strokes: HashMap<StrokeId, Option<Entity>>,
+}
+
+struct SketchScene {
+    layer: usize,
+    target: SceneTarget,
+    palette: InkPalette,
+    /// Committed element id → ink entity (`None` for elements with no ink).
+    strokes: HashMap<StrokeId, Option<InkEntity>>,
+    /// Committed elements spawned so far; the next one's z slot.
+    committed: u16,
+    /// Next remote wet stroke's z slot.
+    wet_serial: u16,
 }
 
 #[derive(Resource, Default)]
@@ -72,6 +120,29 @@ struct SketchScenes {
     scenes: HashMap<SketchId, SketchScene>,
     wet: HashMap<StrokeId, WetStroke>,
     next_layer: usize,
+}
+
+impl SketchScenes {
+    /// Drop a wet stroke's entity and free its style slot.
+    fn despawn_wet(&mut self, commands: &mut Commands, id: StrokeId) {
+        let Some(wet) = self.wet.remove(&id) else {
+            return;
+        };
+        despawn_wet(commands, &mut self.scenes, wet);
+    }
+}
+
+fn despawn_wet(
+    commands: &mut Commands,
+    scenes: &mut HashMap<SketchId, SketchScene>,
+    wet: WetStroke,
+) {
+    if let Some(drawn) = wet.drawn {
+        commands.entity(drawn.entity).despawn();
+        if let Some(scene) = scenes.get_mut(&wet.sketch) {
+            scene.palette.remove(drawn.slot);
+        }
+    }
 }
 
 /// Receive-side latency of wet-ink batches (sender clock → local clock).
@@ -84,11 +155,15 @@ pub struct SketchPlugin;
 
 impl Plugin for SketchPlugin {
     fn build(&self, app: &mut App) {
-        app.add_message::<WetInkFrame>()
+        app.add_plugins(InkMaterialPlugin)
+            .add_message::<WetInkFrame>()
             .init_resource::<SketchScenes>()
             .init_resource::<SketchTextures>()
             .init_resource::<WetLatency>()
-            .add_systems(Update, (sync_sketch_scenes, apply_wet_ink).chain())
+            .add_systems(
+                Update,
+                (sync_sketch_scenes, apply_wet_ink, flush_palettes).chain(),
+            )
             .add_systems(EguiPrimaryContextPass, install_loader);
     }
 }
@@ -160,7 +235,8 @@ fn sync_sketch_scenes(
     textures: Res<SketchTextures>,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut materials: ResMut<Assets<InkMaterial>>,
+    mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut egui_textures: ResMut<EguiUserTextures>,
 ) {
     let Some(note_id) = editor.open else { return };
@@ -190,21 +266,35 @@ fn sync_sketch_scenes(
         let scenes = &mut *scenes;
         if !scenes.scenes.contains_key(&sketch) {
             scenes.next_layer += 1; // layer 0 = main window
-            let scene = new_scene(
+            let layer = scenes.next_layer;
+            let target = new_target(
                 &mut commands,
                 &mut images,
                 &mut egui_textures,
                 &textures,
                 sketch,
-                scenes.next_layer,
+                layer,
                 desired,
             );
-            scenes.scenes.insert(sketch, scene);
+            let palette = InkPalette::new(&mut buffers, &mut materials, InkParams::new(ZOOM));
+            scenes.scenes.insert(
+                sketch,
+                SketchScene {
+                    layer,
+                    target,
+                    palette,
+                    strokes: HashMap::new(),
+                    committed: 0,
+                    wet_serial: 0,
+                },
+            );
         }
         let scene = scenes.scenes.get_mut(&sketch).expect("inserted above");
 
-        if scene.size != desired {
-            let replacement = new_scene(
+        if scene.target.size != desired {
+            commands.entity(scene.target.camera).despawn();
+            egui_textures.remove_image(scene.target.image.id());
+            scene.target = new_target(
                 &mut commands,
                 &mut images,
                 &mut egui_textures,
@@ -213,51 +303,75 @@ fn sync_sketch_scenes(
                 scene.layer,
                 desired,
             );
-            commands.entity(scene.camera).despawn();
-            egui_textures.remove_image(scene.image.id());
-            let strokes_kept = std::mem::take(&mut scene.strokes);
-            *scene = SketchScene {
-                strokes: strokes_kept,
-                ..replacement
-            };
         }
 
         // Diff committed elements.
         let mut stale: HashMap<_, _> = scene.strokes.clone();
-        for (z, (element, outline)) in outlines.iter().enumerate() {
+        for (element, outline) in &outlines {
             let id = element.id();
             if stale.remove(&id).is_some() {
                 continue;
             }
-            let entity = ink_mesh(element.tool(), outline, element.base_width()).map(|mesh| {
-                commands
-                    .spawn((
-                        Mesh2d(meshes.add(mesh)),
-                        MeshMaterial2d(materials.add(color_of(element.color()))),
-                        Transform::from_xyz(0.0, 0.0, z as f32 * 0.01),
-                        RenderLayers::layer(scene.layer),
-                    ))
-                    .id()
-            });
-            scene.strokes.insert(id, entity);
+            let drawn =
+                ink_mesh(&element.ink(), outline, StrokeEnd::Complete).map(|(mesh, style)| {
+                    let slot = scene.palette.insert(style);
+                    let z = committed_z(scene.committed);
+                    scene.committed = scene.committed.saturating_add(1);
+                    let (tag, material) = scene.palette.components(slot);
+                    let entity = commands
+                        .spawn((
+                            Mesh2d(meshes.add(mesh)),
+                            material,
+                            tag,
+                            Transform::from_xyz(0.0, 0.0, z),
+                            RenderLayers::layer(scene.layer),
+                        ))
+                        .id();
+                    InkEntity { entity, slot }
+                });
+            scene.strokes.insert(id, drawn);
             // A committed element (stroke or snapped shape) replaces its
             // wet-ink preview.
             if let Some(wet) = scenes.wet.remove(&id)
-                && let Some(entity) = wet.entity
+                && let Some(drawn) = wet.drawn
             {
-                commands.entity(entity).despawn();
+                commands.entity(drawn.entity).despawn();
+                scene.palette.remove(drawn.slot);
             }
         }
-        for (id, entity) in stale {
-            if let Some(entity) = entity {
-                commands.entity(entity).despawn();
+        for (id, drawn) in stale {
+            if let Some(drawn) = drawn {
+                commands.entity(drawn.entity).despawn();
+                scene.palette.remove(drawn.slot);
             }
             scene.strokes.remove(&id);
         }
     }
 }
 
-fn new_scene(
+/// Upload every sketch's style edits after the frame's diffs.
+fn flush_palettes(
+    mut scenes: ResMut<SketchScenes>,
+    mut materials: ResMut<Assets<InkMaterial>>,
+    mut buffers: ResMut<Assets<ShaderBuffer>>,
+) {
+    scenes
+        .scenes
+        .values_mut()
+        .for_each(|scene| scene.palette.flush(&mut buffers, &mut materials));
+}
+
+/// z of the `k`th committed element; saturates far below the wet band.
+fn committed_z(k: u16) -> f32 {
+    f32::from(k) * Z_STEP
+}
+
+/// z of the `j`th remote wet stroke, above every committed element.
+fn wet_z(j: u16) -> f32 {
+    WET_Z_BASE + f32::from(j) * Z_STEP
+}
+
+fn new_target(
     commands: &mut Commands,
     images: &mut Assets<Image>,
     egui_textures: &mut EguiUserTextures,
@@ -265,7 +379,7 @@ fn new_scene(
     sketch: SketchId,
     layer: usize,
     size: UVec2,
-) -> SketchScene {
+) -> SceneTarget {
     let mut image = Image::new_fill(
         bevy::render::render_resource::Extent3d {
             width: size.x,
@@ -312,12 +426,10 @@ fn new_scene(
         ))
         .id();
 
-    SketchScene {
-        layer,
+    SceneTarget {
         image,
         camera,
         size,
-        strokes: HashMap::new(),
     }
 }
 
@@ -326,28 +438,32 @@ fn target_extent(content_max: f32) -> u32 {
     padded.next_multiple_of(64).clamp(MIN_TARGET, MAX_TARGET)
 }
 
-fn color_of(rgba: Rgba) -> ColorMaterial {
-    let [r, g, b, a] = rgba.0;
-    ColorMaterial::from(Color::srgba_u8(r, g, b, a))
-}
-
-/// Canvas-space stroke mesh → bevy mesh (y flipped into bevy's y-up space).
+/// Canvas-space stroke mesh → bevy mesh (y flipped into bevy's y-up space)
+/// plus the style it draws with.
 /// `None` when there is nothing to draw: bevy's mesh allocator never
 /// allocates a zero-vertex mesh but still tries to upload it, logging a
 /// "Use-after-free" error every frame the mesh is extracted.
-fn ink_mesh(tool: Tool, points: &[StrokePoint], base_width: f32) -> Option<Mesh> {
-    let ink = stroke_mesh(tool, points, base_width, DEFAULT_TOLERANCE);
+fn ink_mesh(ink: &Ink<'_>, points: &[StrokePoint], end: StrokeEnd) -> Option<(Mesh, InkStyle)> {
+    let ink = ink.mesh(points, end, DEFAULT_TOLERANCE);
     if ink.is_empty() {
         return None;
     }
-    let positions: Vec<[f32; 3]> = ink.positions.iter().map(|[x, y]| [*x, -*y, 0.0]).collect();
+    let positions: Vec<[f32; 3]> = ink
+        .vertices
+        .iter()
+        .map(|v| [v.pos[0], -v.pos[1], 0.0])
+        .collect();
+    let uvs: Vec<[f32; 2]> = ink.vertices.iter().map(|v| v.uv).collect();
+    let opacity: Vec<f32> = ink.vertices.iter().map(|v| v.opacity).collect();
     let mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
     )
     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(ATTRIBUTE_INK_UV, uvs)
+    .with_inserted_attribute(ATTRIBUTE_INK_OPACITY, opacity)
     .with_inserted_indices(Indices::U32(ink.indices));
-    Some(mesh)
+    Some((mesh, ink.style))
 }
 
 // ---- wet ink ----
@@ -358,7 +474,6 @@ fn apply_wet_ink(
     editor: Res<EditorState>,
     mut scenes: ResMut<SketchScenes>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
     mut latency: ResMut<WetLatency>,
 ) {
     let open_doc = editor.open.map(DocKey::from);
@@ -381,35 +496,44 @@ fn apply_wet_ink(
                 tool,
                 color,
                 base_width,
+                spec,
             } => {
+                let spec = spec.and_then(|bytes| match BrushSpec::decode(&bytes) {
+                    Ok(spec) => Some(spec),
+                    Err(err) => {
+                        tracing::warn!(%err, "unreadable wet-ink brush spec; using the preset");
+                        None
+                    }
+                });
                 let Some(layer) = scenes.scenes.get(&sketch).map(|s| s.layer) else {
                     continue; // sketch not on screen yet; CRDT commit will cover it
                 };
-                let old = scenes.wet.insert(
+                scenes.despawn_wet(&mut commands, stroke);
+                scenes.wet.insert(
                     stroke,
                     WetStroke {
-                        entity: None,
+                        sketch,
+                        drawn: None,
                         mesh: None,
                         layer,
                         tool,
                         color,
                         base_width,
+                        spec,
                         points: Vec::new(),
                         last_seq: 0,
                         expires_ms: None,
                     },
                 );
-                if let Some(entity) = old.and_then(|w| w.entity) {
-                    commands.entity(entity).despawn();
-                }
             }
             WetInk::Points {
                 stroke,
                 seq,
                 sent_ms,
-                points,
+                ..
             } => {
                 latency.samples_ms.push(now_ms() as f64 - sent_ms as f64);
+                let scenes = &mut *scenes;
                 let Some(wet) = scenes.wet.get_mut(&stroke) else {
                     continue; // joined mid-stroke; wait for the commit
                 };
@@ -417,25 +541,15 @@ fn apply_wet_ink(
                     continue;
                 }
                 wet.last_seq = seq;
-                wet.points.extend(points);
-                let flat: Vec<StrokePoint> = wet
-                    .points
-                    .iter()
-                    .map(|p| StrokePoint {
-                        x: p.x,
-                        y: p.y,
-                        force: p.force,
-                        t_ms: 0,
-                        tilt: p.nib.map(|angle| Tilt {
-                            azimuth: angle,
-                            altitude: 0.0,
-                            roll: 0.0,
-                        }),
-                        size: p.width.map(|w| PointSize { w, h: w }),
-                    })
-                    .collect();
-                let Some(mesh) = ink_mesh(wet.tool, &flat, wet.base_width.max(WET_WIDTH_FALLBACK))
-                else {
+                match msg.decode_points() {
+                    Ok(points) => wet.points.extend(points),
+                    Err(err) => {
+                        tracing::warn!(%err, "undecodable wet-ink points");
+                        continue;
+                    }
+                }
+                let ink = wet.ink();
+                let Some((mesh, style)) = ink_mesh(&ink, &wet.points, StrokeEnd::Live) else {
                     continue; // nothing drawable yet
                 };
                 match &wet.mesh {
@@ -445,33 +559,51 @@ fn apply_wet_ink(
                         }
                     }
                     None => {
+                        let Some(scene) = scenes.scenes.get_mut(&wet.sketch) else {
+                            continue; // sketch went away; the commit will cover it
+                        };
+                        let slot = scene.palette.insert(style);
+                        let z = wet_z(scene.wet_serial);
+                        scene.wet_serial = (scene.wet_serial + 1) % WET_Z_SLOTS;
+                        let (tag, material) = scene.palette.components(slot);
                         let handle = meshes.add(mesh);
                         let entity = commands
                             .spawn((
                                 Mesh2d(handle.clone()),
-                                MeshMaterial2d(materials.add(color_of(wet.color))),
-                                Transform::from_xyz(0.0, 0.0, 500.0),
+                                material,
+                                tag,
+                                Transform::from_xyz(0.0, 0.0, z),
                                 RenderLayers::layer(wet.layer),
                             ))
                             .id();
                         wet.mesh = Some(handle);
-                        wet.entity = Some(entity);
+                        wet.drawn = Some(InkEntity { entity, slot });
                     }
                 }
             }
-            WetInk::End { stroke, sent_ms } => {
+            WetInk::End {
+                stroke, sent_ms, ..
+            } => {
                 latency.samples_ms.push(now_ms() as f64 - sent_ms as f64);
                 if let Some(wet) = scenes.wet.get_mut(&stroke) {
                     wet.expires_ms = Some(now_ms() + WET_TTL_MS);
+                    // The landing tail completes the stroke; redraw it
+                    // finished so the commit lands without a change.
+                    if let Ok(tail) = msg.decode_points() {
+                        wet.points.extend(tail);
+                    }
+                    let ink = wet.ink();
+                    if let (Some(handle), Some((mesh, _))) =
+                        (&wet.mesh, ink_mesh(&ink, &wet.points, StrokeEnd::Complete))
+                        && let Err(err) = meshes.insert(handle, mesh)
+                    {
+                        tracing::error!(%err, "wet-ink mesh update failed");
+                    }
                 }
                 report_latency(&mut latency);
             }
             // No stroke is coming (ruler drag, tool fiddling): drop it now.
-            WetInk::Cancel { stroke } => {
-                if let Some(entity) = scenes.wet.remove(&stroke).and_then(|w| w.entity) {
-                    commands.entity(entity).despawn();
-                }
-            }
+            WetInk::Cancel { stroke } => scenes.despawn_wet(&mut commands, stroke),
         }
     }
 
@@ -484,9 +616,7 @@ fn apply_wet_ink(
         .map(|(id, _)| *id)
         .collect();
     for id in expired {
-        if let Some(entity) = scenes.wet.remove(&id).and_then(|w| w.entity) {
-            commands.entity(entity).despawn();
-        }
+        scenes.despawn_wet(&mut commands, id);
     }
 }
 

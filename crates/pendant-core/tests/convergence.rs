@@ -54,6 +54,7 @@ fn apply(doc: &NoteDoc, sketch: pendant_core::SketchId, op: &Op) {
                 &Stroke {
                     id: StrokeId::new(),
                     tool: Tool::Pen,
+                    brush: None,
                     color: Rgba::BLACK,
                     base_width: 2.0,
                     kind: PointKind::PolylineSample,

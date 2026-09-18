@@ -24,7 +24,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
 use crate::engine::{CoreListener, NoteListener, Shared, SyncTarget};
-use crate::types::{NoteInfo, SyncState, rgba_to_u32};
+use crate::types::{BrushInfo, NoteInfo, SyncState, rgba_to_u32};
 
 pub(crate) enum Cmd {
     Connect(SyncTarget),
@@ -425,33 +425,34 @@ fn dispatch_wet(shared: &Shared, doc: DocKey, payload: &[u8]) {
             tool,
             color,
             base_width,
+            spec,
         } => listener.wet_begin(
             sketch.to_string(),
             stroke.to_string(),
             tool.into(),
             rgba_to_u32(color),
             base_width,
+            spec,
         ),
         WetInk::Points {
-            stroke,
-            points,
-            sent_ms,
-            ..
-        } => listener.wet_points(
-            stroke.to_string(),
-            sent_ms,
-            points
-                .iter()
-                .map(|p| crate::types::WetPoint {
-                    x: p.x,
-                    y: p.y,
-                    force: p.force,
-                    width: p.width,
-                    nib: p.nib,
-                })
-                .collect(),
-        ),
-        WetInk::End { stroke, .. } => listener.wet_end(stroke.to_string()),
+            stroke, sent_ms, ..
+        }
+        | WetInk::End {
+            stroke, sent_ms, ..
+        } => {
+            match ink.decode_points() {
+                Ok(points) if !points.is_empty() => listener.wet_points(
+                    stroke.to_string(),
+                    sent_ms,
+                    points.into_iter().map(Into::into).collect(),
+                ),
+                Ok(_) => {}
+                Err(err) => tracing::warn!("dropping undecodable wet-ink points: {err}"),
+            }
+            if matches!(ink, WetInk::End { .. }) {
+                listener.wet_end(stroke.to_string());
+            }
+        }
         WetInk::Cancel { stroke } => listener.wet_cancel(stroke.to_string()),
     }
 }
@@ -460,6 +461,7 @@ fn dispatch_wet(shared: &Shared, doc: DocKey, payload: &[u8]) {
 /// is released.
 enum Notify {
     Notes(Arc<dyn CoreListener>, Vec<NoteInfo>),
+    Brushes(Arc<dyn CoreListener>, Vec<BrushInfo>),
     Text(Arc<dyn NoteListener>, String),
     Strokes(Arc<dyn NoteListener>, String),
 }
@@ -468,6 +470,7 @@ impl Notify {
     fn dispatch(self) {
         match self {
             Self::Notes(listener, notes) => listener.notes_changed(notes),
+            Self::Brushes(listener, brushes) => listener.brushes_changed(brushes),
             Self::Text(listener, text) => listener.text_changed(text),
             Self::Strokes(listener, sketch) => listener.strokes_changed(sketch),
         }
@@ -497,7 +500,14 @@ impl ClientDocs for Docs<'_> {
                     .into_iter()
                     .map(Into::into)
                     .collect();
-                self.pending.push(Notify::Notes(listener, notes));
+                self.pending.push(Notify::Notes(listener.clone(), notes));
+                let brushes = state
+                    .workspace
+                    .brushes()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect();
+                self.pending.push(Notify::Brushes(listener, brushes));
             }
             return Ok(());
         }

@@ -14,7 +14,8 @@ use tokio::sync::mpsc;
 
 use crate::net::{self, Cmd};
 use crate::types::{
-    DeviceInfo, Element, NoteInfo, ShapeElement, Stroke, SyncState, Tool, WetPoint, rgba_from_u32,
+    BrushInfo, DeviceInfo, Element, NoteInfo, ShapeElement, Stroke, StrokePoint, SyncState, Tool,
+    rgba_from_u32,
 };
 
 /// Errors crossing the FFI boundary. Flattened to message-carrying variants;
@@ -45,6 +46,9 @@ pub type Result<T, E = PendantError> = core::result::Result<T, E>;
 #[uniffi::export(foreign)]
 pub trait CoreListener: Send + Sync {
     fn notes_changed(&self, notes: Vec<NoteInfo>);
+    /// The shared brush library changed (a peer added, edited or removed
+    /// a brush); the full list, newest edit first.
+    fn brushes_changed(&self, brushes: Vec<BrushInfo>);
     fn sync_state(&self, state: SyncState);
 }
 
@@ -60,10 +64,23 @@ pub trait NoteListener: Send + Sync {
     fn synced(&self);
     fn text_changed(&self, text: String);
     fn strokes_changed(&self, sketch: String);
-    fn wet_begin(&self, sketch: String, stroke: String, tool: Tool, color: u32, base_width: f32);
+    /// `spec` is a custom brush's encoded spec (pass it as
+    /// `BrushRef.custom` with any id to mesh the wet points); `None` for
+    /// the tool's preset.
+    fn wet_begin(
+        &self,
+        sketch: String,
+        stroke: String,
+        tool: Tool,
+        color: u32,
+        base_width: f32,
+        spec: Option<Vec<u8>>,
+    );
+    /// Stored points the sender emitted since its last batch; fold them
+    /// through `points_mesh` with `StrokeEnd.live`.
     /// `sent_ms` is the sender's unix-millis clock when the batch left the
     /// pen — latency telemetry only, meaningless across skewed clocks.
-    fn wet_points(&self, stroke: String, sent_ms: u64, points: Vec<WetPoint>);
+    fn wet_points(&self, stroke: String, sent_ms: u64, points: Vec<StrokePoint>);
     fn wet_end(&self, stroke: String);
     /// No stroke will follow: drop the provisional ink immediately.
     fn wet_cancel(&self, stroke: String);
@@ -384,6 +401,56 @@ impl Core {
             .map(Into::into)
             .collect()
     }
+
+    /// The workspace's brush library, newest edit first. Bundled brushes
+    /// (`builtin_brushes`) are not in it.
+    pub fn list_brushes(&self) -> Vec<BrushInfo> {
+        let state = self.shared.lock_state();
+        state
+            .workspace
+            .brushes()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    /// Add or edit a library brush; `spec` must decode in this build.
+    /// Existing strokes keep the spec they snapshotted.
+    pub fn upsert_brush(&self, id: String, name: String, spec: Vec<u8>) -> Result<()> {
+        pcore::BrushSpec::decode(&spec)?;
+        let meta = pcore::BrushMeta {
+            id: pcore::BrushId(id),
+            name,
+            spec,
+            updated_ms: now_ms(),
+        };
+        let payload = {
+            let mut state = self.shared.lock_state();
+            commit_workspace(&mut state, |ws| ws.upsert_brush(&meta))?
+        };
+        if let Some(payload) = payload {
+            let _ = self.shared.cmd.send(Cmd::Update {
+                doc: DocKey::WORKSPACE,
+                payload,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn remove_brush(&self, id: String) -> Result<()> {
+        let id = pcore::BrushId(id);
+        let payload = {
+            let mut state = self.shared.lock_state();
+            commit_workspace(&mut state, |ws| ws.remove_brush(&id))?
+        };
+        if let Some(payload) = payload {
+            let _ = self.shared.cmd.send(Cmd::Update {
+                doc: DocKey::WORKSPACE,
+                payload,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Apply a workspace mutation, persist the delta and return it for the wire.
@@ -547,6 +614,7 @@ impl NoteSession {
         tool: Tool,
         color: u32,
         base_width: f32,
+        spec: Option<Vec<u8>>,
     ) -> Result<String> {
         let sketch = self.parse_sketch(&sketch)?;
         let stroke = pcore::StrokeId::new();
@@ -556,27 +624,32 @@ impl NoteSession {
             tool: tool.into(),
             color: rgba_from_u32(color),
             base_width,
+            spec,
         })?;
         Ok(stroke.to_string())
     }
 
-    /// Live pen samples. `seq` is monotonic per stroke, starting at 1.
-    pub fn append_points(&self, stroke: String, seq: u32, points: Vec<WetPoint>) -> Result<()> {
+    /// The stored points emitted since the last batch (`BrushModeler.push`
+    /// results). `seq` is monotonic per stroke, starting at 1.
+    pub fn append_points(&self, stroke: String, seq: u32, points: Vec<StrokePoint>) -> Result<()> {
         let stroke: pcore::StrokeId = stroke
             .parse()
             .map_err(|_| PendantError::MalformedId { id: stroke })?;
-        self.send_wet(pcore::WetInk::Points {
-            stroke,
-            seq,
-            sent_ms: now_ms(),
-            points: points.into_iter().map(Into::into).collect(),
-        })
+        let points: Vec<pcore::StrokePoint> = points.into_iter().map(Into::into).collect();
+        self.send_wet(pcore::WetInk::points(stroke, seq, now_ms(), &points)?)
     }
 
     /// Pen-up: commit the authoritative stroke to the CRDT and end the wet
     /// stream. `stroke.id` must be the id returned by `begin_stroke` (or a
-    /// fresh ULID when there was no wet phase).
-    pub fn finish_stroke(&self, sketch: String, stroke: Stroke) -> Result<()> {
+    /// fresh ULID when there was no wet phase). `tail` is whatever
+    /// `BrushModeler.finish` added beyond the last `append_points` batch,
+    /// so receivers complete the wet stroke before the commit lands.
+    pub fn finish_stroke(
+        &self,
+        sketch: String,
+        stroke: Stroke,
+        tail: Vec<StrokePoint>,
+    ) -> Result<()> {
         let sketch = self.parse_sketch(&sketch)?;
         let stroke_id: pcore::StrokeId =
             stroke.id.parse().map_err(|_| PendantError::MalformedId {
@@ -584,10 +657,8 @@ impl NoteSession {
             })?;
         let committed = pcore::Stroke::from(stroke);
         self.commit(Flush::Immediate, |doc| doc.add_stroke(sketch, &committed))?;
-        self.send_wet(pcore::WetInk::End {
-            stroke: stroke_id,
-            sent_ms: now_ms(),
-        })
+        let tail: Vec<pcore::StrokePoint> = tail.into_iter().map(Into::into).collect();
+        self.send_wet(pcore::WetInk::end(stroke_id, now_ms(), &tail)?)
     }
 
     /// Pen-up on a stroke that snapped to a shape: commit the shape under
@@ -601,10 +672,7 @@ impl NoteSession {
         })?;
         let committed = pcore::ShapeElement::from(shape);
         self.commit(Flush::Immediate, |doc| doc.add_shape(sketch, &committed))?;
-        self.send_wet(pcore::WetInk::End {
-            stroke: id,
-            sent_ms: now_ms(),
-        })
+        self.send_wet(pcore::WetInk::end(id, now_ms(), &[])?)
     }
 
     /// Eraser sample: remove every element whose ink a circle of `radius`
@@ -616,7 +684,7 @@ impl NoteSession {
             Ok(doc
                 .elements(sketch_id)?
                 .iter()
-                .filter(|el| pcore::hits(&el.outline(), el.base_width(), x, y, radius))
+                .filter(|el| el.ink().hits(&el.outline(), x, y, radius))
                 .map(pcore::Element::id)
                 .collect())
         })?;

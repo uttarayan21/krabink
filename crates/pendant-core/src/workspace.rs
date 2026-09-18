@@ -4,6 +4,7 @@
 use loro::{ExportMode, LoroDoc, LoroMap, LoroValue, ValueOrContainer};
 use serde::{Deserialize, Serialize};
 
+use crate::brush::BrushId;
 use crate::{NoteId, Result};
 
 /// Entry in the note registry.
@@ -27,6 +28,21 @@ pub struct DeviceMeta {
     pub last_seen_ms: u64,
 }
 
+/// Entry in the brush library: a custom brush every device in the
+/// workspace can pick. Strokes snapshot the spec inline, so editing or
+/// deleting a library brush never restyles existing ink.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrushMeta {
+    pub id: BrushId,
+    pub name: String,
+    /// Encoded [`crate::BrushSpec`] ([`crate::BrushSpec::encode`]); kept
+    /// as bytes so a workspace with brushes from a newer build still
+    /// lists them.
+    pub spec: Vec<u8>,
+    /// Unix millis of the last edit.
+    pub updated_ms: u64,
+}
+
 /// CRDT doc listing every note in the library.
 pub struct WorkspaceDoc {
     doc: LoroDoc,
@@ -34,6 +50,7 @@ pub struct WorkspaceDoc {
 
 const NOTES: &str = "notes";
 const DEVICES: &str = "devices";
+const BRUSHES: &str = "brushes";
 
 impl WorkspaceDoc {
     pub fn new() -> Self {
@@ -154,6 +171,54 @@ impl WorkspaceDoc {
         out
     }
 
+    pub fn upsert_brush(&self, meta: &BrushMeta) -> Result<()> {
+        let brushes = self.doc.get_map(BRUSHES);
+        let entry = brushes.insert_container(&meta.id.0, LoroMap::new())?;
+        entry.insert("name", meta.name.as_str())?;
+        entry.insert("spec", LoroValue::Binary(meta.spec.clone().into()))?;
+        entry.insert("updated", meta.updated_ms as i64)?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    pub fn remove_brush(&self, id: &BrushId) -> Result<()> {
+        self.doc.get_map(BRUSHES).delete(&id.0)?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// Every library brush, newest edit first.
+    pub fn brushes(&self) -> Vec<BrushMeta> {
+        let brushes = self.doc.get_map(BRUSHES);
+        let mut out: Vec<BrushMeta> = brushes
+            .keys()
+            .filter_map(|key| {
+                let entry = match brushes.get(&key)? {
+                    ValueOrContainer::Container(c) => c.into_map().ok()?,
+                    ValueOrContainer::Value(_) => return None,
+                };
+                let get = |k: &str| entry.get(k);
+                Some(BrushMeta {
+                    id: BrushId(key.to_string()),
+                    name: match get("name")? {
+                        ValueOrContainer::Value(LoroValue::String(s)) => s.to_string(),
+                        _ => return None,
+                    },
+                    spec: match get("spec")? {
+                        ValueOrContainer::Value(LoroValue::Binary(b)) => b.to_vec(),
+                        _ => return None,
+                    },
+                    updated_ms: match get("updated")? {
+                        ValueOrContainer::Value(LoroValue::I64(v)) => v as u64,
+                        _ => 0,
+                    },
+                })
+            })
+            .collect();
+        out.sort_by_key(|b| std::cmp::Reverse(b.updated_ms));
+        out
+    }
+
     // Same sync surface as NoteDoc.
 
     pub fn version(&self) -> Vec<u8> {
@@ -205,6 +270,57 @@ mod tests {
         a.import_update(&b.export_updates_since(&a.version()).unwrap())
             .unwrap();
         assert!(a.notes().is_empty());
+    }
+
+    #[test]
+    fn brush_library_roundtrip() {
+        let a = WorkspaceDoc::new();
+        let spec = crate::BrushSpec::preset(crate::Tool::Pencil)
+            .encode()
+            .unwrap();
+        let soft = BrushMeta {
+            id: BrushId("user:soft".into()),
+            name: "Soft".into(),
+            spec: spec.clone(),
+            updated_ms: 5,
+        };
+        a.upsert_brush(&soft).unwrap();
+
+        let b = WorkspaceDoc::new();
+        b.import_update(&a.export_updates_since(&[]).unwrap())
+            .unwrap();
+        assert_eq!(b.brushes(), vec![soft.clone()]);
+        assert_eq!(
+            crate::BrushSpec::decode(&b.brushes()[0].spec)
+                .unwrap()
+                .tip
+                .hardness,
+            0.7
+        );
+
+        // Re-upsert edits in place; newest first; delete syncs.
+        b.upsert_brush(&BrushMeta {
+            name: "Softer".into(),
+            updated_ms: 9,
+            ..soft.clone()
+        })
+        .unwrap();
+        b.upsert_brush(&BrushMeta {
+            id: BrushId("user:old".into()),
+            name: "Old".into(),
+            spec,
+            updated_ms: 1,
+        })
+        .unwrap();
+        a.import_update(&b.export_updates_since(&a.version()).unwrap())
+            .unwrap();
+        let names: Vec<String> = a.brushes().into_iter().map(|b| b.name).collect();
+        assert_eq!(names, ["Softer", "Old"]);
+        a.remove_brush(&soft.id).unwrap();
+        a.remove_brush(&BrushId("user:none".into())).unwrap();
+        b.import_update(&a.export_updates_since(&b.version()).unwrap())
+            .unwrap();
+        assert_eq!(b.brushes().len(), 1);
     }
 
     #[test]
