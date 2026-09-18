@@ -83,11 +83,15 @@ fn editor_ui(
     relay: Res<crate::relay::EmbeddedRelay>,
     mut adopted: MessageWriter<crate::settings::PairAdopted>,
     follow: Res<FollowLatest>,
+    paired: Option<Res<crate::discovery::PairedDesktop>>,
+    finder: Res<crate::discovery::RelayFinder>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     let view = crate::settings::SettingsView {
         links: transport.links(),
         mdns_name: relay.mdns_name.clone(),
+        paired_relay: paired.map(|p| p.relay_id.clone()),
+        discovered: finder.last_found.clone(),
         this_device: transport.device(),
         devices: docs.workspace.devices(),
         now_ms: crate::docs::now_ms(),

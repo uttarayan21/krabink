@@ -6,6 +6,7 @@ use bevy::prelude::*;
 use bevy_egui::egui;
 use pendant_core::{DeviceId, DeviceMeta, PairInfo};
 
+use crate::discovery::PairedDesktop;
 use crate::sync::{LOCAL_PLATFORM, LinkKind, LinkStatus, SyncStatus, local_device_name};
 use crate::theme;
 
@@ -27,11 +28,13 @@ impl Plugin for SettingsPlugin {
 }
 
 /// Persist the adopted coordinates, swap the remote links to the new
-/// workspace's relays, teach the embedded relay the new token, and repoint
-/// the shared QR. Registration with the new workspace rides the resulting
-/// `Connected` effect.
+/// workspace's relays, teach the embedded relay the new token, repoint
+/// the shared QR, and (when the URI came from a desktop) start looking
+/// for that desktop over mDNS. Registration with the new workspace rides
+/// the resulting `Connected` effect.
 fn apply_adopted(
     mut adopted: MessageReader<PairAdopted>,
+    mut commands: Commands,
     runtime: Res<crate::Runtime>,
     relay: Res<crate::relay::EmbeddedRelay>,
     mut transport: ResMut<crate::sync::SyncTransport>,
@@ -40,6 +43,10 @@ fn apply_adopted(
     let Some(PairAdopted(info)) = adopted.read().last() else {
         return;
     };
+    match PairedDesktop::from_pair(info) {
+        Some(paired) => commands.insert_resource(paired),
+        None => commands.remove_resource::<PairedDesktop>(),
+    }
     match crate::config::persist_pair(info) {
         // Connect live either way; persistence only affects the next launch.
         Ok(path) => tracing::info!(server = %info.server, path = %path.display(), "pair adopted"),
@@ -77,6 +84,10 @@ pub enum SettingsAction {
 pub struct SettingsView {
     pub links: Vec<LinkStatus>,
     pub mdns_name: Option<String>,
+    /// Device id of the desktop we joined, when there is one.
+    pub paired_relay: Option<String>,
+    /// Where mDNS last saw that desktop; `None` until found.
+    pub discovered: Option<String>,
     pub this_device: DeviceId,
     pub devices: Vec<DeviceMeta>,
     pub now_ms: u64,
@@ -104,6 +115,15 @@ impl Settings {
             join_uri: String::new(),
             join_error: false,
             pending_remove: None,
+        }
+    }
+
+    /// The joined desktop moved (`from` → `to`): when our QR's fallback
+    /// pointed at it, follow it so devices we pair inherit the live path.
+    pub fn direct_repointed(&mut self, from: &str, to: &str) {
+        if self.info.fallback.as_deref() == Some(from) {
+            self.info.fallback = Some(to.to_string());
+            self.texture = None;
         }
     }
 
@@ -206,6 +226,14 @@ impl Settings {
                 Some(name) => format!("mDNS: {name}"),
                 None => "mDNS: off (advertising failed)".to_string(),
             });
+            if let Some(relay) = &view.paired_relay {
+                ui.weak(match &view.discovered {
+                    Some(url) => format!("paired desktop {relay}: seen over mDNS at {url}"),
+                    None => format!(
+                        "paired desktop {relay}: not seen over mDNS yet (using stored address)"
+                    ),
+                });
+            }
             if view.links.len() == 1 {
                 ui.add_space(4.0);
                 ui.label(

@@ -14,6 +14,9 @@ struct FileConfig {
     server: Option<String>,
     token: Option<String>,
     fallback: Option<String>,
+    /// Device id of the desktop behind `server` (from its pairing URI);
+    /// lets discovery re-find it when its address or port changes.
+    relay_id: Option<String>,
 }
 
 /// Everything the app needs to start.
@@ -31,6 +34,8 @@ pub struct RuntimeConfig {
     pub fallback: Option<String>,
     /// Token for the remote relays; empty when none configured.
     pub token: String,
+    /// Paired desktop's device id when `server` is its embedded relay.
+    pub relay_id: Option<String>,
 }
 
 impl RuntimeConfig {
@@ -56,6 +61,7 @@ impl RuntimeConfig {
             server: server.or(file.server),
             fallback: file.fallback,
             token: token.or(file.token).unwrap_or_default(),
+            relay_id: file.relay_id,
         })
     }
 
@@ -96,7 +102,7 @@ pub fn adopt_pair(uri: &str) -> Result<()> {
 }
 
 /// Write the pairing coordinates to config.toml; returns the path written.
-/// Shared by the CLI and the in-app join flow.
+/// Shared by the CLI, the in-app join flow, and discovery re-pointing.
 pub fn persist_pair(info: &PairInfo) -> Result<std::path::PathBuf> {
     let dirs = directories::ProjectDirs::from("dev", "darksailor", "pendant")
         .ok_or_else(|| Report::new(Error).attach("no home directory"))?;
@@ -109,6 +115,7 @@ pub fn persist_pair(info: &PairInfo) -> Result<std::path::PathBuf> {
         server: Some(info.server.clone()),
         token: Some(info.token.clone()),
         fallback: info.fallback.clone(),
+        relay_id: info.relay_id.clone(),
     })
     .change_context(Error)?;
     std::fs::write(&path, raw)

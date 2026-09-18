@@ -15,11 +15,11 @@ flowchart TB
             direction LR
             DA_docs["Docs\nLoro CRDT + redb"]
             DA_sync["SyncTransport\nlinks[0] = local relay\nlinks[1] = dedicated relay\nbridges updates across links"]
-            DA_relay["EmbeddedRelay\npendant-server router\nws://0.0.0.0:8722/ws\nrelay.redb + relay_token"]
+            DA_relay["EmbeddedRelay\npendant-server router\nws://0.0.0.0:<ephemeral>/ws\nrelay.redb + relay_token"]
             DA_docs <--> DA_sync
-            DA_sync -- "ws://127.0.0.1:8722/ws" --> DA_relay
+            DA_sync -- "ws://127.0.0.1:<ephemeral>/ws" --> DA_relay
         end
-        IPAD_A["iPad A (Swift + pendant-ffi)\nserver = ws://192.168.0.x:8722/ws\nfallback = wss://relay.example/ws"]
+        IPAD_A["iPad A (Swift + pendant-ffi)\nserver = ws://192.168.0.x:<port>/ws\nfallback = wss://relay.example/ws"]
         IPAD_A -- "direct (attempt 0,2,4…)" --> DA_relay
     end
 
@@ -29,7 +29,7 @@ flowchart TB
 
     subgraph LAN_B["Office LAN"]
         subgraph DB["Desktop B (pendant)"]
-            DB_relay["EmbeddedRelay :8722"]
+            DB_relay["EmbeddedRelay :<ephemeral>"]
             DB_sync["SyncTransport\n2 links, bridges"]
             DB_sync --> DB_relay
         end
@@ -45,10 +45,18 @@ flowchart TB
 
 Rules the diagram encodes:
 
-- **Every desktop is a relay.** `EmbeddedRelay::start` binds `0.0.0.0:8722`
-  (ephemeral port if taken), serves the same axum router as the standalone
-  `pendant-server`, and keeps its own `relay.redb` plus a per-install
-  `relay_token`. The desktop connects to itself over loopback as link 0.
+- **Every desktop is a relay.** `EmbeddedRelay::start` binds `0.0.0.0` on
+  an ephemeral port (a fresh one each launch; `--relay-listen` pins one),
+  serves the same axum router as the standalone `pendant-server`, and keeps
+  its own `relay.redb` plus a per-install `relay_token`. The desktop
+  connects to itself over loopback as link 0. Port 8722 belongs to the
+  dedicated `pendant-server` only: sharing it would let macOS route the
+  desktop's loopback self-link to the dedicated server (wildcard and
+  loopback binds coexist under `SO_REUSEADDR`, most specific wins) and
+  fail auth. Paired devices cope with the changing port by re-finding the
+  desktop over mDNS via `relay_id`: the iPad in `RelayDiscovery.swift`, a
+  joined desktop in `discovery.rs` (browses `_pendant._tcp`, matches TXT
+  `id`, swaps the direct link and rewrites `config.toml` on a hit).
 - **Dedicated relay is optional and shared.** `server`/`token` in
   `config.toml` (or `--server`) become link 1. It is the only thing two LANs
   have in common, so it is what makes Desktop A and Desktop B converge.
@@ -65,7 +73,7 @@ Rules the diagram encodes:
 sequenceDiagram
     participant D as Desktop (settings window)
     participant P as iPad (ScanScreen)
-    D->>D: build PairInfo { server: ws://<lan-ip>:8722/ws, token, fallback: <dedicated> }
+    D->>D: build PairInfo { server: ws://<lan-ip>:<port>/ws, token, fallback: <dedicated>, relay: <device id> }
     D->>D: render QR of pendant://pair?server=…&token=…&fallback=…
     P->>D: scan QR (camera)
     P->>P: parse_pair_uri, persist serverURL / fallbackURL / token (UserDefaults)
@@ -182,7 +190,8 @@ render through `Shape::outline` and the same `stroke_mesh`. See
 | iPad leaves LAN, no dedicated relay | Backoff loop against direct only, 500 ms to 30 s. Edits queue locally in the CRDT. |
 | Desktop offline | Its embedded relay is gone. iPads on that LAN converge only via the dedicated relay; on desktop restart, link 0 and link 1 both catch up and the desktop re-bridges. |
 | Dedicated relay down | Each LAN keeps working through its desktop's relay. Cross-LAN convergence resumes when link 1 reconnects. |
-| Port 8722 busy | Embedded relay binds an ephemeral port; QR advertises the real one. |
+| Desktop restarted (new relay port) | Stored direct URLs are stale; iPads and joined desktops browse `_pendant._tcp` for the desktop's `relay_id` and switch to the new port. Off-LAN (no multicast) a joined desktop keeps the stored URL and the dedicated relay carries on. |
+| Pinned `--relay-listen` port busy | Embedded relay falls back to an ephemeral port; QR advertises the real one. |
 | Two desktops, no dedicated relay | Two islands. Nothing bridges them. |
 
 ## Not covered by bridging
