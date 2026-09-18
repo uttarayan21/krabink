@@ -450,10 +450,13 @@ Core/FFI:
   oriented ones.
 - `pendant_core::corpus::parse` reads v1 (4 columns) and v2 (7/8 columns,
   `nan` tilt, `est` flag) recordings; the shape corpus uses it.
-  `tests/corpus/brush/` holds six fountain strokes with tilt and roll
-  recorded on the iPad; `tests/brush_corpus.rs` prints points, jitter, lag,
-  overshoot, width range and vertex count per file and asserts loose
-  bounds (lag ≤ 4 sizes, overshoot 0, jitter within 1.5× raw).
+  `tests/corpus/brush/` holds fifteen iPad recordings with tilt and roll
+  (six fountain, six pencil at size 45 with altitude 0.75–1.03 rad, one
+  each pen, marker, monoline); `tests/brush_corpus.rs` prints points,
+  jitter (second difference over mean step), lag, overshoot, width range
+  and vertex count per file and asserts loose bounds (lag ≤ 4 sizes,
+  overshoot 0, jitter within 1.5× raw). Pencil widths come out 1.2–1.6×
+  the base width: the tilt behaviour is live on real data.
 - Tilt/pressure behaviours and the hardness feather were already in the
   P1 presets and shaders; P2 only added grain on top.
 
@@ -474,7 +477,6 @@ iOS:
 Desktop: `StrokeStyle::from(InkStyle)` fills the grain slots; the WGSL
 noise path was already there.
 
-Not done in P2: pencil recordings with tilt (the corpus has fountain
-strokes only; add pencil ones from the next device session), the
-Pencil Pro hover check on hardware, `InkMesh::zoom_independent` (no
-stamped meshes exist before P3, so nothing to skip yet).
+Not done in P2: the Pencil Pro hover check on hardware, and
+`InkMesh::zoom_independent` (no stamped meshes exist before P3, so
+nothing to skip yet).

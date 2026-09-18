@@ -15,8 +15,8 @@ use pendant_core::{
 struct Metrics {
     samples: usize,
     points: usize,
-    /// Mean second difference of position, canvas units: hand jitter left
-    /// after smoothing.
+    /// Mean second difference of position over mean step: hand jitter
+    /// left after smoothing, independent of how densely points fall.
     jitter: f32,
     /// Mean distance between each emitted point and the raw sample nearest
     /// in time, canvas units.
@@ -34,7 +34,7 @@ fn jitter(points: impl Iterator<Item = [f32; 2]>) -> f32 {
     if pts.len() < 3 {
         return 0.0;
     }
-    let sum: f32 = pts
+    let second: f32 = pts
         .windows(3)
         .map(|w| {
             let ax = w[0][0] - 2.0 * w[1][0] + w[2][0];
@@ -42,7 +42,12 @@ fn jitter(points: impl Iterator<Item = [f32; 2]>) -> f32 {
             ax.hypot(ay)
         })
         .sum();
-    sum / (pts.len() - 2) as f32
+    let step: f32 = pts
+        .windows(2)
+        .map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]))
+        .sum();
+    let steps = (pts.len() - 1) as f32;
+    (second / (pts.len() - 2) as f32) / (step / steps).max(1e-3)
 }
 
 fn measure(rec: &corpus::Recording) -> Metrics {
@@ -109,7 +114,7 @@ fn recorded_strokes_replay_within_bounds() {
         let raw_jitter = jitter(rec.samples.iter().map(|s| [s.x, s.y]));
         let m = measure(&rec);
         println!(
-            "{name:<24} {:>7} {:>6} {:>7.3} {:>6.2} {:>7.3} {:>6.2}..{:<5.2} {:>8}",
+            "{name:<24} {:>7} {:>6} {:>7.3} {:>6.2} {:>7.3} {:>6.2}..{:<5.2} {:>8} (raw jitter {raw_jitter:.3})",
             m.samples, m.points, m.jitter, m.lag, m.overshoot, m.width.0, m.width.1, m.vertices
         );
         let mut check = |ok: bool, what: String| {
@@ -118,15 +123,13 @@ fn recorded_strokes_replay_within_bounds() {
             }
         };
         check(m.points >= 2, "no points emitted".into());
+        // `finish` lands one more point on the last raw sample.
         check(
-            m.points <= m.samples,
+            m.points <= m.samples + 1,
             format!("{} points from {} samples", m.points, m.samples),
         );
-        // Emitted points are sparser than raw samples (near-duplicates
-        // are dropped), so their second differences run a little larger
-        // per step; smoothing must still keep them in the same league.
         check(
-            m.jitter <= (raw_jitter * 1.5).max(0.5),
+            m.jitter <= raw_jitter * 1.5 + 0.05,
             format!("smoothing added jitter: {} vs raw {raw_jitter}", m.jitter),
         );
         check(
