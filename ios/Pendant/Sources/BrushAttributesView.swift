@@ -8,6 +8,8 @@ import SwiftUI
 struct BrushAttributesView: View {
     let brush: LibraryBrush
     @State private var knobs: BrushKnobs
+    @State private var newName = ""
+    @State private var saved = false
 
     init(brush: LibraryBrush) {
         self.brush = brush
@@ -30,11 +32,34 @@ struct BrushAttributesView: View {
             optional("opacity jitter", $knobs.opacityJitter, 0...1)
             optional("grain", $knobs.grainStrength, 0...1)
             optional("grain scale", $knobs.grainScale, 0.5...8)
-            Button("Reset") {
-                BrushKnobsStore.reset(id: brush.id)
-                if let base = brushKnobs(spec: brush.spec) { knobs = base }
+            HStack {
+                Button("Reset") {
+                    BrushKnobsStore.reset(id: brush.id)
+                    if let base = brushKnobs(spec: brush.spec) { knobs = base }
+                }
+                Spacer()
+                if BrushLibrary.isShared(brush.id) {
+                    Button("Delete from library", role: .destructive) {
+                        try? BrushLibrary.shared.remove(id: brush.id)
+                    }
+                }
             }
             .font(.caption)
+            Divider()
+            HStack {
+                TextField("New brush name", text: $newName)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                Button(saved ? "Saved" : "Save to library") {
+                    let spec = brushWithKnobs(spec: brush.spec, knobs: knobs)
+                    let name = newName.isEmpty ? "\(brush.name) copy" : newName
+                    saved = (try? BrushLibrary.shared.save(name: name, spec: spec)) != nil
+                }
+                .font(.caption)
+                .disabled(saved)
+            }
+            Text("Library brushes appear in every device's picker after the sketch is reopened.")
+                .font(.caption2).foregroundStyle(.secondary)
         }
         .padding(12)
         .onChange(of: knobsKey) { _, _ in BrushKnobsStore.save(id: brush.id, knobs: knobs) }

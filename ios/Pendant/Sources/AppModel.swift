@@ -32,6 +32,7 @@ final class AppModel {
         core = try! Core(dataDir: dir)
         notes = core.listNotes()
         core.setListener(listener: CoreEvents(model: self))
+        BrushLibrary.shared.attach(core)
 
         // Server config via UserDefaults; launch arguments like
         // `-serverURL ws://… -token demo` populate these automatically.

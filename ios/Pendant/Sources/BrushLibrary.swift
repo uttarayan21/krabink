@@ -69,6 +69,32 @@ final class BrushLibrary {
     /// Bundled first, then the workspace's, newest edit first.
     private(set) var brushes: [LibraryBrush]
     private let builtins: [LibraryBrush]
+    private weak var core: Core?
+
+    /// The workspace whose library this is; reads it once, then follows
+    /// `brushesChanged`.
+    func attach(_ core: Core) {
+        self.core = core
+        setShared(core.listBrushes())
+    }
+
+    /// Is this a workspace brush (one the user can delete)?
+    static func isShared(_ id: String) -> Bool { id.hasPrefix("user:") }
+
+    /// Add `spec` to the workspace library under a fresh `user:` id; every
+    /// device's picker offers it once its sketch is reopened.
+    func save(name: String, spec: Data) throws {
+        guard let core else { return }
+        try core.upsertBrush(id: "user:\(UUID().uuidString.lowercased())", name: name, spec: spec)
+        setShared(core.listBrushes())
+    }
+
+    func remove(id: String) throws {
+        guard let core, Self.isShared(id) else { return }
+        try core.removeBrush(id: id)
+        BrushKnobsStore.reset(id: id)
+        setShared(core.listBrushes())
+    }
 
     init() {
         builtins = builtinBrushes().map {

@@ -572,5 +572,7 @@ Not done in P3: `Mask::Image` / `GrainSource::Image` with the workspace
 draws with the bundled brush, the grainy pencil is not offered); the
 `LiveInk` mesh delta (`GPUGeometry.append/truncate`): a stamped stroke at
 spacing 0.15 re-uploads a few thousand quads per frame, which has not
-shown up in the redraw timings; a "new brush" UI that writes to the
-workspace library (the FFI is there, the picker has no button yet).
+shown up in the redraw timings. The popover's "Save to library" writes
+the current knobs as a new `user:` brush to the workspace (and "Delete
+from library" removes one); there is no separate brush editor beyond the
+knobs.
