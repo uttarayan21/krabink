@@ -494,6 +494,13 @@ iOS:
 Desktop: `StrokeStyle::from(InkStyle)` fills the grain slots; the WGSL
 noise path was already there.
 
+Found, not fixed (recogniser, not ink): proptest
+`clean_shapes_are_recognised_equivariantly` fails for a vertical
+line path scaled and moved (`+cc e9bd2def1d2e6c6de68c1d91b0825dbf886186ce8df06a0d32c6d2819beeb32c # shrinks to path = [ …`,
+seed in the shrunk case): the recognised bounds land ~25 units off the
+expected copy. Reproduces on `db50e38`, before any P2 geometry change; the
+regression entry was not kept so the suite stays green.
+
 Not done in P2: the Pencil Pro hover check on hardware, and
 `InkMesh::zoom_independent` (no stamped meshes exist before P3, so
 nothing to skip yet).
