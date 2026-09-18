@@ -484,6 +484,13 @@ iOS:
   `testEstimateUpdateDoesNotDuplicateStroke` asserts one stroke, revised,
   then a second one.
 
+- Highlighter on dark paper: `Blend::Multiply` means "keep the text
+  legible", and multiply over black is black. The iOS renderer picks the
+  pipeline from the clear colour's linear luminance (`darkPaper`):
+  multiply on light paper, screen (`src·(1 − dst) + dst`) on dark, for
+  the view and thumbnails alike. The desktop's paper is white, so it has
+  only the multiply pipeline until it gets a dark theme.
+
 Desktop: `StrokeStyle::from(InkStyle)` fills the grain slots; the WGSL
 noise path was already there.
 

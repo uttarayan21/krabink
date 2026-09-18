@@ -277,6 +277,13 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     private let queue: MTLCommandQueue
     private let psoNormal: MTLRenderPipelineState
     private let psoMultiply: MTLRenderPipelineState
+    private let psoScreen: MTLRenderPipelineState
+    /// Dark paper flips the highlighter from multiply to screen, so it
+    /// lightens and keeps light text legible the way multiply keeps dark
+    /// text legible on white. Set from the clear colour.
+    var darkPaper = false {
+        didSet { if darkPaper != oldValue { needsDisplay() } }
+    }
     private let depthAccumulate: MTLDepthStencilState
     private let depthDiscard: MTLDepthStencilState
     private weak var view: MTKView?
@@ -364,7 +371,7 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         precondition(inkVertexFloats() == UInt32(InkGeometry.vertexFloats), "InkMesh vertex layout changed")
         self.device = device
         self.queue = queue
-        (psoNormal, psoMultiply) = pipelines
+        (psoNormal, psoMultiply, psoScreen) = pipelines
         (depthAccumulate, depthDiscard) = depthStates
         self.view = view
         batch = GPUGeometry(device: device)
@@ -395,16 +402,22 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         return d
     }
 
-    /// Normal and Multiply pipelines; both premultiplied.
-    private static func makePipelines(device: MTLDevice) -> (MTLRenderPipelineState, MTLRenderPipelineState)? {
+    private enum BlendMode: String {
+        case normal, multiply, screen
+    }
+
+    /// Normal, Multiply and Screen pipelines; all premultiplied.
+    private static func makePipelines(device: MTLDevice)
+        -> (MTLRenderPipelineState, MTLRenderPipelineState, MTLRenderPipelineState)?
+    {
         guard
             let library = device.makeDefaultLibrary(),
             let vertex = library.makeFunction(name: "ink_vertex"),
             let fragment = library.makeFunction(name: "ink_fragment")
         else { return nil }
-        func make(multiply: Bool) -> MTLRenderPipelineState? {
+        func make(_ mode: BlendMode) -> MTLRenderPipelineState? {
             let descriptor = MTLRenderPipelineDescriptor()
-            descriptor.label = multiply ? "ink multiply" : "ink normal"
+            descriptor.label = "ink \(mode.rawValue)"
             descriptor.vertexFunction = vertex
             descriptor.fragmentFunction = fragment
             descriptor.vertexDescriptor = vertexDescriptor
@@ -413,16 +426,29 @@ final class InkRenderer: NSObject, MTKViewDelegate {
             let target = descriptor.colorAttachments[0]!
             target.pixelFormat = colorFormat
             target.isBlendingEnabled = true
-            // Normal: out = src + dst·(1 − a). Multiply: out = lerp(dst, c·dst, a)
-            // = c·a·dst + dst·(1 − a), the classic highlighter.
-            target.sourceRGBBlendFactor = multiply ? .destinationColor : .one
-            target.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            // Normal: out = src + dst·(1 − a).
+            // Multiply: out = lerp(dst, c·dst, a) = c·a·dst + dst·(1 − a),
+            // the highlighter on white paper.
+            // Screen: out = lerp(dst, 1 − (1 − c)(1 − dst), a) = c·a·(1 − dst) + dst,
+            // the same highlighter on dark paper.
+            switch mode {
+            case .normal:
+                target.sourceRGBBlendFactor = .one
+                target.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            case .multiply:
+                target.sourceRGBBlendFactor = .destinationColor
+                target.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            case .screen:
+                target.sourceRGBBlendFactor = .oneMinusDestinationColor
+                target.destinationRGBBlendFactor = .one
+            }
             target.sourceAlphaBlendFactor = .one
             target.destinationAlphaBlendFactor = .oneMinusSourceAlpha
             return try? device.makeRenderPipelineState(descriptor: descriptor)
         }
-        guard let normal = make(multiply: false), let multiply = make(multiply: true) else { return nil }
-        return (normal, multiply)
+        guard let normal = make(.normal), let multiply = make(.multiply), let screen = make(.screen)
+        else { return nil }
+        return (normal, multiply, screen)
     }
 
     /// Accumulate (`.lessEqual`) and Discard (`.less`), both writing depth.
@@ -450,6 +476,12 @@ final class InkRenderer: NSObject, MTKViewDelegate {
             return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
         }
         return MTLClearColor(red: linear(r), green: linear(g), blue: linear(b), alpha: 1)
+    }
+
+    /// Is this paper dark enough that a highlighter should screen rather
+    /// than multiply? Linear luminance under 0.5 (mid grey in sRGB is 0.21).
+    static func isDark(_ clear: MTLClearColor) -> Bool {
+        0.2126 * clear.red + 0.7152 * clear.green + 0.0722 * clear.blue < 0.5
     }
 
     // MARK: tolerance
@@ -683,7 +715,7 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         let size = viewport.size
         if size.width > 0, size.height > 0 {
             var uniforms = Uniforms(viewport)
-            encode(encoder, uniforms: &uniforms) { draw in
+            encode(encoder, uniforms: &uniforms, dark: darkPaper) { draw in
                 draw(batch)
                 for id in wetOrder {
                     guard let entry = wet[id] else { continue }
@@ -705,9 +737,10 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     /// Bind the uniforms once, then hand the body a `draw` that encodes a
     /// geometry's runs, switching pipeline and depth state per run.
     private func encode(
-        _ encoder: MTLRenderCommandEncoder, uniforms: inout Uniforms,
+        _ encoder: MTLRenderCommandEncoder, uniforms: inout Uniforms, dark: Bool,
         _ body: ((GPUGeometry) -> Void) -> Void
     ) {
+        let highlighter = dark ? psoScreen : psoMultiply
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
         body { geometry in
@@ -721,7 +754,7 @@ final class InkRenderer: NSObject, MTKViewDelegate {
             encoder.setVertexBuffer(strokeIndex, offset: 0, index: 3)
             encoder.setFragmentBuffer(styles, offset: 0, index: 0)
             for run in geometry.runs {
-                encoder.setRenderPipelineState(run.combo.multiply ? psoMultiply : psoNormal)
+                encoder.setRenderPipelineState(run.combo.multiply ? highlighter : psoNormal)
                 encoder.setDepthStencilState(run.combo.discard ? depthDiscard : depthAccumulate)
                 encoder.drawIndexedPrimitives(
                     type: .triangle, indexCount: run.indexCount, indexType: .uint32,
@@ -782,7 +815,8 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         pass.colorAttachments[0].resolveTexture = resolveTexture
         pass.colorAttachments[0].loadAction = .clear
         pass.colorAttachments[0].storeAction = .multisampleResolve
-        pass.colorAttachments[0].clearColor = Self.clearColor(for: background, trait: trait)
+        let clear = Self.clearColor(for: background, trait: trait)
+        pass.colorAttachments[0].clearColor = clear
         pass.depthAttachment.texture = depthTexture
         pass.depthAttachment.loadAction = .clear
         pass.depthAttachment.clearDepth = 1
@@ -795,7 +829,7 @@ final class InkRenderer: NSObject, MTKViewDelegate {
                 zoom: scale,
                 offset: CGPoint(x: bounds.minX * scale, y: bounds.minY * scale),
                 size: points))
-        encode(encoder, uniforms: &uniforms) { draw in draw(gpu) }
+        encode(encoder, uniforms: &uniforms, dark: Self.isDark(clear)) { draw in draw(gpu) }
         encoder.endEncoding()
         command.commit()
         command.waitUntilCompleted()
