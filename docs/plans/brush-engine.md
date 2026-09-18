@@ -372,3 +372,56 @@ Total ≈ 40 working days. P0+P1 is the first shippable slice (proper highlighte
 ### iOS / desktop files
 
 `ios/Pendant/Sources/SketchScreen.swift` (RawSample, recogniser phases, settling, selection, recorder v2, picker), `StrokeCodec.swift` (selection + tables), `InkRenderer.swift` (locals, hover layer, `InkMesh`), `AppModel.swift` (listener signatures, library), `SketchPreview.swift` (stamped thumbnails), `PendantApp.swift` (`-brushLab`); new `BrushLibrary.swift`, `BrushSheet.swift`, `BrushAttributesView.swift`, `BrushLabScreen.swift`, `AssetImport.swift`, `UITests/BrushLabUITests.swift`. Core/FFI/desktop: `wetink.rs`, `brush/*` (update/pending estimates), new `corpus.rs`, `tests/brush_corpus.rs`, `pendant-ffi/src/{brush,types,engine}.rs`, `pendant-ffi/tests/engine.rs`, `scripts/smoke/main.swift`, `crates/pendant/src/{sketch,cli,main,replay}.rs`, new `lab.rs`.
+
+## Implementation notes
+
+### P0 (done, `fa20095`)
+
+`brush.rs`/`geom.rs` split into `brush/{input,dynamics,spec}` and
+`geom/{mesh,continuous,nib,outline}` with a golden-mesh test
+(`tests/golden_mesh.rs`, `PENDANT_UPDATE_GOLDEN=1` to regenerate) pinning
+the output.
+
+### P1 (done, core `9394204`, iOS `b2fa99d`, desktop follows)
+
+Core/FFI as designed, with these calls:
+
+- `InkStyle` carries `hardness` only; mask aspect/corner and grain fields
+  are reserved in the renderer's `StrokeStyle` (mask kind 3 = ribbon edge
+  feather on `|v|`) until P2 stamps need tip-space masks.
+- Pen preset maps force 0.5 (average pressure after the `/2` normalisation)
+  to 75 % width, not 100 %: the `K.*` calibration tables absorb the rest.
+- `BrushModeler.update` patches a stored point and re-runs the fold from
+  it; `pending_estimates` drives the 200 ms settle on the iPad.
+- Wet `End` tail is delivered to listeners as one more `wet_points` batch
+  followed by `wet_end`; receivers finish the mesh with `StrokeEnd.complete`.
+
+iOS:
+
+- Renderer draws runs split only by blend × overlap; depth slots committed
+  `0.2 + 0.8·(N−k)/(N+1)`, wet `0.1 + 0.001·(W−j)`, live `0.01`, settling
+  `0.05 − 0.001·i`. Thumbnails are the same pipeline offscreen (2×, MSAA 4,
+  resolve → `CGImage`). `IndexedMesh.cgPath` is gone.
+- `-tool <name>` pins the tool and skips the picker; `-figureEight 1`
+  commits a lemniscate; `testMarkerSelfOverlapDoesNotDarken` samples
+  screenshot pixels at the crossing vs an arm (passes: uniform grey).
+- `-brushLab 1`: preset grid (5 tools × 3 widths from one canned stroke)
+  and a calibration page with `PKCanvasView` above our canvas. The ratio
+  measurement is still by eye; `widthScale`/`opacityScale` stay at 1.0
+  (crayon 1.5 / 0.9, watercolour 0.6 by rule).
+- Recorder v2 writes tilt columns and an `est` flag (1 = still an
+  estimate at commit); the shape corpus parser reads the first four
+  columns and ignores the rest, so recordings still replay there.
+- Picker state autosaves as `sketch` (iOS 18 `toolItems` without
+  watercolour; iOS 17 stock picker with watercolour → lighter marker).
+
+Desktop: `ink_material.rs` + `ink.wgsl`. bevy 0.19 names the storage asset
+`ShaderBuffer`; `specialize` reaches `depth_stencil`, so write-once ink
+works as designed. `PreparedMaterial2d` does not re-prepare after a
+`ShaderBuffer` reallocation, so the palette pads to a power of two and
+re-touches its four materials for two frames after growth.
+
+Not done in P1: real-device check (iPad locked during the session; the
+`est:` log line and the marker/nib feel are unverified on hardware), the
+automated K/A calibration, `cargo mutants`, and the desktop parity
+screenshot script.
