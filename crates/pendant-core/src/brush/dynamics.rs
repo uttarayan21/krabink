@@ -381,7 +381,10 @@ mod tests {
             ..pt(0.0, 1.0, 0)
         };
         let s = TipEvaluator::evaluate(&fountain, 8.0, &[rolled], StrokeEnd::Live);
-        assert!((s[0].rot - 1.25).abs() < 1e-6);
+        assert!(
+            (s[0].rot - 0.75).abs() < 1e-6,
+            "roll turns against the azimuth"
+        );
         assert!(
             (s[0].h - 8.0 * 0.15).abs() < 1e-6,
             "nib thickness is aspect * width"

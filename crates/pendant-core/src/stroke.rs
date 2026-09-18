@@ -116,9 +116,11 @@ pub struct Tilt {
 
 impl Tilt {
     /// Orientation of a flat nib on the canvas: where the barrel points,
-    /// turned by how far it was rolled.
+    /// turned by how far it was rolled. UIKit's roll angle grows the
+    /// opposite way round the barrel from the azimuth's sense on the
+    /// canvas, so it is subtracted (verified on an Apple Pencil Pro).
     pub fn nib_angle(self) -> f32 {
-        self.azimuth + self.roll
+        self.azimuth - self.roll
     }
 }
 
