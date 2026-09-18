@@ -12,6 +12,13 @@ macro_rules! ulid_id {
             pub fn new() -> Self {
                 Self(ulid::Ulid::new())
             }
+
+            /// The low 32 bits of the ULID's random part: a per-id seed
+            /// for anything that must look the same on every device
+            /// (stroke-mapped grain, stamp scatter).
+            pub fn seed(self) -> u32 {
+                u32::try_from(self.0.0 & 0xffff_ffff).unwrap_or(0)
+            }
         }
 
         impl Default for $name {

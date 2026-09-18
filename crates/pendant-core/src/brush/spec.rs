@@ -155,6 +155,41 @@ pub struct Paint {
     pub opacity: f32,
     pub overlap: Overlap,
     pub blend: Blend,
+    /// Paper texture modulating the ink's alpha; `None` for flat ink.
+    pub grain: Option<Grain>,
+}
+
+/// A texture that thins the ink where the paper's tooth would hold it
+/// off: pencil, crayon. Evaluated in the fragment shader, so it costs no
+/// geometry and does not change with zoom buckets.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Grain {
+    pub source: GrainSource,
+    pub mapping: GrainMapping,
+    /// Size of one texture cell in canvas units.
+    pub scale: f32,
+    /// 0 leaves the ink flat; 1 lets the texture cut alpha all the way to
+    /// zero in its dark cells.
+    pub strength: f32,
+}
+
+/// Where the grain texture comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GrainSource {
+    /// Smooth value noise from an integer hash: identical on every
+    /// platform, needs no asset. Image grains come with the brush library.
+    Noise,
+}
+
+/// What the grain texture is anchored to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GrainMapping {
+    /// The page: overlapping strokes reveal the same paper and the texture
+    /// zooms with the ink.
+    Canvas,
+    /// The stroke's own arc length and side, seeded per stroke: a ribbon
+    /// texture that travels with the stroke.
+    Stroke,
 }
 
 /// What happens where a stroke covers itself.
@@ -179,7 +214,7 @@ pub enum Blend {
 
 /// Bump when the serialised layout changes; older readers fall back to the
 /// tool's preset.
-const SPEC_VERSION: u8 = 1;
+const SPEC_VERSION: u8 = 2;
 
 impl BrushSpec {
     /// The tuned brush for a built-in tool.
@@ -201,6 +236,7 @@ impl BrushSpec {
             opacity: 1.0,
             overlap: Overlap::Accumulate,
             blend: Blend::Normal,
+            grain: None,
         };
         let behavior = |source, curve, range, target, damping_ms| Behavior {
             source,
@@ -275,6 +311,12 @@ impl BrushSpec {
                 ],
                 paint: Paint {
                     opacity: 0.9,
+                    grain: Some(Grain {
+                        source: GrainSource::Noise,
+                        mapping: GrainMapping::Canvas,
+                        scale: 1.5,
+                        strength: 0.55,
+                    }),
                     ..opaque
                 },
             },
@@ -297,6 +339,7 @@ impl BrushSpec {
                     opacity: 0.45,
                     overlap: Overlap::Discard,
                     blend: Blend::Multiply,
+                    grain: None,
                 },
             },
             Tool::Monoline => Self {

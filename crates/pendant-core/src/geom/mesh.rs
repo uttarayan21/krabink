@@ -1,7 +1,7 @@
 //! The mesh every renderer draws: triangles in canvas space with the
 //! per-vertex attributes a brush shader needs, plus the per-stroke style.
 
-use crate::brush::{Blend, Overlap, Tip};
+use crate::brush::{Blend, GrainMapping, Overlap, Paint, Tip};
 use crate::stroke::Rgba;
 
 /// One mesh vertex.
@@ -27,6 +27,23 @@ pub struct InkStyle {
     pub overlap: Overlap,
     /// Edge feathering, 1 for a hard edge (see [`Tip::hardness`]).
     pub hardness: f32,
+    /// Paper texture the shader multiplies into the alpha; `None` for flat
+    /// ink.
+    pub grain: Option<GrainStyle>,
+}
+
+/// Procedural grain as the shader evaluates it (see
+/// [`crate::brush::Grain`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GrainStyle {
+    pub mapping: GrainMapping,
+    /// Cell size in canvas units.
+    pub scale: f32,
+    /// 0..=1: how deep the texture cuts into the alpha.
+    pub strength: f32,
+    /// Hash seed; 0 for canvas-mapped grain so every stroke shares the
+    /// paper, the stroke's own seed otherwise.
+    pub seed: u32,
 }
 
 impl InkStyle {
@@ -37,15 +54,26 @@ impl InkStyle {
         blend: Blend::Normal,
         overlap: Overlap::Accumulate,
         hardness: 1.0,
+        grain: None,
     };
 
-    pub(crate) fn of(color: Rgba, tip: &Tip, paint: &crate::brush::Paint) -> Self {
+    pub(crate) fn of(color: Rgba, tip: &Tip, paint: &Paint, seed: u32) -> Self {
+        let grain = paint.grain.map(|g| GrainStyle {
+            mapping: g.mapping,
+            scale: g.scale.max(1e-3),
+            strength: g.strength.clamp(0.0, 1.0),
+            seed: match g.mapping {
+                GrainMapping::Canvas => 0,
+                GrainMapping::Stroke => seed,
+            },
+        });
         Self {
             color,
             opacity: paint.opacity.clamp(0.0, 1.0),
             blend: paint.blend,
             overlap: paint.overlap,
             hardness: tip.hardness.clamp(0.0, 1.0),
+            grain,
         }
     }
 }

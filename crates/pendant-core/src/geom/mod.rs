@@ -17,10 +17,10 @@ mod outline;
 
 use std::borrow::Cow;
 
-pub use mesh::{InkMesh, InkStyle, InkVertex};
+pub use mesh::{GrainStyle, InkMesh, InkStyle, InkVertex};
 
 use crate::brush::{BrushSpec, StrokeEnd, TipEvaluator, TipState};
-use crate::stroke::{PointKind, Rgba, Stroke, StrokePoint, Tool};
+use crate::stroke::{PointKind, Rgba, Stroke, StrokePoint, Tilt, Tool};
 
 /// Curve samples evaluated per spline segment. 8 keeps a typical pen segment
 /// (a few canvas units long) visually smooth at 1:1 zoom.
@@ -46,6 +46,7 @@ impl Stroke {
             spec: self.spec(),
             color: self.color,
             base_width: self.base_width,
+            seed: self.id.seed(),
         }
     }
 
@@ -141,22 +142,46 @@ pub struct Ink<'a> {
     pub color: Rgba,
     /// Full ink width in canvas units, the brush "size".
     pub base_width: f32,
+    /// Per-stroke randomness seed (the element id's, see
+    /// [`crate::ElementId::seed`]); 0 for ink with no element yet.
+    pub seed: u32,
 }
 
 impl Ink<'static> {
-    /// A built-in tool's preset at `color` and `base_width`.
+    /// A built-in tool's preset at `color` and `base_width`, seed 0.
     pub fn preset(tool: Tool, color: Rgba, base_width: f32) -> Self {
         Self {
             spec: Cow::Owned(BrushSpec::preset(tool)),
             color,
             base_width,
+            seed: 0,
         }
     }
 }
 
 impl Ink<'_> {
+    pub fn with_seed(self, seed: u32) -> Self {
+        Self { seed, ..self }
+    }
+
     pub fn style(&self) -> InkStyle {
-        InkStyle::of(self.color, &self.spec.tip, &self.spec.paint)
+        InkStyle::of(self.color, &self.spec.tip, &self.spec.paint, self.seed)
+    }
+
+    /// The mark the tip would leave touching down at (`x`, `y`) with the
+    /// pen held at `tilt` and average pressure: the hover preview the
+    /// Pencil Pro shows before ink. One point, so a round tip is a dot
+    /// and a nib its rectangle.
+    pub fn hover_dab(&self, x: f32, y: f32, tilt: Option<Tilt>, tolerance: f32) -> InkMesh {
+        let point = StrokePoint {
+            x,
+            y,
+            force: 0.5,
+            t_ms: 0,
+            tilt,
+            size: None,
+        };
+        self.mesh(&[point], StrokeEnd::Live, tolerance)
     }
 
     /// Tessellate a run of input points. `end` says whether the run is

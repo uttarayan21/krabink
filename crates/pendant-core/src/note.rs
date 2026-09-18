@@ -668,6 +668,7 @@ mod tests {
         spec.paint = Paint {
             opacity: 0.3,
             blend: Blend::Normal,
+            grain: None,
             ..spec.paint
         };
         let custom = Stroke {

@@ -99,7 +99,9 @@ impl Element {
     pub fn ink(&self) -> Ink<'_> {
         match self {
             Self::Stroke(s) => s.ink(),
-            Self::Shape(s) => Ink::preset(s.style.tool, s.style.color, s.style.width),
+            Self::Shape(s) => {
+                Ink::preset(s.style.tool, s.style.color, s.style.width).with_seed(s.id.seed())
+            }
         }
     }
 }

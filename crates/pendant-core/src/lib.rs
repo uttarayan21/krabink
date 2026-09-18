@@ -16,6 +16,7 @@
 //! ```
 
 mod brush;
+pub mod corpus;
 mod element;
 mod export;
 mod geom;
@@ -32,12 +33,12 @@ mod workspace;
 
 pub use brush::{
     Behavior, Blend, BrushId, BrushModeler, BrushSpec, Curve, CustomBrush, EmaModel, Estimate,
-    InputParams, Orient, Overlap, Paint, RawSample, Source, StrokeEnd, Target, Tip, TipEvaluator,
-    TipState,
+    Grain, GrainMapping, GrainSource, InputParams, Orient, Overlap, Paint, RawSample, Source,
+    StrokeEnd, Target, Tip, TipEvaluator, TipState,
 };
 pub use element::{Binding, Element, ShapeElement, Style};
 pub use export::{ExportAsset, ExportBundle, SKETCH_URI_PREFIX, elements_to_svg};
-pub use geom::{DEFAULT_TOLERANCE, Ink, InkMesh, InkStyle, InkVertex};
+pub use geom::{DEFAULT_TOLERANCE, GrainStyle, Ink, InkMesh, InkStyle, InkVertex};
 pub use ids::{DeviceId, ElementId, NoteId, SketchId, StrokeId};
 pub use note::NoteDoc;
 pub use pair::PairInfo;

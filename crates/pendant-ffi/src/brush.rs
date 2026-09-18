@@ -55,12 +55,25 @@ pub struct BrushRef {
     pub tool: Tool,
     /// Full ink width in canvas units.
     pub base_width: f32,
+    /// Per-stroke randomness seed, the stroke id's low bits
+    /// ([`stroke_seed`]); only stroke-mapped grain and stamps read it, so
+    /// 0 is fine for ink that has no element yet.
+    #[uniffi(default = 0)]
+    pub seed: u32,
 }
 
 impl BrushRef {
     fn ink(self, color: u32) -> pcore::Ink<'static> {
         pcore::Ink::preset(self.tool.into(), rgba_from_u32(color), self.base_width)
+            .with_seed(self.seed)
     }
+}
+
+/// The seed a stroke or shape with element id `id` renders with; 0 for
+/// an id that does not parse.
+#[uniffi::export]
+pub fn stroke_seed(id: String) -> u32 {
+    id.parse::<pcore::ElementId>().map_or(0, |id| id.seed())
 }
 
 /// Whether a run of points is still being drawn or is the whole stroke;
@@ -210,6 +223,30 @@ pub struct InkStyle {
     pub overlap: Overlap,
     /// Edge feathering, 1 for a hard edge.
     pub hardness: f32,
+    /// Procedural paper texture the fragment shader multiplies into the
+    /// alpha; `None` for flat ink.
+    pub grain: Option<GrainStyle>,
+}
+
+/// What the grain texture is anchored to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum GrainMapping {
+    /// Canvas coordinates: every stroke reveals the same paper.
+    Canvas,
+    /// The stroke's own `(u, v)`, seeded per stroke.
+    Stroke,
+}
+
+/// Value-noise grain: `mix(1, noise(anchor / scale, seed), strength)`.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct GrainStyle {
+    pub mapping: GrainMapping,
+    /// Cell size in canvas units.
+    pub scale: f32,
+    /// 0..=1.
+    pub strength: f32,
+    /// Hash seed; 0 for canvas-mapped grain.
+    pub seed: u32,
 }
 
 impl From<pcore::InkStyle> for InkStyle {
@@ -226,6 +263,15 @@ impl From<pcore::InkStyle> for InkStyle {
                 pcore::Overlap::Discard => Overlap::Discard,
             },
             hardness: s.hardness,
+            grain: s.grain.map(|g| GrainStyle {
+                mapping: match g.mapping {
+                    pcore::GrainMapping::Canvas => GrainMapping::Canvas,
+                    pcore::GrainMapping::Stroke => GrainMapping::Stroke,
+                },
+                scale: g.scale,
+                strength: g.strength,
+                seed: g.seed,
+            }),
         }
     }
 }
@@ -326,6 +372,24 @@ pub fn shape_outline_mesh(shape: Shape, brush: BrushRef, color: u32, tolerance: 
         .into()
 }
 
+/// The mark the tip would leave touching down at (`x`, `y`) with the pen
+/// held at `tilt` and average pressure: the Pencil Pro hover preview,
+/// drawn by the renderer at reduced alpha. Same ink as a one-point stroke.
+#[uniffi::export]
+pub fn hover_dab_mesh(
+    brush: BrushRef,
+    color: u32,
+    x: f32,
+    y: f32,
+    tilt: Option<Tilt>,
+    tolerance: f32,
+) -> InkMesh {
+    brush
+        .ink(color)
+        .hover_dab(x, y, tilt.map(Into::into), tolerance)
+        .into()
+}
+
 /// Snap a live stroke (`BrushModeler.points` at hold time) to a line,
 /// arrow, rectangle or ellipse; `None` when it is not drawn cleanly enough
 /// to be one. `hold_radius` is how far, in canvas units, the pen may have
@@ -393,6 +457,7 @@ mod tests {
         let brush = BrushRef {
             tool: Tool::Pen,
             base_width: 4.0,
+            seed: 0,
         };
         assert_eq!(
             m.live_mesh(vec![], brush, 0xff, 0.25),
@@ -479,6 +544,7 @@ mod tests {
         let brush = BrushRef {
             tool: Tool::Pen,
             base_width: 4.0,
+            seed: 0,
         };
         let preview = shape_outline_mesh(rec.shape, brush, 0xff, 0.25);
         let committed = element_mesh(

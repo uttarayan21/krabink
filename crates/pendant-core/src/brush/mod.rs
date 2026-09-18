@@ -31,8 +31,8 @@ pub(crate) use dynamics::MIN_TIP;
 pub use dynamics::{StrokeEnd, TipEvaluator, TipState};
 pub use input::{EmaModel, Estimate, InputParams, RawSample};
 pub use spec::{
-    Behavior, Blend, BrushId, BrushSpec, Curve, CustomBrush, Orient, Overlap, Paint, Source,
-    Target, Tip,
+    Behavior, Blend, BrushId, BrushSpec, Curve, CustomBrush, Grain, GrainMapping, GrainSource,
+    Orient, Overlap, Paint, Source, Target, Tip,
 };
 
 use crate::stroke::{StrokePoint, Tilt, Tool};
