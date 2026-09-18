@@ -12,6 +12,7 @@ use pendant_core as pcore;
 use pendant_core::{DeviceId, DocKey, Flush, NoteId, NoteMeta, SketchId, Store, WorkspaceDoc};
 use tokio::sync::mpsc;
 
+use crate::brush::{AssetInfo, AssetKind};
 use crate::net::{self, Cmd};
 use crate::types::{
     BrushInfo, DeviceInfo, Element, NoteInfo, ShapeElement, Stroke, StrokePoint, SyncState, Tool,
@@ -49,6 +50,10 @@ pub trait CoreListener: Send + Sync {
     /// The shared brush library changed (a peer added, edited or removed
     /// a brush); the full list, newest edit first.
     fn brushes_changed(&self, brushes: Vec<BrushInfo>);
+    /// The workspace's image assets changed; the full list with bytes,
+    /// newest first. Renderers upload what they lack and redraw strokes
+    /// that were waiting for it.
+    fn assets_changed(&self, assets: Vec<AssetInfo>);
     fn sync_state(&self, state: SyncState);
 }
 
@@ -427,6 +432,55 @@ impl Core {
         let payload = {
             let mut state = self.shared.lock_state();
             commit_workspace(&mut state, |ws| ws.upsert_brush(&meta))?
+        };
+        if let Some(payload) = payload {
+            let _ = self.shared.cmd.send(Cmd::Update {
+                doc: DocKey::WORKSPACE,
+                payload,
+            });
+        }
+        Ok(())
+    }
+
+    /// The workspace's image assets, newest first (bundled ones are in
+    /// `builtin_assets`).
+    pub fn list_assets(&self) -> Vec<AssetInfo> {
+        let state = self.shared.lock_state();
+        state
+            .workspace
+            .assets()
+            .into_iter()
+            .map(|a| a.asset.into())
+            .collect()
+    }
+
+    /// Add a greyscale PNG (≤ 64 KiB) to the workspace; returns its id.
+    /// The same bytes added twice are one asset.
+    pub fn put_asset(&self, name: String, kind: AssetKind, png: Vec<u8>) -> Result<String> {
+        let asset = pcore::Asset::from_png(name, kind.into(), png)?;
+        let id = asset.id.0.clone();
+        let meta = pcore::AssetMeta {
+            asset,
+            added_ms: now_ms(),
+        };
+        let payload = {
+            let mut state = self.shared.lock_state();
+            commit_workspace(&mut state, |ws| ws.put_asset(&meta))?
+        };
+        if let Some(payload) = payload {
+            let _ = self.shared.cmd.send(Cmd::Update {
+                doc: DocKey::WORKSPACE,
+                payload,
+            });
+        }
+        Ok(id)
+    }
+
+    pub fn remove_asset(&self, id: String) -> Result<()> {
+        let id = pcore::AssetId(id);
+        let payload = {
+            let mut state = self.shared.lock_state();
+            commit_workspace(&mut state, |ws| ws.remove_asset(&id))?
         };
         if let Some(payload) = payload {
             let _ = self.shared.cmd.send(Cmd::Update {

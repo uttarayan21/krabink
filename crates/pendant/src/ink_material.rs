@@ -13,8 +13,9 @@
 //! uses `Greater` and writes depth: where it covers itself the second
 //! fragment sits at the same z and fails.
 //!
-//! Not in this phase: the mask/grain texture arrays (mask kind 2, grain
-//! kind 2). The shader leaves those branches out.
+//! Image masks (kind 2) and grains (kind 2) sample the two texture arrays
+//! of [`crate::ink_assets::InkAssets`]; a style names its layer through
+//! `mask_layer` / `grain_layer`.
 
 use bevy::asset::{AssetPath, embedded_asset, embedded_path};
 use bevy::mesh::{MeshTag, MeshVertexAttribute, MeshVertexBufferLayoutRef, VertexFormat};
@@ -27,6 +28,8 @@ use bevy::render::storage::ShaderBuffer;
 use bevy::shader::ShaderRef;
 use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dKey, Material2dPlugin};
 use pendant_core::{Blend, GrainMapping, InkStyle, MaskStyle, Overlap, Rgba};
+
+use crate::ink_assets::InkAssets;
 
 /// Stroke-space uv: `u` arc length in canvas units, `v` the side in -1..1.
 pub const ATTRIBUTE_INK_UV: MeshVertexAttribute =
@@ -66,10 +69,14 @@ impl StrokeStyle {
     /// Bits 0-1, mask kind 3: feather the ribbon edge by `mask.z`.
     /// Mask kind 1: rounded superellipse in tip space (stamped dabs).
     pub const MASK_SHAPE: u32 = 1;
+    /// Mask kind 2: the `masks` array layer `mask_layer` over tip space.
+    pub const MASK_IMAGE: u32 = 2;
     pub const MASK_EDGE: u32 = 3;
     /// Bits 2-3, grain kind 1: procedural value noise seeded by
     /// `grain_layer`.
     pub const GRAIN_NOISE: u32 = 4;
+    /// Grain kind 2: the `grains` array layer `grain_layer`, tiled.
+    pub const GRAIN_IMAGE: u32 = 8;
     /// Bit 4: grain follows the stroke's own uv rather than the canvas.
     pub const GRAIN_STROKE: u32 = 16;
     /// Bit 5: ink multiplies what is under it.
@@ -86,15 +93,17 @@ impl StrokeStyle {
     }
 }
 
-impl From<InkStyle> for StrokeStyle {
-    fn from(style: InkStyle) -> Self {
+impl StrokeStyle {
+    /// The GPU style for `style`, image layers resolved through `assets`
+    /// (an asset the arrays lack falls back to the shape mask or noise).
+    pub fn new(style: &InkStyle, assets: &InkAssets) -> Self {
         let LinearRgba {
             red,
             green,
             blue,
             alpha,
         } = linear(style.color);
-        let (mask, edge) = match style.mask {
+        let (mask, edge, mask_layer) = match &style.mask {
             MaskStyle::Ribbon => (
                 Vec4::new(1.0, 0.0, style.hardness, 0.0),
                 if style.hardness < 1.0 {
@@ -102,11 +111,25 @@ impl From<InkStyle> for StrokeStyle {
                 } else {
                     0
                 },
+                0,
             ),
             MaskStyle::Shape { corner } => (
-                Vec4::new(1.0, corner, style.hardness, 0.0),
+                Vec4::new(1.0, *corner, style.hardness, 0.0),
                 Self::MASK_SHAPE,
+                0,
             ),
+            MaskStyle::Image { asset, corner } => match assets.mask_layer(asset) {
+                Some(layer) => (
+                    Vec4::new(1.0, *corner, style.hardness, 0.0),
+                    Self::MASK_IMAGE,
+                    layer,
+                ),
+                None => (
+                    Vec4::new(1.0, *corner, style.hardness, 0.0),
+                    Self::MASK_SHAPE,
+                    0,
+                ),
+            },
         };
         let multiply = match style.blend {
             Blend::Multiply => Self::MULTIPLY,
@@ -116,16 +139,20 @@ impl From<InkStyle> for StrokeStyle {
             Overlap::Discard => Self::DISCARD,
             Overlap::Accumulate => 0,
         };
-        let (grain, grain_flags, grain_layer) = match style.grain {
+        let (grain, grain_flags, grain_layer) = match &style.grain {
             Some(g) => {
                 let mapping = match g.mapping {
                     GrainMapping::Canvas => 0,
                     GrainMapping::Stroke => Self::GRAIN_STROKE,
                 };
+                let (kind, layer) = match g.image.as_ref().and_then(|id| assets.grain_layer(id)) {
+                    Some(layer) => (Self::GRAIN_IMAGE, layer),
+                    None => (Self::GRAIN_NOISE, g.seed),
+                };
                 (
                     Vec4::new(g.scale, g.strength, 0.0, 0.0),
-                    Self::GRAIN_NOISE | mapping,
-                    g.seed,
+                    kind | mapping,
+                    layer,
                 )
             }
             None => (Vec4::ZERO, 0, 0),
@@ -136,7 +163,7 @@ impl From<InkStyle> for StrokeStyle {
             grain,
             depth: 0.0,
             flags: edge | multiply | discard | grain_flags,
-            mask_layer: 0,
+            mask_layer,
             grain_layer,
         }
     }
@@ -244,6 +271,14 @@ pub struct InkMaterial {
     pub styles: Handle<ShaderBuffer>,
     #[uniform(1)]
     pub params: InkParams,
+    /// Tip masks (mask kind 2), clamped.
+    #[texture(2, dimension = "2d_array")]
+    #[sampler(3)]
+    pub masks: Handle<Image>,
+    /// Paper grains (grain kind 2), repeating.
+    #[texture(4, dimension = "2d_array")]
+    #[sampler(5)]
+    pub grains: Handle<Image>,
     /// Blend and depth state; the specialisation key.
     pub combo: InkCombo,
 }
@@ -338,6 +373,7 @@ impl InkPalette {
         buffers: &mut Assets<ShaderBuffer>,
         materials: &mut Assets<InkMaterial>,
         params: InkParams,
+        assets: &InkAssets,
     ) -> Self {
         let capacity = 1;
         let mut buffer = ShaderBuffer::default();
@@ -347,6 +383,8 @@ impl InkPalette {
             materials.add(InkMaterial {
                 styles: buffer.clone(),
                 params,
+                masks: assets.masks.clone(),
+                grains: assets.grains.clone(),
                 combo,
             })
         });
@@ -361,9 +399,19 @@ impl InkPalette {
         }
     }
 
+    /// Point the materials at rebuilt texture arrays.
+    pub fn set_assets(&self, materials: &mut Assets<InkMaterial>, assets: &InkAssets) {
+        for handle in &self.materials {
+            if let Some(mut material) = materials.get_mut(handle) {
+                material.masks = assets.masks.clone();
+                material.grains = assets.grains.clone();
+            }
+        }
+    }
+
     /// Reserve a slot for `style`; the upload happens at [`Self::flush`].
-    pub fn insert(&mut self, style: InkStyle) -> InkSlot {
-        let style = StrokeStyle::from(style);
+    pub fn insert(&mut self, style: &InkStyle, assets: &InkAssets) -> InkSlot {
+        let style = StrokeStyle::new(style, assets);
         let combo = style.combo();
         let index = match self.free.pop() {
             Some(index) => {

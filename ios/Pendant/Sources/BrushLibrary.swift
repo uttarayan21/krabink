@@ -49,6 +49,23 @@ enum BrushKnobsStore {
 
     static func reset(id: String) {
         UserDefaults.standard.removeObject(forKey: key(id))
+        UserDefaults.standard.removeObject(forKey: imageKey(id, .mask))
+        UserDefaults.standard.removeObject(forKey: imageKey(id, .grain))
+    }
+
+    enum ImageSlot: String { case mask, grain }
+
+    static func imageKey(_ id: String, _ slot: ImageSlot) -> String { "brush.\(id).\(slot.rawValue)" }
+
+    /// `nil` when untouched; `.some(nil)` for "the plain shape / noise";
+    /// `.some(id)` for an asset.
+    static func loadImage(id: String, slot: ImageSlot) -> String?? {
+        guard let stored = UserDefaults.standard.string(forKey: imageKey(id, slot)) else { return nil }
+        return .some(stored.isEmpty ? nil : stored)
+    }
+
+    static func saveImage(id: String, slot: ImageSlot, asset: String?) {
+        UserDefaults.standard.set(asset ?? "", forKey: imageKey(id, slot))
     }
 }
 
@@ -103,14 +120,29 @@ final class BrushLibrary {
         brushes = builtins
     }
 
-    /// The brush under `id`, with the knobs the user set in its popover
-    /// (`UserDefaults` `brush.<id>.knobs`) written into its spec.
+    /// The brush under `id`, with the knobs and image choices the user
+    /// set in its popover (`UserDefaults` `brush.<id>.*`) written into
+    /// its spec.
     func brush(id: String) -> LibraryBrush? {
         guard let base = brushes.first(where: { $0.id == id }) else { return nil }
-        guard let knobs = BrushKnobsStore.load(id: id) else { return base }
-        return LibraryBrush(
-            id: base.id, name: base.name, tool: base.tool,
-            spec: brushWithKnobs(spec: base.spec, knobs: knobs))
+        var spec = base.spec
+        if let knobs = BrushKnobsStore.load(id: id) { spec = brushWithKnobs(spec: spec, knobs: knobs) }
+        if let mask = BrushKnobsStore.loadImage(id: id, slot: .mask) {
+            spec = brushWithMask(spec: spec, asset: mask)
+        }
+        if let grain = BrushKnobsStore.loadImage(id: id, slot: .grain) {
+            spec = brushWithGrainImage(spec: spec, asset: grain)
+        }
+        return LibraryBrush(id: base.id, name: base.name, tool: base.tool, spec: spec)
+    }
+
+    /// Add a picked picture to the workspace as a mask or grain; the
+    /// asset id, or `nil` when it could not be made small enough.
+    func importAsset(_ image: UIImage, name: String, kind: AssetKind) throws -> String? {
+        guard let core, let png = AssetImport.greyscalePNG(image) else { return nil }
+        let id = try core.putAsset(name: name, kind: kind, png: png)
+        InkAssets.shared.setShared(core.listAssets())
+        return id
     }
 
     /// The workspace library as the core reports it (`brushesChanged`).

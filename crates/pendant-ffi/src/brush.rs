@@ -174,7 +174,109 @@ pub fn brush_with_knobs(spec: Vec<u8>, knobs: BrushKnobs) -> Vec<u8> {
     }
 }
 
-/// Every brush bundled with the app (a crayon and a grainy pencil).
+/// An image asset a brush samples: greyscale PNG bytes, a tip mask or a
+/// paper grain, keyed by the content hash of the bytes.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AssetInfo {
+    pub id: String,
+    pub name: String,
+    pub kind: AssetKind,
+    pub png: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum AssetKind {
+    /// Sampled over a dab, clamped; white is ink.
+    Mask,
+    /// Tiled over the canvas or the stroke; white takes ink.
+    Grain,
+}
+
+impl From<pcore::Asset> for AssetInfo {
+    fn from(a: pcore::Asset) -> Self {
+        Self {
+            id: a.id.0,
+            name: a.name,
+            kind: match a.kind {
+                pcore::AssetKind::Mask => AssetKind::Mask,
+                pcore::AssetKind::Grain => AssetKind::Grain,
+            },
+            png: a.png,
+        }
+    }
+}
+
+impl From<AssetKind> for pcore::AssetKind {
+    fn from(k: AssetKind) -> Self {
+        match k {
+            AssetKind::Mask => Self::Mask,
+            AssetKind::Grain => Self::Grain,
+        }
+    }
+}
+
+/// The image assets bundled with the app (a paper grain and a chalk
+/// mask); the workspace library adds to them (`Core.list_assets`).
+#[uniffi::export]
+pub fn builtin_assets() -> Vec<AssetInfo> {
+    pcore::BrushSpec::builtin_assets()
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+/// The asset ids an encoded spec samples (mask, grain), for a renderer
+/// to check it has them.
+#[uniffi::export]
+pub fn brush_assets(spec: Vec<u8>) -> Vec<String> {
+    pcore::BrushSpec::decode(&spec)
+        .map(|s| s.assets().into_iter().map(|a| a.0).collect())
+        .unwrap_or_default()
+}
+
+/// `spec` with its tip mask set to `asset` (`None` for the plain shape),
+/// re-encoded; unchanged when it does not decode.
+#[uniffi::export]
+pub fn brush_with_mask(spec: Vec<u8>, asset: Option<String>) -> Vec<u8> {
+    let Ok(mut s) = pcore::BrushSpec::decode(&spec) else {
+        return spec;
+    };
+    s.tip.mask = match asset {
+        Some(id) => pcore::Mask::Image(pcore::AssetId(id)),
+        None => pcore::Mask::Shape,
+    };
+    s.encode().unwrap_or(spec)
+}
+
+/// `spec` with its grain texture set to `asset` (`None` for noise; adds
+/// canvas grain at strength 0.5 when the spec had none), re-encoded.
+#[uniffi::export]
+pub fn brush_with_grain_image(spec: Vec<u8>, asset: Option<String>) -> Vec<u8> {
+    let Ok(mut s) = pcore::BrushSpec::decode(&spec) else {
+        return spec;
+    };
+    let source = match asset {
+        Some(id) => pcore::GrainSource::Image(pcore::AssetId(id)),
+        None => pcore::GrainSource::Noise,
+    };
+    let scale = if matches!(source, pcore::GrainSource::Image(_)) {
+        48.0
+    } else {
+        1.5
+    };
+    s.paint.grain = Some(match s.paint.grain.take() {
+        Some(g) => pcore::Grain { source, ..g },
+        None => pcore::Grain {
+            source,
+            mapping: pcore::GrainMapping::Canvas,
+            scale,
+            strength: 0.5,
+        },
+    });
+    s.encode().unwrap_or(spec)
+}
+
+/// Every brush bundled with the app (a crayon, a grainy pencil, a chalk).
 #[uniffi::export]
 pub fn builtin_brushes() -> Vec<BuiltinBrush> {
     pcore::BrushSpec::builtins()
@@ -357,7 +459,7 @@ pub enum Overlap {
 }
 
 /// Everything a renderer applies per stroke rather than per vertex.
-#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct InkStyle {
     /// RGBA8 packed big-endian: 0xRRGGBBAA.
     pub color: u32,
@@ -375,7 +477,7 @@ pub struct InkStyle {
 }
 
 /// How the fragment shader shapes the ink inside the triangles.
-#[derive(Debug, Clone, Copy, PartialEq, uniffi::Enum)]
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
 pub enum MaskStyle {
     /// The triangles are the ink; `v` is the side in -1..=1 and a soft tip
     /// feathers the outer band (mask kind 3 in the style flags).
@@ -383,6 +485,10 @@ pub enum MaskStyle {
     /// Each quad is one dab in tip space `[-1, 1]²`; keep the rounded
     /// superellipse with this corner radius (mask kind 1).
     Shape { corner: f32 },
+    /// Each quad is one dab; sample the greyscale asset over it (mask kind
+    /// 2, `maskLayer` = the asset's layer). Without the asset draw
+    /// `Shape { corner }`.
+    Image { asset: String, corner: f32 },
 }
 
 /// What the grain texture is anchored to.
@@ -394,9 +500,14 @@ pub enum GrainMapping {
     Stroke,
 }
 
-/// Value-noise grain: `mix(1, noise(anchor / scale, seed), strength)`.
-#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+/// Grain: `mix(1, texture(anchor / scale), strength)` where the texture is
+/// value noise seeded by `seed` (grain kind 1) or, when `image` is set and
+/// the renderer has it, that asset tiled (grain kind 2, `grainLayer` = its
+/// layer).
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct GrainStyle {
+    /// Asset id of a tileable greyscale image; `None` for noise.
+    pub image: Option<String>,
     pub mapping: GrainMapping,
     /// Cell size in canvas units.
     pub scale: f32,
@@ -423,8 +534,13 @@ impl From<pcore::InkStyle> for InkStyle {
             mask: match s.mask {
                 pcore::MaskStyle::Ribbon => MaskStyle::Ribbon,
                 pcore::MaskStyle::Shape { corner } => MaskStyle::Shape { corner },
+                pcore::MaskStyle::Image { asset, corner } => MaskStyle::Image {
+                    asset: asset.0,
+                    corner,
+                },
             },
             grain: s.grain.map(|g| GrainStyle {
+                image: g.image.map(|a| a.0),
                 mapping: match g.mapping {
                     pcore::GrainMapping::Canvas => GrainMapping::Canvas,
                     pcore::GrainMapping::Stroke => GrainMapping::Stroke,

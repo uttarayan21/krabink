@@ -229,6 +229,29 @@ final class SketchModel {
     /// erases, anything else is ignored.
     /// What the picker selected: ink, or the eraser.
     var picked: PickedTool
+
+    /// The id of the custom brush the pen draws with, if any.
+    var activeCustomBrush: String? {
+        if case .ink(let selection) = picked { return selection.brush.custom?.id }
+        return nil
+    }
+
+    /// Draw with a library brush at the current colour and width (the
+    /// iOS 17 sheet; iOS 18 goes through the picker's custom items).
+    func pick(custom brush: LibraryBrush) {
+        var color: UInt32 = 0x0000_00FF
+        var width: Float = 8
+        if case .ink(let current) = picked {
+            color = current.color | 0xff
+            width = current.brush.baseWidth
+        }
+        picked = .ink(
+            BrushSelection(
+                brush: BrushRef(
+                    tool: brush.tool, baseWidth: width,
+                    custom: CustomBrush(id: brush.id, spec: brush.spec)),
+                color: color))
+    }
     /// `-tool <pen|pencil|marker|monoline|fountain|crayon>` pins the tool
     /// and skips the picker (UI tests).
     let toolOverride: BrushSelection?
@@ -968,6 +991,7 @@ final class SketchCanvasView: UIView, UIScrollViewDelegate {
 struct SketchScreen: View {
     let model: SketchModel
     let done: () -> Void
+    @State private var showBrushes = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -976,6 +1000,19 @@ struct SketchScreen: View {
                     .font(.system(size: 13, design: .monospaced))
                     .accessibilityIdentifier("sketchStatus")
                 Spacer()
+                if #unavailable(iOS 18.0) {
+                    if let active = model.activeCustomBrush {
+                        Text(BrushLibrary.shared.brush(id: active)?.name ?? active)
+                            .font(.caption)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Capsule().fill(Color.accentColor.opacity(0.2)))
+                            .accessibilityIdentifier("activeBrush")
+                    }
+                    Button("brushes") { showBrushes = true }
+                        .accessibilityIdentifier("brushes")
+                        .sheet(isPresented: $showBrushes) { BrushSheet(model: model) }
+                }
                 Button("erase last") { model.eraseLast() }
                     .accessibilityIdentifier("eraseLast")
                 Button("done") { done() }

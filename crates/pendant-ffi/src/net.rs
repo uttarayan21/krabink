@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
+use crate::brush::AssetInfo;
 use crate::engine::{CoreListener, NoteListener, Shared, SyncTarget};
 use crate::types::{BrushInfo, NoteInfo, SyncState, rgba_to_u32};
 
@@ -462,6 +463,7 @@ fn dispatch_wet(shared: &Shared, doc: DocKey, payload: &[u8]) {
 enum Notify {
     Notes(Arc<dyn CoreListener>, Vec<NoteInfo>),
     Brushes(Arc<dyn CoreListener>, Vec<BrushInfo>),
+    Assets(Arc<dyn CoreListener>, Vec<AssetInfo>),
     Text(Arc<dyn NoteListener>, String),
     Strokes(Arc<dyn NoteListener>, String),
 }
@@ -471,6 +473,7 @@ impl Notify {
         match self {
             Self::Notes(listener, notes) => listener.notes_changed(notes),
             Self::Brushes(listener, brushes) => listener.brushes_changed(brushes),
+            Self::Assets(listener, assets) => listener.assets_changed(assets),
             Self::Text(listener, text) => listener.text_changed(text),
             Self::Strokes(listener, sketch) => listener.strokes_changed(sketch),
         }
@@ -507,7 +510,15 @@ impl ClientDocs for Docs<'_> {
                     .into_iter()
                     .map(Into::into)
                     .collect();
-                self.pending.push(Notify::Brushes(listener, brushes));
+                self.pending
+                    .push(Notify::Brushes(listener.clone(), brushes));
+                let assets = state
+                    .workspace
+                    .assets()
+                    .into_iter()
+                    .map(|a| a.asset.into())
+                    .collect();
+                self.pending.push(Notify::Assets(listener, assets));
             }
             return Ok(());
         }

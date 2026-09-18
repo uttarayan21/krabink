@@ -1,7 +1,6 @@
 # Brush engine: stamp/texture brushes for Pendant
 
-Status: P0–P3 implemented (notes at the end; P3 without image assets);
-P4 planned.
+Status: P0–P3 implemented (notes at the end); P4 planned.
 
 ## Context
 
@@ -565,14 +564,50 @@ iOS:
   sketch is reopened.
 - Brush lab rows for the two bundled brushes.
 
-Not done in P3: `Mask::Image` / `GrainSource::Image` with the workspace
-`assets` map, PNG import and the texture arrays on both renderers
-(procedural noise and shape masks cover the bundled brushes); the iOS 17
-`BrushSheet` fallback (custom items need iOS 18; on 17 the crayon still
-draws with the bundled brush, the grainy pencil is not offered); the
-`LiveInk` mesh delta (`GPUGeometry.append/truncate`): a stamped stroke at
-spacing 0.15 re-uploads a few thousand quads per frame, which has not
-shown up in the redraw timings. The popover's "Save to library" writes
-the current knobs as a new `user:` brush to the workspace (and "Delete
-from library" removes one); there is no separate brush editor beyond the
-knobs.
+The popover's "Save to library" writes the current knobs as a new `user:`
+brush to the workspace (and "Delete from library" removes one); there is
+no separate brush editor beyond the knobs.
+
+Image assets (second P3 slice):
+
+- `AssetId::of(png)` is `a:` + FNV-1a 64 of the bytes, so the same
+  picture is one asset everywhere and a stroke names exactly the pixels
+  it was drawn with. `Asset { id, name, kind: Mask | Grain, png }`,
+  `Asset::from_png` checks the PNG signature and `MAX_ASSET_BYTES` (64 KiB).
+  `Tip.mask: Mask { Shape | Image(AssetId) }` (images only apply to
+  stamped brushes), `GrainSource::Image(AssetId)`; `SPEC_VERSION` 4.
+  `InkStyle.mask` gains `Image { asset, corner }`, `GrainStyle.image`.
+  Two PNGs are embedded in the core (`assets/paper.png` 256² tileable
+  grain, `assets/chalk.png` 128² rough disc) and `builtin:chalk` samples
+  both with rotation jitter π.
+- Workspace `assets` LoroMap (`AssetMeta { asset, added_ms }`,
+  `put_asset` is idempotent on the id, `asset_ids()` is the cheap poll),
+  FFI `list_assets` / `put_asset` / `remove_asset`, `builtin_assets`,
+  `brush_assets(spec)`, `brush_with_mask`, `brush_with_grain_image`,
+  `CoreListener.assets_changed`; the relay test syncs an add and a
+  removal and rejects junk bytes.
+- Renderers: two `r8` texture arrays, masks 256² clamped and grains 512²
+  repeating, both mipmapped (desktop: CPU box mips in `ink_assets.rs`
+  with the `image` crate decoding; iOS: `InkAssets` draws the PNG into a
+  grey `CGContext` and `generateMipmaps`). Style flags: mask kind 2 with
+  `maskLayer`, grain kind 2 (bit value 8) with `grainLayer`; an asset the
+  arrays lack falls back to shape / noise at style-build time. Under
+  Discard an image mask keeps a fragment with probability equal to its
+  coverage (same stipple hash as the edges). The desktop restyles every
+  stroke of a scene when the asset generation changes; iOS marks the batch
+  dirty and re-meshes wet strokes on `InkAssets.didChange`. The WGSL
+  samples both arrays in uniform control flow before the mask switch.
+- iOS popover: "tip mask" and "paper" menus over the assets of each kind
+  (plus shape / noise), persisted per brush as `brush.<id>.mask|grain`,
+  and "Import…" which files a picked picture into the workspace as a
+  greyscale PNG shrunk until it fits 64 KiB.
+
+iOS 17: `BrushSheet` (a "brushes" button in the sketch toolbar, shown
+only below iOS 18) lists the library with each brush drawn as its icon;
+picking one sets the pen to it at the picker's last colour and width and
+a pill names it; any PencilKit tool switches back. Compiled, not run: the
+simulator and the iPad are on 18.
+
+Not done in P3: the `LiveInk` mesh delta (`GPUGeometry.append/truncate`):
+a stamped stroke at spacing 0.15 re-uploads a few thousand quads per
+frame, which has not shown up in the redraw timings.

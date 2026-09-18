@@ -1,7 +1,7 @@
 //! The mesh every renderer draws: triangles in canvas space with the
 //! per-vertex attributes a brush shader needs, plus the per-stroke style.
 
-use crate::brush::{Blend, Emit, GrainMapping, Overlap, Paint, Tip};
+use crate::brush::{AssetId, Blend, Emit, GrainMapping, GrainSource, Mask, Overlap, Paint, Tip};
 use crate::stroke::Rgba;
 
 /// One mesh vertex.
@@ -20,7 +20,7 @@ pub struct InkVertex {
 }
 
 /// Everything a renderer applies per stroke rather than per vertex.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InkStyle {
     pub color: Rgba,
     /// 0..=1, multiplied into `color`'s alpha and every vertex opacity.
@@ -37,7 +37,7 @@ pub struct InkStyle {
 }
 
 /// How the fragment shader shapes the ink inside the triangles.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MaskStyle {
     /// The triangles are the ink: `v` is the side, and a soft tip feathers
     /// the outer band of `|v|`.
@@ -46,12 +46,18 @@ pub enum MaskStyle {
     /// superellipse with this corner radius (0 square … 1 ellipse) and
     /// drops the rest.
     Shape { corner: f32 },
+    /// Each quad is one dab in tip space; the shader samples this
+    /// greyscale image over it (white is ink). A renderer without the
+    /// asset falls back to `Shape` with `corner`.
+    Image { asset: AssetId, corner: f32 },
 }
 
-/// Procedural grain as the shader evaluates it (see
-/// [`crate::brush::Grain`]).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Grain as the shader evaluates it (see [`crate::brush::Grain`]).
+#[derive(Debug, Clone, PartialEq)]
 pub struct GrainStyle {
+    /// A tileable greyscale image, or `None` for procedural value noise.
+    /// A renderer without the asset falls back to noise.
+    pub image: Option<AssetId>,
     pub mapping: GrainMapping,
     /// Cell size in canvas units.
     pub scale: f32,
@@ -75,7 +81,11 @@ impl InkStyle {
     };
 
     pub(crate) fn of(color: Rgba, tip: &Tip, emit: Emit, paint: &Paint, seed: u32) -> Self {
-        let grain = paint.grain.map(|g| GrainStyle {
+        let grain = paint.grain.as_ref().map(|g| GrainStyle {
+            image: match &g.source {
+                GrainSource::Noise => None,
+                GrainSource::Image(id) => Some(id.clone()),
+            },
             mapping: g.mapping,
             scale: g.scale.max(1e-3),
             strength: g.strength.clamp(0.0, 1.0),
@@ -90,9 +100,13 @@ impl InkStyle {
             blend: paint.blend,
             overlap: paint.overlap,
             hardness: tip.hardness.clamp(0.0, 1.0),
-            mask: match emit {
-                Emit::Continuous => MaskStyle::Ribbon,
-                Emit::Stamped(_) => MaskStyle::Shape {
+            mask: match (emit, &tip.mask) {
+                (Emit::Continuous, _) => MaskStyle::Ribbon,
+                (Emit::Stamped(_), Mask::Shape) => MaskStyle::Shape {
+                    corner: tip.corner.clamp(0.0, 1.0),
+                },
+                (Emit::Stamped(_), Mask::Image(id)) => MaskStyle::Image {
+                    asset: id.clone(),
                     corner: tip.corner.clamp(0.0, 1.0),
                 },
             },

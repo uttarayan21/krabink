@@ -68,6 +68,22 @@ func createAndEdit(dir: String) throws -> (note: String, sketch: String, stroke:
     }
     try note.finishShape(sketch: sketch, shape: shape)
 
+    // Bundled image assets: content-hashed PNGs, the chalk brush samples two of them.
+    let assets = builtinAssets()
+    guard assets.count == 2, assets.allSatisfy({ $0.png.count <= 64 * 1024 }) else { fatalError("assets") }
+    let chalkSpec = builtinBrushes().first { $0.id == "builtin:chalk" }!.spec
+    guard brushAssets(spec: chalkSpec).count == 2 else { fatalError("chalk assets") }
+    let chalkStyle = pointsMesh(
+        points: [StrokePoint(x: 0, y: 0, force: 0.5, tMs: 0, tilt: nil, size: nil)],
+        brush: BrushRef(tool: .pencil, baseWidth: 8, custom: CustomBrush(id: "builtin:chalk", spec: chalkSpec)),
+        color: 0xFF, end: .complete, tolerance: defaultTolerance()
+    ).style
+    guard case .image = chalkStyle.mask, chalkStyle.grain?.image != nil else { fatalError("chalk style: \(chalkStyle)") }
+    let plain = brushWithMask(spec: brushWithGrainImage(spec: chalkSpec, asset: nil), asset: nil)
+    guard brushAssets(spec: plain).isEmpty else { fatalError("asset removal") }
+    let paperId = try core.putAsset(name: "paper again", kind: .grain, png: assets[0].png)
+    guard paperId == assets[0].id else { fatalError("asset id is the content hash") }
+
     // A bundled stamped brush: dabs masked in the shader, spec snapshotted on the stroke.
     let builtins = builtinBrushes()
     guard let crayon = builtins.first(where: { $0.id == "builtin:crayon" }) else { fatalError("no crayon") }

@@ -33,9 +33,10 @@ pub use dynamics::{StrokeEnd, TipEvaluator, TipState};
 pub(crate) use input::distance;
 pub use input::{EmaModel, Estimate, InputParams, RawSample};
 pub use spec::{
-    BUILTIN_CRAYON, BUILTIN_PENCIL_GRAINY, Behavior, Blend, BrushId, BrushKnobs, BrushSpec,
-    BuiltinBrush, Curve, CustomBrush, Emit, Grain, GrainMapping, GrainSource, Orient, Overlap,
-    Paint, Source, Stamped, Target, Tip,
+    Asset, AssetId, AssetKind, BUILTIN_CHALK, BUILTIN_CRAYON, BUILTIN_PENCIL_GRAINY, Behavior,
+    Blend, BrushId, BrushKnobs, BrushSpec, BuiltinBrush, Curve, CustomBrush, Emit, Grain,
+    GrainMapping, GrainSource, MAX_ASSET_BYTES, Mask, Orient, Overlap, Paint, Source, Stamped,
+    Target, Tip,
 };
 
 use crate::stroke::{StrokePoint, Tilt, Tool};

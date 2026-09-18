@@ -32,10 +32,11 @@ mod wetink;
 mod workspace;
 
 pub use brush::{
-    BUILTIN_CRAYON, BUILTIN_PENCIL_GRAINY, Behavior, Blend, BrushId, BrushKnobs, BrushModeler,
-    BrushSpec, BuiltinBrush, Curve, CustomBrush, EmaModel, Emit, Estimate, Grain, GrainMapping,
-    GrainSource, InputParams, Orient, Overlap, Paint, RawSample, Source, Stamped, StrokeEnd,
-    Target, Tip, TipEvaluator, TipState,
+    Asset, AssetId, AssetKind, BUILTIN_CHALK, BUILTIN_CRAYON, BUILTIN_PENCIL_GRAINY, Behavior,
+    Blend, BrushId, BrushKnobs, BrushModeler, BrushSpec, BuiltinBrush, Curve, CustomBrush,
+    EmaModel, Emit, Estimate, Grain, GrainMapping, GrainSource, InputParams, MAX_ASSET_BYTES, Mask,
+    Orient, Overlap, Paint, RawSample, Source, Stamped, StrokeEnd, Target, Tip, TipEvaluator,
+    TipState,
 };
 pub use element::{Binding, Element, ShapeElement, Style};
 pub use export::{ExportAsset, ExportBundle, SKETCH_URI_PREFIX, elements_to_svg};
@@ -56,7 +57,7 @@ pub use sync::{
 };
 pub use sync_doc::SyncDoc;
 pub use wetink::WetInk;
-pub use workspace::{BrushMeta, DeviceMeta, NoteMeta, WorkspaceDoc};
+pub use workspace::{AssetMeta, BrushMeta, DeviceMeta, NoteMeta, WorkspaceDoc};
 
 /// Errors produced by the core document model.
 #[derive(Debug, thiserror::Error)]

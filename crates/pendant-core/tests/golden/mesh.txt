@@ -9,3 +9,4 @@ fountain-s-curve vertices=353 indices=705 fnv=2cebfc60ec2851e9
 crayon-s-curve vertices=696 indices=1044 fnv=f3c40e23803ac094
 crayon-dot vertices=4 indices=6 fnv=52b4384db4a6a191
 pencil-grainy-hairpin vertices=576 indices=864 fnv=61bceb2c13b8655a
+chalk-slow-line vertices=84 indices=126 fnv=cd6fe3337786fb85

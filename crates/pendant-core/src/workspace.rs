@@ -4,7 +4,7 @@
 use loro::{ExportMode, LoroDoc, LoroMap, LoroValue, ValueOrContainer};
 use serde::{Deserialize, Serialize};
 
-use crate::brush::BrushId;
+use crate::brush::{Asset, AssetId, AssetKind, BrushId};
 use crate::{NoteId, Result};
 
 /// Entry in the note registry.
@@ -43,6 +43,15 @@ pub struct BrushMeta {
     pub updated_ms: u64,
 }
 
+/// Entry in the asset library: a greyscale PNG a brush can sample as a
+/// tip mask or a paper grain, keyed by its content hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetMeta {
+    pub asset: Asset,
+    /// Unix millis when it was added.
+    pub added_ms: u64,
+}
+
 /// CRDT doc listing every note in the library.
 pub struct WorkspaceDoc {
     doc: LoroDoc,
@@ -51,6 +60,7 @@ pub struct WorkspaceDoc {
 const NOTES: &str = "notes";
 const DEVICES: &str = "devices";
 const BRUSHES: &str = "brushes";
+const ASSETS: &str = "assets";
 
 impl WorkspaceDoc {
     pub fn new() -> Self {
@@ -219,6 +229,86 @@ impl WorkspaceDoc {
         out
     }
 
+    /// Add an asset; re-adding the same bytes is a no-op.
+    pub fn put_asset(&self, meta: &AssetMeta) -> Result<()> {
+        let assets = self.doc.get_map(ASSETS);
+        if assets.get(&meta.asset.id.0).is_some() {
+            return Ok(());
+        }
+        let entry = assets.insert_container(&meta.asset.id.0, LoroMap::new())?;
+        entry.insert("name", meta.asset.name.as_str())?;
+        entry.insert(
+            "kind",
+            match meta.asset.kind {
+                AssetKind::Mask => "mask",
+                AssetKind::Grain => "grain",
+            },
+        )?;
+        entry.insert("png", LoroValue::Binary(meta.asset.png.clone().into()))?;
+        entry.insert("added", meta.added_ms as i64)?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    pub fn remove_asset(&self, id: &AssetId) -> Result<()> {
+        self.doc.get_map(ASSETS).delete(&id.0)?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// The ids of every asset, cheap to poll for changes.
+    pub fn asset_ids(&self) -> Vec<AssetId> {
+        let mut ids: Vec<AssetId> = self
+            .doc
+            .get_map(ASSETS)
+            .keys()
+            .map(|k| AssetId(k.to_string()))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Every asset, newest first.
+    pub fn assets(&self) -> Vec<AssetMeta> {
+        let assets = self.doc.get_map(ASSETS);
+        let mut out: Vec<AssetMeta> = assets
+            .keys()
+            .filter_map(|key| {
+                let entry = match assets.get(&key)? {
+                    ValueOrContainer::Container(c) => c.into_map().ok()?,
+                    ValueOrContainer::Value(_) => return None,
+                };
+                let get = |k: &str| entry.get(k);
+                let string = |v: ValueOrContainer| match v {
+                    ValueOrContainer::Value(LoroValue::String(s)) => Some(s.to_string()),
+                    _ => None,
+                };
+                let kind = match string(get("kind")?)?.as_str() {
+                    "mask" => AssetKind::Mask,
+                    "grain" => AssetKind::Grain,
+                    _ => return None,
+                };
+                Some(AssetMeta {
+                    asset: Asset {
+                        id: AssetId(key.to_string()),
+                        name: string(get("name")?)?,
+                        kind,
+                        png: match get("png")? {
+                            ValueOrContainer::Value(LoroValue::Binary(b)) => b.to_vec(),
+                            _ => return None,
+                        },
+                    },
+                    added_ms: match get("added")? {
+                        ValueOrContainer::Value(LoroValue::I64(v)) => v as u64,
+                        _ => 0,
+                    },
+                })
+            })
+            .collect();
+        out.sort_by_key(|a| std::cmp::Reverse(a.added_ms));
+        out
+    }
+
     // Same sync surface as NoteDoc.
 
     pub fn version(&self) -> Vec<u8> {
@@ -321,6 +411,30 @@ mod tests {
         b.import_update(&a.export_updates_since(&b.version()).unwrap())
             .unwrap();
         assert_eq!(b.brushes().len(), 1);
+    }
+
+    #[test]
+    fn asset_library_roundtrip() {
+        let a = WorkspaceDoc::new();
+        let paper = crate::BrushSpec::builtin_assets().remove(0);
+        let meta = AssetMeta {
+            asset: paper.clone(),
+            added_ms: 3,
+        };
+        a.put_asset(&meta).unwrap();
+        a.put_asset(&AssetMeta {
+            added_ms: 9,
+            ..meta.clone()
+        })
+        .unwrap();
+        let b = WorkspaceDoc::new();
+        b.import_update(&a.export_updates_since(&[]).unwrap())
+            .unwrap();
+        assert_eq!(b.assets(), vec![meta.clone()], "same bytes are one asset");
+        b.remove_asset(&paper.id).unwrap();
+        a.import_update(&b.export_updates_since(&a.version()).unwrap())
+            .unwrap();
+        assert!(a.assets().is_empty());
     }
 
     #[test]

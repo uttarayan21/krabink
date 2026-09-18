@@ -5649,6 +5649,7 @@ dependencies = [
  "futures",
  "gethostname 0.5.0",
  "if-addrs",
+ "image",
  "mdns-sd",
  "pendant-core",
  "pendant-server",

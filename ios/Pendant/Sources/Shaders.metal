@@ -103,9 +103,15 @@ static float value_noise(float2 p, uint s)
 
 fragment float4 ink_fragment(V2F in [[stage_in]],
                              constant StrokeStyle *styles [[buffer(0)]],
-                             constant Uniforms &u [[buffer(1)]])
+                             constant Uniforms &u [[buffer(1)]],
+                             texture2d_array<float> masks [[texture(0)]],
+                             texture2d_array<float> grains [[texture(1)]],
+                             sampler clampMip [[sampler(0)]],
+                             sampler repeatMip [[sampler(1)]])
 {
     StrokeStyle s = styles[in.stroke];
+    float2 grainAnchor = (s.flags & FLAG_GRAIN_STROKE) ? in.uv : in.canvas;
+    float2 grainP = grainAnchor / max(s.grain.x, 1e-3);
     float m = 1.0;
     switch (s.flags & MASK_KIND) {
         case 1u: {
@@ -122,6 +128,19 @@ fragment float4 ink_fragment(V2F in [[stage_in]],
                     discard_fragment();
             } else {
                 m = 1.0 - smoothstep(-w, 0.0, d);
+            }
+            break;
+        }
+        case 2u: {
+            // Greyscale image over the dab, white is ink. Write-once ink
+            // cannot carry partial coverage, so it keeps a fragment with
+            // probability equal to the coverage instead.
+            if (any(abs(in.uv) > 1.0)) discard_fragment();
+            float cover = masks.sample(clampMip, in.uv * 0.5 + 0.5, s.maskLayer).r;
+            if (s.flags & FLAG_DISCARD) {
+                if (lattice(floor(in.canvas / EDGE_CELL), EDGE_SEED) > cover) discard_fragment();
+            } else {
+                m = cover;
             }
             break;
         }
@@ -146,10 +165,13 @@ fragment float4 ink_fragment(V2F in [[stage_in]],
         default: break;
     }
     float g = 1.0;
-    if ((s.flags & GRAIN_KIND) == 4u) {
-        float2 p = ((s.flags & FLAG_GRAIN_STROKE) ? in.uv : in.canvas) / max(s.grain.x, 1e-3);
-        float n = value_noise(p, s.grainLayer);
+    uint grainKind = s.flags & GRAIN_KIND;
+    if (grainKind == 4u) {
+        float n = value_noise(grainP, s.grainLayer);
         g = mix(1.0, n, s.grain.y * saturate(s.grain.x * u.zoom / 1.5));
+    } else if (grainKind == 8u) {
+        // Mipmapped, so no fade is needed as the view zooms out.
+        g = mix(1.0, grains.sample(repeatMip, grainP, s.grainLayer).r, s.grain.y);
     }
     float a = s.color.a * in.opacity * m * g;
     if (a < 1.0 / 255.0) discard_fragment();

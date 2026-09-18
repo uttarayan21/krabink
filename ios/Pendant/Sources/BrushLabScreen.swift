@@ -46,6 +46,7 @@ enum LabStroke {
             (.monoline, .monoline, nil), (.fountain, .fountainPen, nil),
             (.pencil, .crayon, custom("builtin:crayon")),
             (.pencil, .pencil, custom("builtin:pencil-grainy")),
+            (.pencil, .pencil, custom("builtin:chalk")),
         ]
     }()
 

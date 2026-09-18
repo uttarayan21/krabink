@@ -13,8 +13,9 @@ mod net;
 mod types;
 
 pub use brush::{
-    Blend, BrushKnobs, BrushModeler, BrushRef, BuiltinBrush, CustomBrush, INK_VERTEX_FLOATS,
-    InkMesh, InkStyle, MaskStyle, Overlap, RawSample, StrokeEnd, builtin_brushes,
+    AssetInfo, AssetKind, Blend, BrushKnobs, BrushModeler, BrushRef, BuiltinBrush, CustomBrush,
+    INK_VERTEX_FLOATS, InkMesh, InkStyle, MaskStyle, Overlap, RawSample, StrokeEnd, builtin_assets,
+    builtin_brushes,
 };
 pub use engine::{Core, CoreListener, NoteListener, NoteSession, PendantError};
 pub use types::{

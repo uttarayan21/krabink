@@ -75,16 +75,23 @@ struct StrokeStyle {
 
     /// Mask kind 1: rounded superellipse in tip space (stamped dabs).
     static let maskShape: UInt32 = 1
+    /// Mask kind 2: the masks array layer `maskLayer` over tip space.
+    static let maskImage: UInt32 = 2
     static let maskEdge: UInt32 = 3
     /// Grain kind 1: value noise seeded by `grainLayer`.
     static let grainNoise: UInt32 = 4
+    /// Grain kind 2: the grains array layer `grainLayer`, tiled.
+    static let grainImage: UInt32 = 8
     /// Grain follows the stroke's own uv rather than the canvas.
     static let grainStroke: UInt32 = 16
     static let multiply: UInt32 = 32
     static let discard: UInt32 = 64
     static let stride = MemoryLayout<StrokeStyle>.stride
 
-    init(_ style: InkStyle, depth: Float) {
+    /// `assets` resolves image masks and grains to array layers; one the
+    /// arrays lack falls back to the shape mask or value noise.
+    @MainActor
+    init(_ style: InkStyle, depth: Float, assets: InkAssets = .shared) {
         let c = Self.linearColor(style.color)
         color = SIMD4(c.x, c.y, c.z, c.w * style.opacity)
         self.depth = depth
@@ -96,13 +103,26 @@ struct StrokeStyle {
         case .shape(let corner):
             mask = SIMD4(1, corner, style.hardness, 0)
             flags |= Self.maskShape
+        case .image(let asset, let corner):
+            mask = SIMD4(1, corner, style.hardness, 0)
+            if let layer = assets.maskLayer(asset) {
+                maskLayer = layer
+                flags |= Self.maskImage
+            } else {
+                flags |= Self.maskShape
+            }
         }
         if style.blend == .multiply { flags |= Self.multiply }
         if style.overlap == .discard { flags |= Self.discard }
         if let g = style.grain {
             grain = SIMD4(g.scale, g.strength, 0, 0)
-            grainLayer = g.seed
-            flags |= Self.grainNoise
+            if let image = g.image, let layer = assets.grainLayer(image) {
+                grainLayer = layer
+                flags |= Self.grainImage
+            } else {
+                grainLayer = g.seed
+                flags |= Self.grainNoise
+            }
             if g.mapping == .stroke { flags |= Self.grainStroke }
         } else {
             grain = .zero
@@ -156,6 +176,7 @@ struct InkGeometry {
 
     init() {}
 
+    @MainActor
     init(_ mesh: InkMesh, depth: Float) {
         append(mesh, depth: depth)
     }
@@ -164,6 +185,7 @@ struct InkGeometry {
     /// the vertices so far. Extends the last run when the pipeline state
     /// matches, so consecutive same-brush strokes are one draw. The mesh
     /// arrives as little-endian bytes; they are copied, not decoded.
+    @MainActor
     mutating func append(_ mesh: InkMesh, depth: Float) {
         let count = Int(mesh.vertexCount)
         let indexCount = Int(mesh.indexCount)
@@ -386,6 +408,20 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         local = GPUGeometry(device: device)
         hover = GPUGeometry(device: device)
         super.init()
+        // New texture arrays move layers: restyle everything on screen.
+        assetsObserver = NotificationCenter.default.addObserver(
+            forName: InkAssets.didChange, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.assetsChanged() }
+        }
+    }
+
+    private var assetsObserver: NSObjectProtocol?
+
+    private func assetsChanged() {
+        batchDirty = true
+        for id in wetOrder { remeshWet(id) }
+        needsDisplay()
     }
 
     /// Mirrors `VertexIn` in Shaders.metal: buffer 0 is the core's
@@ -752,6 +788,11 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         let highlighter = dark ? psoScreen : psoMultiply
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
+        let assets = InkAssets.shared
+        encoder.setFragmentTexture(assets.masks, index: 0)
+        encoder.setFragmentTexture(assets.grains, index: 1)
+        encoder.setFragmentSamplerState(assets.clampSampler, index: 0)
+        encoder.setFragmentSamplerState(assets.repeatSampler, index: 1)
         body { geometry in
             guard
                 !geometry.isEmpty, let vertices = geometry.vertices,
