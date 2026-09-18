@@ -190,7 +190,9 @@ private enum StrokeRecorder {
         let device = UIDevice.current
         var text = "# pendant-stroke v2\n# expect: none\n"
         text += "# tool: \(selection.brush.tool) size: \(selection.brush.baseWidth)"
-        text += String(format: " color: %08x brush: preset\n", selection.color)
+        text += String(
+            format: " color: %08x brush: %@\n", selection.color,
+            selection.brush.custom?.id ?? "preset")
         text += "# device: \(device.model) ios: \(device.systemVersion) force: half-average"
         text += String(format: " zoom: %.2f\n", zoom)
         text += "# columns: x y force t_ms azimuth altitude roll est\n"
@@ -213,6 +215,8 @@ final class SketchModel {
     let sketchId: String
     /// Stroke elements on screen.
     var strokeCount = 0
+    /// Committed strokes drawn with a custom brush (status label, UI tests).
+    var customCount = 0
     /// Shape elements on screen.
     var shapeCount = 0
     /// Diagnostics surfaced in the status label (log capture on the sim is
@@ -223,10 +227,11 @@ final class SketchModel {
     var estUpdated = 0
     /// Selected in the PencilKit tool picker; inking tools draw, the eraser
     /// erases, anything else is ignored.
-    var tool: PKTool
+    /// What the picker selected: ink, or the eraser.
+    var picked: PickedTool
     /// `-tool <pen|pencil|marker|monoline|fountain|crayon>` pins the tool
     /// and skips the picker (UI tests).
-    let toolOverride: PKInkingTool?
+    let toolOverride: BrushSelection?
 
     private weak var canvas: SketchCanvasView?
     private var renderer: InkRenderer? { canvas?.renderer }
@@ -234,6 +239,8 @@ final class SketchModel {
     private var ids: [String] = []
     /// The subset of `ids` that are shapes.
     private var shapeIds: Set<String> = []
+    /// The subset of `ids` that are strokes with a custom brush.
+    private var customIds: Set<String> = []
     private var penDown = false
     private var pendingRefresh = false
     private var erasing = false
@@ -249,23 +256,11 @@ final class SketchModel {
         self.session = session
         self.sketchId = sketchId
         let name = UserDefaults.standard.string(forKey: "tool") ?? ""
-        let override = StrokeCodec.selection(named: name).map { _ in
-            PKInkingTool(Self.inkType(named: name), color: .black, width: 10)
-        }
+        let override = StrokeCodec.selection(named: name)
         toolOverride = override
-        tool = override ?? PKInkingTool(.pen, color: .black, width: 10)
+        picked = .ink(override ?? StrokeCodec.selection(named: "pen")!)
     }
 
-    private static func inkType(named name: String) -> PKInkingTool.InkType {
-        switch name {
-        case "pencil": .pencil
-        case "marker": .marker
-        case "monoline": .monoline
-        case "fountain", "fountainPen": .fountainPen
-        case "crayon": .crayon
-        default: .pen
-        }
-    }
 
     func attach(_ canvas: SketchCanvasView) {
         self.canvas = canvas
@@ -273,6 +268,7 @@ final class SketchModel {
         // fresh canvas + renderer, so forget what the old one showed.
         ids = []
         shapeIds = []
+        customIds = []
         canvas.renderer.removeAll()
         refreshFromCrdt()
         if UserDefaults.standard.bool(forKey: "figureEight"), !selfTestDone {
@@ -285,7 +281,7 @@ final class SketchModel {
     /// marker self-overlap UI test (XCUITest drags are straight lines).
     /// Lemniscate centred at (300, 300), crossing there, arm tip at (440, 300).
     private func drawFigureEight() {
-        guard let ink = tool as? PKInkingTool else { return }
+        guard case .ink(let selection) = picked else { return }
         let n = 240
         let samples = (0...n).map { i -> RawSample in
             let t = Float(i) / Float(n) * 2 * .pi
@@ -293,7 +289,7 @@ final class SketchModel {
                 x: 300 + 140 * sin(t), y: 300 + 140 * sin(t) * cos(t), force: 0.5,
                 tMs: Double(i) * 8, tilt: nil, estimationId: nil, expectsUpdate: false)
         }
-        beginStroke(StrokeCodec.selection(inking: ink), at: samples[0])
+        beginStroke(selection, at: samples[0])
         penMoved(coalesced: Array(samples.dropFirst()), predicted: [])
         penEnded(cancelled: false)
     }
@@ -301,6 +297,7 @@ final class SketchModel {
     private func updateCounts() {
         shapeCount = shapeIds.count
         strokeCount = ids.count - shapeCount
+        customCount = customIds.count
     }
 
     // MARK: pen input
@@ -308,13 +305,18 @@ final class SketchModel {
     func penBegan(_ sample: RawSample) {
         penDown = true
         renderer?.clearHover()
-        if let eraser = tool as? PKEraserTool {
+        let selection: BrushSelection
+        switch picked {
+        case .eraser(let eraser):
             erasing = true
             erase(at: sample, radius: Self.eraserRadius(eraser))
             return
+        case .ink(let ink):
+            // A custom brush may have been edited in its popover since
+            // the picker reported it.
+            selection = ink.refreshed()
         }
-        guard let ink = tool as? PKInkingTool else { return }
-        beginStroke(StrokeCodec.selection(inking: ink), at: sample)
+        beginStroke(selection, at: sample)
         flushTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: wetFlushInterval)
@@ -327,11 +329,10 @@ final class SketchModel {
         guard
             let id = try? session.beginStroke(
                 sketch: sketchId, tool: selection.brush.tool, color: selection.color,
-                baseWidth: selection.brush.baseWidth)
+                baseWidth: selection.brush.baseWidth, spec: selection.brush.custom?.spec)
         else { return }
         var stroke = LiveStroke(
-            id: id, modeler: BrushModeler(tool: selection.brush.tool, size: selection.brush.baseWidth),
-            selection: selection)
+            id: id, modeler: BrushModeler.forBrush(brush: selection.brush), selection: selection)
         stroke.wetBuffer = stroke.modeler.push(samples: [sample])
         if sample.expectsUpdate { stroke.estPushed += 1 }
         if StrokeRecorder.enabled { stroke.recording = [sample] }
@@ -344,7 +345,7 @@ final class SketchModel {
     /// is Apple's guess at the next few, drawn as a tail and discarded on
     /// the next event.
     func penMoved(coalesced: [RawSample], predicted: [RawSample]) {
-        if erasing, let eraser = tool as? PKEraserTool {
+        if erasing, case .eraser(let eraser) = picked {
             let radius = Self.eraserRadius(eraser)
             for sample in coalesced { erase(at: sample, radius: radius) }
             return
@@ -548,7 +549,7 @@ final class SketchModel {
             let committed = Stroke(
                 id: stroke.id, tool: stroke.brush.tool, color: stroke.color,
                 baseWidth: stroke.brush.baseWidth, kind: .polylineSample, points: points,
-                createdMs: createdMs)
+                createdMs: createdMs, brush: stroke.brush.custom)
             try? session.finishStroke(sketch: sketchId, stroke: committed, tail: tail)
             element = .stroke(committed)
         }
@@ -563,6 +564,7 @@ final class SketchModel {
         // `show` also drops the settling copy of the same id.
         renderer?.show(element, z: ids.count)
         ids.append(stroke.id)
+        if stroke.brush.custom != nil, stroke.shape == nil { customIds.insert(stroke.id) }
         updateCounts()
         grow()
     }
@@ -592,11 +594,10 @@ final class SketchModel {
     /// pen is down or the eraser is selected.
     func hover(_ sample: RawSample?) {
         guard let renderer else { return }
-        guard let sample, !penDown, let ink = tool as? PKInkingTool else {
+        guard let sample, !penDown, case .ink(let selection) = picked else {
             renderer.clearHover()
             return
         }
-        let selection = StrokeCodec.selection(inking: ink)
         let alpha = UInt32((Float(selection.color & 0xff) * hoverAlpha).rounded())
         renderer.setHover(
             mesh: hoverDabMesh(
@@ -632,6 +633,7 @@ final class SketchModel {
         for id in gone { renderer?.remove(id) }
         ids.removeAll { gone.contains($0) }
         shapeIds.subtract(gone)
+        customIds.subtract(gone)
         updateCounts()
     }
 
@@ -644,8 +646,11 @@ final class SketchModel {
 
     // MARK: inbound wet ink
 
-    func remoteWetBegin(stroke: String, tool: Tool, color: UInt32, baseWidth: Float) {
-        renderer?.wetBegin(stroke, brush: BrushRef(tool: tool, baseWidth: baseWidth), color: color)
+    func remoteWetBegin(stroke: String, tool: Tool, color: UInt32, baseWidth: Float, spec: Data?) {
+        // The id does not matter for meshing; the committed stroke brings its own.
+        let custom = spec.map { CustomBrush(id: "wet", spec: $0) }
+        renderer?.wetBegin(
+            stroke, brush: BrushRef(tool: tool, baseWidth: baseWidth, custom: custom), color: color)
     }
 
     func remoteWetPoints(stroke: String, points: [StrokePoint]) {
@@ -688,6 +693,7 @@ final class SketchModel {
         renderer?.remove(last)
         ids.removeLast()
         shapeIds.remove(last)
+        customIds.remove(last)
         updateCounts()
     }
 
@@ -701,6 +707,11 @@ final class SketchModel {
             ids = newIds
         }
         shapeIds = Set(crdt.filter(\.isShape).map(\.id))
+        customIds = Set(
+            crdt.compactMap { element in
+                if case .stroke(let s) = element, s.brush != nil { return s.id }
+                return nil
+            })
         // A committed element replaces its wet ink.
         for id in newIds where renderer.hasWet(id) { renderer.wetRemove(id) }
         updateCounts()
@@ -961,7 +972,7 @@ struct SketchScreen: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("strokes=\(model.strokeCount) shapes=\(model.shapeCount) wetSent=\(model.wetSent) wetRecv=\(model.wetRecv) est=\(model.estUpdated)")
+                Text("strokes=\(model.strokeCount) shapes=\(model.shapeCount) wetSent=\(model.wetSent) wetRecv=\(model.wetRecv) est=\(model.estUpdated) custom=\(model.customCount)")
                     .font(.system(size: 13, design: .monospaced))
                     .accessibilityIdentifier("sketchStatus")
                 Spacer()
@@ -1013,7 +1024,7 @@ struct SketchCanvas: UIViewRepresentable {
             picker.addObserver(context.coordinator)
             context.coordinator.picker = picker
             canvas.becomeFirstResponder()
-            if let selected = context.coordinator.selectedTool { model.tool = selected }
+            if let selected = context.coordinator.selectedPick { model.picked = selected }
         }
 
         model.attach(canvas)
@@ -1035,6 +1046,7 @@ struct SketchCanvas: UIViewRepresentable {
                 PKToolPickerInkingItem(type: .monoline),
                 PKToolPickerInkingItem(type: .fountainPen),
                 PKToolPickerInkingItem(type: .crayon),
+            ] + BrushLibrary.shared.pickerItems() + [
                 PKToolPickerEraserItem(type: .vector),
             ])
         } else {
@@ -1051,28 +1063,39 @@ struct SketchCanvas: UIViewRepresentable {
 
         init(model: SketchModel) { self.model = model }
 
-        var selectedTool: PKTool? {
+        /// The picker's selection as a brush or the eraser; `nil` for an
+        /// item the core has no brush for.
+        var selectedPick: PickedTool? {
             guard let picker else { return nil }
             if #available(iOS 18.0, *) {
                 switch picker.selectedToolItem {
-                case let inking as PKToolPickerInkingItem: return inking.inkingTool
-                case let eraser as PKToolPickerEraserItem: return eraser.eraserTool
-                default: return nil
+                case let inking as PKToolPickerInkingItem:
+                    return .ink(StrokeCodec.selection(inking: inking.inkingTool))
+                case let eraser as PKToolPickerEraserItem:
+                    return .eraser(eraser.eraserTool)
+                case let custom as PKToolPickerCustomItem:
+                    return StrokeCodec.selection(item: custom).map(PickedTool.ink)
+                default:
+                    return nil
                 }
             }
-            return picker.selectedTool
+            switch picker.selectedTool {
+            case let inking as PKInkingTool: return .ink(StrokeCodec.selection(inking: inking))
+            case let eraser as PKEraserTool: return .eraser(eraser)
+            default: return nil
+            }
         }
 
         nonisolated func toolPickerSelectedToolDidChange(_ toolPicker: PKToolPicker) {
             MainActor.assumeIsolated {
-                if let selected = selectedTool { model.tool = selected }
+                if let selected = selectedPick { model.picked = selected }
             }
         }
 
         @available(iOS 18.0, *)
         nonisolated func toolPickerSelectedToolItemDidChange(_ toolPicker: PKToolPicker) {
             MainActor.assumeIsolated {
-                if let selected = selectedTool { model.tool = selected }
+                if let selected = selectedPick { model.picked = selected }
             }
         }
     }

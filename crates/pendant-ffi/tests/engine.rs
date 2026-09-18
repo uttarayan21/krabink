@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pendant_ffi::{
-    Core, CoreListener, Element, NoteInfo, NoteListener, Point2, PointKind, Shape, ShapeElement,
-    Stroke, StrokePoint, SyncState, Tool,
+    BrushInfo, Core, CoreListener, Element, NoteInfo, NoteListener, Point2, PointKind, Shape,
+    ShapeElement, Stroke, StrokePoint, SyncState, Tool,
 };
 
 fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
@@ -43,12 +43,17 @@ fn start_server(dir: &std::path::Path, token: &str) -> String {
 #[derive(Default)]
 struct RecCore {
     notes: Mutex<Vec<NoteInfo>>,
+    brushes: Mutex<Vec<BrushInfo>>,
     states: Mutex<Vec<SyncState>>,
 }
 
 impl CoreListener for RecCore {
     fn notes_changed(&self, notes: Vec<NoteInfo>) {
         *self.notes.lock().unwrap() = notes;
+    }
+
+    fn brushes_changed(&self, brushes: Vec<BrushInfo>) {
+        *self.brushes.lock().unwrap() = brushes;
     }
 
     fn sync_state(&self, state: SyncState) {
@@ -77,11 +82,20 @@ impl NoteListener for RecNote {
         self.stroke_events.lock().unwrap().push(sketch);
     }
 
-    fn wet_begin(&self, _sketch: String, stroke: String, _tool: Tool, color: u32, width: f32) {
+    fn wet_begin(
+        &self,
+        _sketch: String,
+        stroke: String,
+        _tool: Tool,
+        color: u32,
+        width: f32,
+        spec: Option<Vec<u8>>,
+    ) {
+        let custom = if spec.is_some() { ":custom" } else { "" };
         self.wet
             .lock()
             .unwrap()
-            .push(format!("begin:{stroke}:{color:08x}:{width}"));
+            .push(format!("begin:{stroke}:{color:08x}:{width}{custom}"));
     }
 
     fn wet_points(&self, stroke: String, _sent_ms: u64, points: Vec<StrokePoint>) {
@@ -122,7 +136,7 @@ fn local_state_survives_reopen() {
         .unwrap();
     let sketch = note.create_sketch().unwrap();
     let stroke_id = note
-        .begin_stroke(sketch.clone(), Tool::Pen, 0x1e3cc8ff, 3.0)
+        .begin_stroke(sketch.clone(), Tool::Pen, 0x1e3cc8ff, 3.0, None)
         .unwrap();
     note.finish_stroke(
         sketch.clone(),
@@ -134,6 +148,7 @@ fn local_state_survives_reopen() {
             kind: PointKind::PolylineSample,
             points: polyline(16),
             created_ms: 1,
+            brush: None,
         },
         Vec::new(),
     )
@@ -207,6 +222,31 @@ fn two_cores_converge_through_relay() {
     note_b.set_listener(rec_b.clone());
     wait_for("B note synced", || *rec_b.synced.lock().unwrap() > 0);
 
+    // Brush library: A adds a brush, B lists it and its listener hears;
+    // a removal syncs too.
+    let spec = pendant_ffi::builtin_brushes()[0].spec.clone();
+    core_a
+        .upsert_brush("user:soft".into(), "Soft".into(), spec)
+        .unwrap();
+    wait_for("brush reaches B", || {
+        core_b.list_brushes().iter().any(|b| b.id == "user:soft")
+    });
+    assert!(
+        rec_core_b
+            .brushes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|b| b.name == "Soft")
+    );
+    assert!(
+        core_a
+            .upsert_brush("user:bad".into(), "Bad".into(), vec![9, 9])
+            .is_err()
+    );
+    core_a.remove_brush("user:soft".into()).unwrap();
+    wait_for("removal reaches B", || core_b.list_brushes().is_empty());
+
     // Text: A types, B observes via listener and direct read.
     note_a
         .apply_text_edit(0, 0, "# hello from A".into())
@@ -224,7 +264,7 @@ fn two_cores_converge_through_relay() {
     });
 
     let stroke_id = note_a
-        .begin_stroke(sketch.clone(), Tool::Pen, 0x1e3cc8ff, 3.0)
+        .begin_stroke(sketch.clone(), Tool::Pen, 0x1e3cc8ff, 3.0, None)
         .unwrap();
     note_a
         .append_points(stroke_id.clone(), 1, polyline(2))
@@ -240,6 +280,7 @@ fn two_cores_converge_through_relay() {
                 kind: PointKind::PolylineSample,
                 points: polyline(16),
                 created_ms: 2,
+                brush: None,
             },
             polyline(1),
         )
@@ -276,7 +317,7 @@ fn two_cores_converge_through_relay() {
     // detection must count shapes, not just strokes).
     let events_before = rec_b.stroke_events.lock().unwrap().len();
     let shape_id = note_a
-        .begin_stroke(sketch.clone(), Tool::Marker, 0xff0000ff, 5.0)
+        .begin_stroke(sketch.clone(), Tool::Marker, 0xff0000ff, 5.0, None)
         .unwrap();
     note_a
         .finish_shape(

@@ -15,6 +15,25 @@ struct BrushSelection: Equatable {
     var color: UInt32
 }
 
+extension BrushSelection {
+    /// The same selection with a custom brush's spec re-read from the
+    /// library, so edits made after the picker reported it apply.
+    @MainActor
+    func refreshed() -> BrushSelection {
+        guard let custom = brush.custom, let current = BrushLibrary.shared.brush(id: custom.id)
+        else { return self }
+        var out = self
+        out.brush.custom = CustomBrush(id: current.id, spec: current.spec)
+        return out
+    }
+}
+
+/// What the tool picker selected.
+enum PickedTool {
+    case ink(BrushSelection)
+    case eraser(PKEraserTool)
+}
+
 enum StrokeCodec {
     /// Base width per PencilKit width unit. 1.0 until measured against
     /// PencilKit with the `-brushLab 1` calibration page.
@@ -26,8 +45,24 @@ enum StrokeCodec {
     /// Alpha scale per PencilKit ink, on top of the preset's opacity.
     static let opacityScale: [PKInkingTool.InkType: Float] = [
         // Watercolour cannot be rendered honestly; it stores as a lighter marker.
-        .crayon: 0.9, .watercolor: 0.6,
+        .watercolor: 0.6
     ]
+
+    /// The brushes bundled with the app, by id.
+    static let builtins: [String: BuiltinBrush] = Dictionary(
+        uniqueKeysWithValues: builtinBrushes().map { ($0.id, $0) })
+
+    /// PencilKit inks that draw with a bundled brush rather than a preset:
+    /// the crayon is the stamped `builtin:crayon`, recorded as a pencil.
+    static func custom(_ ink: PKInkingTool.InkType) -> CustomBrush? {
+        let id: String
+        switch ink {
+        case .crayon: id = "builtin:crayon"
+        default: return nil
+        }
+        guard let brush = builtins[id] else { return nil }
+        return CustomBrush(id: brush.id, spec: brush.spec)
+    }
 
     static func tool(_ ink: PKInkingTool.InkType) -> Tool {
         switch ink {
@@ -45,8 +80,21 @@ enum StrokeCodec {
         let type = inking.inkType
         let width = Float(inking.width) * (widthScale[type] ?? 1)
         return BrushSelection(
-            brush: BrushRef(tool: tool(type), baseWidth: width),
+            brush: BrushRef(tool: tool(type), baseWidth: width, custom: custom(type)),
             color: pack(inking.color, alphaScale: opacityScale[type] ?? 1))
+    }
+
+    /// A custom picker item (iOS 18): a library brush at the item's colour
+    /// and width; `nil` when the library has no brush under its identifier.
+    @available(iOS 18.0, *)
+    @MainActor
+    static func selection(item: PKToolPickerCustomItem) -> BrushSelection? {
+        guard let brush = BrushLibrary.shared.brush(id: item.identifier) else { return nil }
+        return BrushSelection(
+            brush: BrushRef(
+                tool: brush.tool, baseWidth: Float(item.width),
+                custom: CustomBrush(id: brush.id, spec: brush.spec)),
+            color: pack(item.color))
     }
 
     /// The initial selection under `-tool <name>` (UI tests); pen otherwise.

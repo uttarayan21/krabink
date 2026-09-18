@@ -35,10 +35,24 @@ struct BrushLabScreen: View {
 
 /// The canned stroke and the elements the lab draws from it.
 enum LabStroke {
-    static let presets: [(Tool, PKInkingTool.InkType)] = [
-        (.pen, .pen), (.pencil, .pencil), (.marker, .marker), (.monoline, .monoline),
-        (.fountain, .fountainPen),
-    ]
+    /// Rows of the grid: the tool presets, then the bundled brushes
+    /// (paired with the PencilKit ink the calibration page compares to).
+    static let presets: [(Tool, PKInkingTool.InkType, CustomBrush?)] = {
+        let custom = { (id: String) -> CustomBrush? in
+            StrokeCodec.builtins[id].map { CustomBrush(id: $0.id, spec: $0.spec) }
+        }
+        return [
+            (.pen, .pen, nil), (.pencil, .pencil, nil), (.marker, .marker, nil),
+            (.monoline, .monoline, nil), (.fountain, .fountainPen, nil),
+            (.pencil, .crayon, custom("builtin:crayon")),
+            (.pencil, .pencil, custom("builtin:pencil-grainy")),
+        ]
+    }()
+
+    /// The row's label: the tool, or the bundled brush's id.
+    static func name(_ row: Int) -> String {
+        presets[row].2?.id ?? String(describing: presets[row].0)
+    }
     static let widths: [Float] = [3, 8, 16]
     static let length: Float = 320
     static let rowHeight: CGFloat = 70
@@ -64,23 +78,29 @@ enum LabStroke {
         return "01ARZ3NDEKTSV4RRFFQ69G5F" + String(alphabet[n / 32 % 32]) + String(alphabet[n % 32])
     }
 
-    static func stroke(_ n: Int, tool: Tool, width: Float, color: UInt32, origin: CGPoint) -> Stroke {
-        let modeler = BrushModeler(tool: tool, size: width)
+    static func stroke(
+        _ n: Int, tool: Tool, custom: CustomBrush? = nil, width: Float, color: UInt32, origin: CGPoint
+    ) -> Stroke {
+        let modeler = BrushModeler.forBrush(brush: BrushRef(tool: tool, baseWidth: width, custom: custom))
         _ = modeler.push(samples: samples(origin: origin))
         return Stroke(
             id: id(n), tool: tool, color: color, baseWidth: width, kind: .polylineSample,
-            points: modeler.finish(), createdMs: 0)
+            points: modeler.finish(), createdMs: 0, brush: custom)
     }
 
     /// Rows: presets; columns: widths. A translucent blue bar under every
     /// row shows blend and self-overlap behaviour.
     static func presetGrid() -> [Element] {
         var out: [Element] = []
-        for (row, (tool, _)) in presets.enumerated() {
+        for (row, (tool, _, custom)) in presets.enumerated() {
             let y = 40 + CGFloat(row) * rowHeight
             for (col, width) in widths.enumerated() {
                 let x = 20 + CGFloat(col) * columnWidth
-                out.append(.stroke(stroke(out.count, tool: tool, width: width, color: 0x1E3CC8FF, origin: CGPoint(x: x, y: y))))
+                out.append(
+                    .stroke(
+                        stroke(
+                            out.count, tool: tool, custom: custom, width: width, color: 0x1E3CC8FF,
+                            origin: CGPoint(x: x, y: y))))
             }
         }
         return out
@@ -114,7 +134,7 @@ struct BrushCalibration: View {
             HStack {
                 Picker("ink", selection: $preset) {
                     ForEach(LabStroke.presets.indices, id: \.self) { i in
-                        Text(String(describing: LabStroke.presets[i].0)).tag(i)
+                        Text(LabStroke.name(i)).tag(i)
                     }
                 }
                 .pickerStyle(.menu)
@@ -126,7 +146,8 @@ struct BrushCalibration: View {
                 .frame(height: 140)
             LabCanvas(elements: [
                 .stroke(LabStroke.stroke(
-                    0, tool: LabStroke.presets[preset].0, width: width, color: 0x000000FF,
+                    0, tool: LabStroke.presets[preset].0, custom: LabStroke.presets[preset].2,
+                    width: width, color: 0x000000FF,
                     origin: CGPoint(x: 20, y: 70))),
             ])
             .id("\(preset)-\(width)")

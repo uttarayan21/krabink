@@ -39,7 +39,15 @@ impl NoteListener for Recorder {
     }
     fn text_changed(&self, _text: String) {}
     fn strokes_changed(&self, _sketch: String) {}
-    fn wet_begin(&self, _s: String, _st: String, _t: Tool, _c: u32, _w: f32) {
+    fn wet_begin(
+        &self,
+        _s: String,
+        _st: String,
+        _t: Tool,
+        _c: u32,
+        _w: f32,
+        _spec: Option<Vec<u8>>,
+    ) {
         self.wet.lock().unwrap().begins += 1;
         eprintln!("wet begin");
     }
@@ -151,7 +159,7 @@ fn main() {
     if args.add_stroke {
         let sketch = first_sketch(&session, args.timeout);
         let id = session
-            .begin_stroke(sketch.clone(), Tool::Pen, 0x1e3c_c8ff, 10.0)
+            .begin_stroke(sketch.clone(), Tool::Pen, 0x1e3c_c8ff, 10.0, None)
             .expect("begin stroke");
         let points = (0..6u32)
             .map(|i| StrokePoint {
@@ -177,6 +185,7 @@ fn main() {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_millis() as u64,
+                    brush: None,
                 },
                 Vec::new(),
             )

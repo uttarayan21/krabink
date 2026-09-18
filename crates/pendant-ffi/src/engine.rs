@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::net::{self, Cmd};
 use crate::types::{
-    DeviceInfo, Element, NoteInfo, ShapeElement, Stroke, StrokePoint, SyncState, Tool,
+    BrushInfo, DeviceInfo, Element, NoteInfo, ShapeElement, Stroke, StrokePoint, SyncState, Tool,
     rgba_from_u32,
 };
 
@@ -46,6 +46,9 @@ pub type Result<T, E = PendantError> = core::result::Result<T, E>;
 #[uniffi::export(foreign)]
 pub trait CoreListener: Send + Sync {
     fn notes_changed(&self, notes: Vec<NoteInfo>);
+    /// The shared brush library changed (a peer added, edited or removed
+    /// a brush); the full list, newest edit first.
+    fn brushes_changed(&self, brushes: Vec<BrushInfo>);
     fn sync_state(&self, state: SyncState);
 }
 
@@ -61,7 +64,18 @@ pub trait NoteListener: Send + Sync {
     fn synced(&self);
     fn text_changed(&self, text: String);
     fn strokes_changed(&self, sketch: String);
-    fn wet_begin(&self, sketch: String, stroke: String, tool: Tool, color: u32, base_width: f32);
+    /// `spec` is a custom brush's encoded spec (pass it as
+    /// `BrushRef.custom` with any id to mesh the wet points); `None` for
+    /// the tool's preset.
+    fn wet_begin(
+        &self,
+        sketch: String,
+        stroke: String,
+        tool: Tool,
+        color: u32,
+        base_width: f32,
+        spec: Option<Vec<u8>>,
+    );
     /// Stored points the sender emitted since its last batch; fold them
     /// through `points_mesh` with `StrokeEnd.live`.
     /// `sent_ms` is the sender's unix-millis clock when the batch left the
@@ -387,6 +401,56 @@ impl Core {
             .map(Into::into)
             .collect()
     }
+
+    /// The workspace's brush library, newest edit first. Bundled brushes
+    /// (`builtin_brushes`) are not in it.
+    pub fn list_brushes(&self) -> Vec<BrushInfo> {
+        let state = self.shared.lock_state();
+        state
+            .workspace
+            .brushes()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    /// Add or edit a library brush; `spec` must decode in this build.
+    /// Existing strokes keep the spec they snapshotted.
+    pub fn upsert_brush(&self, id: String, name: String, spec: Vec<u8>) -> Result<()> {
+        pcore::BrushSpec::decode(&spec)?;
+        let meta = pcore::BrushMeta {
+            id: pcore::BrushId(id),
+            name,
+            spec,
+            updated_ms: now_ms(),
+        };
+        let payload = {
+            let mut state = self.shared.lock_state();
+            commit_workspace(&mut state, |ws| ws.upsert_brush(&meta))?
+        };
+        if let Some(payload) = payload {
+            let _ = self.shared.cmd.send(Cmd::Update {
+                doc: DocKey::WORKSPACE,
+                payload,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn remove_brush(&self, id: String) -> Result<()> {
+        let id = pcore::BrushId(id);
+        let payload = {
+            let mut state = self.shared.lock_state();
+            commit_workspace(&mut state, |ws| ws.remove_brush(&id))?
+        };
+        if let Some(payload) = payload {
+            let _ = self.shared.cmd.send(Cmd::Update {
+                doc: DocKey::WORKSPACE,
+                payload,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Apply a workspace mutation, persist the delta and return it for the wire.
@@ -550,6 +614,7 @@ impl NoteSession {
         tool: Tool,
         color: u32,
         base_width: f32,
+        spec: Option<Vec<u8>>,
     ) -> Result<String> {
         let sketch = self.parse_sketch(&sketch)?;
         let stroke = pcore::StrokeId::new();
@@ -559,7 +624,7 @@ impl NoteSession {
             tool: tool.into(),
             color: rgba_from_u32(color),
             base_width,
-            spec: None,
+            spec,
         })?;
         Ok(stroke.to_string())
     }

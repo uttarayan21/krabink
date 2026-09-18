@@ -114,7 +114,15 @@ fragment float4 ink_fragment(V2F in [[stage_in]],
             float2 q = abs(in.uv) - (1.0 - r);
             float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
             float w = max(fwidth(d), 1.0 - s.mask.z);
-            m = 1.0 - smoothstep(-w, 0.0, d);
+            if (s.flags & FLAG_DISCARD) {
+                // Write-once ink: stipple the soft band instead of
+                // feathering it (see the ribbon case).
+                float t = (d + w) / w;
+                if (d > 0.0 || (t > 0.0 && lattice(floor(in.canvas / EDGE_CELL), EDGE_SEED) < t))
+                    discard_fragment();
+            } else {
+                m = 1.0 - smoothstep(-w, 0.0, d);
+            }
             break;
         }
         case 3u: {

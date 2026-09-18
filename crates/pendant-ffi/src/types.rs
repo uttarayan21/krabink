@@ -156,6 +156,10 @@ pub struct Stroke {
     pub points: Vec<StrokePoint>,
     /// Unix millis at stroke creation.
     pub created_ms: u64,
+    /// The custom brush this stroke was drawn with, spec snapshotted
+    /// inline; `None` renders with `tool`'s preset.
+    #[uniffi(default = None)]
+    pub brush: Option<crate::brush::CustomBrush>,
 }
 
 impl From<Stroke> for pcore::Stroke {
@@ -163,9 +167,10 @@ impl From<Stroke> for pcore::Stroke {
         Self {
             id: s.id.parse().unwrap_or_else(|_| pcore::StrokeId::new()),
             tool: s.tool.into(),
-            // Custom brushes cross the boundary once the brush library
-            // lands; until then every stroke uses its tool's preset.
-            brush: None,
+            brush: s
+                .brush
+                .as_ref()
+                .and_then(crate::brush::CustomBrush::decoded),
             color: rgba_from_u32(s.color),
             base_width: s.base_width,
             kind: s.kind.into(),
@@ -185,6 +190,7 @@ impl From<pcore::Stroke> for Stroke {
             kind: s.kind.into(),
             points: s.points.into_iter().map(Into::into).collect(),
             created_ms: s.created_ms,
+            brush: s.brush.map(Into::into),
         }
     }
 }
@@ -259,6 +265,27 @@ pub fn build_pair_uri(info: PairInfo) -> String {
 #[uniffi::export]
 pub fn parse_pair_uri(uri: String) -> Option<PairInfo> {
     pcore::PairInfo::parse(&uri).map(Into::into)
+}
+
+/// A brush in the workspace's shared library.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct BrushInfo {
+    pub id: String,
+    pub name: String,
+    /// Encoded spec; pass it as `CustomBrush.spec`.
+    pub spec: Vec<u8>,
+    pub updated_ms: u64,
+}
+
+impl From<pcore::BrushMeta> for BrushInfo {
+    fn from(m: pcore::BrushMeta) -> Self {
+        Self {
+            id: m.id.0,
+            name: m.name,
+            spec: m.spec,
+            updated_ms: m.updated_ms,
+        }
+    }
 }
 
 /// Entry in the note registry (the workspace doc).

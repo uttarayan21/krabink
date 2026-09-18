@@ -6,3 +6,6 @@ pencil-s-curve vertices=186 indices=552 fnv=f8595de1513d0651
 marker-s-curve vertices=359 indices=717 fnv=920ff5757e3242a8
 monoline-line vertices=126 indices=372 fnv=def3a76ed3633762
 fountain-s-curve vertices=353 indices=705 fnv=2cebfc60ec2851e9
+crayon-s-curve vertices=696 indices=1044 fnv=f3c40e23803ac094
+crayon-dot vertices=4 indices=6 fnv=52b4384db4a6a191
+pencil-grainy-hairpin vertices=576 indices=864 fnv=61bceb2c13b8655a

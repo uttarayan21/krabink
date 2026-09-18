@@ -71,6 +71,30 @@ pub struct Stamped {
     pub opacity_jitter: f32,
 }
 
+/// The handful of numbers a brush editor exposes, read from and written
+/// back into a spec without the editor knowing its layout. `None` means
+/// the spec has no such control (a continuous brush has no spacing);
+/// writing `Some` where there was `None` adds the feature with defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BrushKnobs {
+    /// [`Paint::opacity`], 0..=1.
+    pub opacity: f32,
+    /// [`Tip::hardness`], 0..=1.
+    pub hardness: f32,
+    /// [`Stamped::spacing`] in sizes.
+    pub spacing: Option<f32>,
+    /// [`Stamped::scatter`] in sizes.
+    pub scatter: Option<f32>,
+    /// [`Stamped::size_jitter`], 0..=1.
+    pub size_jitter: Option<f32>,
+    /// [`Stamped::opacity_jitter`], 0..=1.
+    pub opacity_jitter: Option<f32>,
+    /// [`Grain::strength`], 0..=1.
+    pub grain_strength: Option<f32>,
+    /// [`Grain::scale`] in canvas units.
+    pub grain_scale: Option<f32>,
+}
+
 /// A brush bundled with the app under a `builtin:` id, offered next to
 /// the tool presets. Strokes snapshot the spec inline like any custom
 /// brush, so a bundled brush can be retuned without restyling old ink.
@@ -508,6 +532,81 @@ impl BrushSpec {
         matches!(self.emit, Emit::Stamped(_))
     }
 
+    /// The editable numbers of this spec.
+    pub fn knobs(&self) -> BrushKnobs {
+        let stamped = match self.emit {
+            Emit::Stamped(s) => Some(s),
+            Emit::Continuous => None,
+        };
+        BrushKnobs {
+            opacity: self.paint.opacity,
+            hardness: self.tip.hardness,
+            spacing: stamped.map(|s| s.spacing),
+            scatter: stamped.map(|s| s.scatter),
+            size_jitter: stamped.map(|s| s.size_jitter),
+            opacity_jitter: stamped.map(|s| s.opacity_jitter),
+            grain_strength: self.paint.grain.map(|g| g.strength),
+            grain_scale: self.paint.grain.map(|g| g.scale),
+        }
+    }
+
+    /// This spec with `knobs` written into it. Stamping is added (at the
+    /// pencil's dab rhythm) when any stamp knob is set on a continuous
+    /// brush; grain is added (noise on the canvas) when a grain knob is
+    /// set on a flat one.
+    pub fn with_knobs(&self, knobs: &BrushKnobs) -> Self {
+        let mut spec = self.clone();
+        spec.paint.opacity = knobs.opacity.clamp(0.0, 1.0);
+        spec.tip.hardness = knobs.hardness.clamp(0.0, 1.0);
+        let stamp_knobs = [
+            knobs.spacing,
+            knobs.scatter,
+            knobs.size_jitter,
+            knobs.opacity_jitter,
+        ];
+        if stamp_knobs.iter().any(Option::is_some) {
+            let mut s = match spec.emit {
+                Emit::Stamped(s) => s,
+                Emit::Continuous => Stamped {
+                    spacing: 0.15,
+                    scatter: 0.0,
+                    rotation_jitter: 0.0,
+                    size_jitter: 0.0,
+                    opacity_jitter: 0.0,
+                },
+            };
+            if let Some(v) = knobs.spacing {
+                s.spacing = v.max(0.0);
+            }
+            if let Some(v) = knobs.scatter {
+                s.scatter = v.max(0.0);
+            }
+            if let Some(v) = knobs.size_jitter {
+                s.size_jitter = v.clamp(0.0, 1.0);
+            }
+            if let Some(v) = knobs.opacity_jitter {
+                s.opacity_jitter = v.clamp(0.0, 1.0);
+            }
+            spec.emit = Emit::Stamped(s);
+        }
+        if knobs.grain_strength.is_some() || knobs.grain_scale.is_some() {
+            let mut g = spec.paint.grain.unwrap_or(Grain {
+                source: GrainSource::Noise,
+                mapping: GrainMapping::Canvas,
+                scale: 1.5,
+                strength: 0.5,
+            });
+            if let Some(v) = knobs.grain_strength {
+                g.strength = v.clamp(0.0, 1.0);
+            }
+            if let Some(v) = knobs.grain_scale {
+                g.scale = v.max(1e-3);
+            }
+            spec.paint.grain = Some(g);
+        }
+        spec
+    }
+
     /// Does the tip follow the pen's orientation rather than the motion?
     pub fn has_nib(&self) -> bool {
         !matches!(self.tip.orient, Orient::Motion)
@@ -553,6 +652,38 @@ mod tests {
         }
         assert!(BrushSpec::decode(&[]).is_err());
         assert!(BrushSpec::decode(&[SPEC_VERSION, 0xff, 0xff]).is_err());
+    }
+
+    #[test]
+    fn knobs_roundtrip_and_add_features() {
+        let crayon = BrushSpec::builtin(BUILTIN_CRAYON).unwrap().spec;
+        let knobs = crayon.knobs();
+        assert_eq!(knobs.spacing, Some(0.15));
+        assert_eq!(
+            crayon.with_knobs(&knobs),
+            crayon,
+            "writing back what was read is a no-op"
+        );
+        let pen = BrushSpec::preset(Tool::Pen);
+        let pen_knobs = pen.knobs();
+        assert_eq!(pen_knobs.spacing, None);
+        assert_eq!(pen_knobs.grain_strength, None);
+        let edited = pen.with_knobs(&BrushKnobs {
+            opacity: 0.5,
+            spacing: Some(0.3),
+            grain_strength: Some(0.4),
+            ..pen_knobs
+        });
+        assert!(edited.is_stamped());
+        assert_eq!(edited.knobs().spacing, Some(0.3));
+        assert_eq!(edited.knobs().grain_scale, Some(1.5));
+        assert_eq!(edited.paint.opacity, 0.5);
+        let clamped = pen.with_knobs(&BrushKnobs {
+            opacity: 7.0,
+            hardness: -1.0,
+            ..pen_knobs
+        });
+        assert_eq!((clamped.paint.opacity, clamped.tip.hardness), (1.0, 0.0));
     }
 
     #[test]

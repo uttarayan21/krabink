@@ -48,9 +48,9 @@ impl From<RawSample> for pcore::RawSample {
     }
 }
 
-/// A brush applied at a size: the tool's preset. Custom brushes join here
-/// with the brush library.
-#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+/// A brush applied at a size: the tool's preset, or a custom brush's spec
+/// with the tool as what the stroke records.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct BrushRef {
     pub tool: Tool,
     /// Full ink width in canvas units.
@@ -60,12 +60,141 @@ pub struct BrushRef {
     /// 0 is fine for ink that has no element yet.
     #[uniffi(default = 0)]
     pub seed: u32,
+    /// A custom brush (bundled or from the library); `None` draws with
+    /// `tool`'s preset. Its spec is what the stroke snapshots.
+    #[uniffi(default = None)]
+    pub custom: Option<CustomBrush>,
+}
+
+/// A custom brush by id with its encoded spec ([`BrushSpec::encode`] in
+/// the core); strokes carry both so they render without the library.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CustomBrush {
+    pub id: String,
+    pub spec: Vec<u8>,
+}
+
+impl CustomBrush {
+    /// The decoded spec, or `None` (with a warning) when the bytes are
+    /// from a build this one cannot read; callers fall back to the
+    /// tool's preset, as the document reader does.
+    pub(crate) fn decoded(&self) -> Option<pcore::CustomBrush> {
+        match pcore::BrushSpec::decode(&self.spec) {
+            Ok(spec) => Some(pcore::CustomBrush {
+                id: pcore::BrushId(self.id.clone()),
+                spec,
+            }),
+            Err(err) => {
+                tracing::warn!(%err, brush = %self.id, "unreadable brush spec; using the tool preset");
+                None
+            }
+        }
+    }
+}
+
+impl From<pcore::CustomBrush> for CustomBrush {
+    fn from(b: pcore::CustomBrush) -> Self {
+        Self {
+            id: b.id.0,
+            spec: b.spec.encode().unwrap_or_default(),
+        }
+    }
+}
+
+/// A brush bundled with the app, offered next to the tool presets.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct BuiltinBrush {
+    /// `builtin:…`
+    pub id: String,
+    pub name: String,
+    /// Encoded spec; pass it in [`CustomBrush::spec`].
+    pub spec: Vec<u8>,
+}
+
+/// The numbers a brush editor exposes; `None` where the spec has no such
+/// control. See the core's `BrushKnobs`.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct BrushKnobs {
+    pub opacity: f32,
+    pub hardness: f32,
+    pub spacing: Option<f32>,
+    pub scatter: Option<f32>,
+    pub size_jitter: Option<f32>,
+    pub opacity_jitter: Option<f32>,
+    pub grain_strength: Option<f32>,
+    pub grain_scale: Option<f32>,
+}
+
+impl From<pcore::BrushKnobs> for BrushKnobs {
+    fn from(k: pcore::BrushKnobs) -> Self {
+        Self {
+            opacity: k.opacity,
+            hardness: k.hardness,
+            spacing: k.spacing,
+            scatter: k.scatter,
+            size_jitter: k.size_jitter,
+            opacity_jitter: k.opacity_jitter,
+            grain_strength: k.grain_strength,
+            grain_scale: k.grain_scale,
+        }
+    }
+}
+
+impl From<BrushKnobs> for pcore::BrushKnobs {
+    fn from(k: BrushKnobs) -> Self {
+        Self {
+            opacity: k.opacity,
+            hardness: k.hardness,
+            spacing: k.spacing,
+            scatter: k.scatter,
+            size_jitter: k.size_jitter,
+            opacity_jitter: k.opacity_jitter,
+            grain_strength: k.grain_strength,
+            grain_scale: k.grain_scale,
+        }
+    }
+}
+
+/// The editable numbers of an encoded spec; `None` when it does not
+/// decode in this build.
+#[uniffi::export]
+pub fn brush_knobs(spec: Vec<u8>) -> Option<BrushKnobs> {
+    pcore::BrushSpec::decode(&spec)
+        .ok()
+        .map(|s| s.knobs().into())
+}
+
+/// `spec` with `knobs` written into it, re-encoded; the input unchanged
+/// when it does not decode.
+#[uniffi::export]
+pub fn brush_with_knobs(spec: Vec<u8>, knobs: BrushKnobs) -> Vec<u8> {
+    match pcore::BrushSpec::decode(&spec) {
+        Ok(s) => s.with_knobs(&knobs.into()).encode().unwrap_or(spec),
+        Err(_) => spec,
+    }
+}
+
+/// Every brush bundled with the app (a crayon and a grainy pencil).
+#[uniffi::export]
+pub fn builtin_brushes() -> Vec<BuiltinBrush> {
+    pcore::BrushSpec::builtins()
+        .into_iter()
+        .map(|b| BuiltinBrush {
+            id: b.id.0,
+            name: b.name.to_owned(),
+            spec: b.spec.encode().unwrap_or_default(),
+        })
+        .collect()
 }
 
 impl BrushRef {
-    fn ink(self, color: u32) -> pcore::Ink<'static> {
-        pcore::Ink::preset(self.tool.into(), rgba_from_u32(color), self.base_width)
-            .with_seed(self.seed)
+    fn ink(&self, color: u32) -> pcore::Ink<'static> {
+        let color = rgba_from_u32(color);
+        match self.custom.as_ref().and_then(CustomBrush::decoded) {
+            Some(custom) => pcore::Ink::custom(custom.spec, color, self.base_width),
+            None => pcore::Ink::preset(self.tool.into(), color, self.base_width),
+        }
+        .with_seed(self.seed)
     }
 }
 
@@ -118,6 +247,21 @@ impl BrushModeler {
     pub fn new(tool: Tool, size: f32) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(pcore::BrushModeler::new(tool.into(), size)),
+        })
+    }
+
+    /// A modeler for `brush`: its custom spec's input smoothing when it
+    /// has one, the tool's preset otherwise.
+    #[uniffi::constructor]
+    pub fn for_brush(brush: BrushRef) -> Arc<Self> {
+        let tool = brush.tool.into();
+        let spec = brush
+            .custom
+            .as_ref()
+            .and_then(CustomBrush::decoded)
+            .map_or_else(|| pcore::BrushSpec::preset(tool), |c| c.spec);
+        Arc::new(Self {
+            inner: Mutex::new(pcore::BrushModeler::for_brush(tool, spec, brush.base_width)),
         })
     }
 
@@ -223,9 +367,22 @@ pub struct InkStyle {
     pub overlap: Overlap,
     /// Edge feathering, 1 for a hard edge.
     pub hardness: f32,
+    /// What the vertex `uv` means and how the shader cuts the edge.
+    pub mask: MaskStyle,
     /// Procedural paper texture the fragment shader multiplies into the
     /// alpha; `None` for flat ink.
     pub grain: Option<GrainStyle>,
+}
+
+/// How the fragment shader shapes the ink inside the triangles.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Enum)]
+pub enum MaskStyle {
+    /// The triangles are the ink; `v` is the side in -1..=1 and a soft tip
+    /// feathers the outer band (mask kind 3 in the style flags).
+    Ribbon,
+    /// Each quad is one dab in tip space `[-1, 1]²`; keep the rounded
+    /// superellipse with this corner radius (mask kind 1).
+    Shape { corner: f32 },
 }
 
 /// What the grain texture is anchored to.
@@ -263,6 +420,10 @@ impl From<pcore::InkStyle> for InkStyle {
                 pcore::Overlap::Discard => Overlap::Discard,
             },
             hardness: s.hardness,
+            mask: match s.mask {
+                pcore::MaskStyle::Ribbon => MaskStyle::Ribbon,
+                pcore::MaskStyle::Shape { corner } => MaskStyle::Shape { corner },
+            },
             grain: s.grain.map(|g| GrainStyle {
                 mapping: match g.mapping {
                     pcore::GrainMapping::Canvas => GrainMapping::Canvas,
@@ -293,6 +454,9 @@ pub struct InkMesh {
     pub vertex_count: u32,
     pub index_count: u32,
     pub style: InkStyle,
+    /// Exact at every zoom (stamped dabs are masked in the shader), so
+    /// there is no need to rebuild it when the tolerance changes.
+    pub zoom_independent: bool,
 }
 
 impl From<pcore::InkMesh> for InkMesh {
@@ -300,6 +464,7 @@ impl From<pcore::InkMesh> for InkMesh {
         Self {
             vertex_count: u32::try_from(m.vertices.len()).unwrap_or(u32::MAX),
             index_count: u32::try_from(m.indices.len()).unwrap_or(u32::MAX),
+            zoom_independent: m.zoom_independent,
             vertices: m
                 .vertices
                 .iter()
@@ -458,14 +623,15 @@ mod tests {
             tool: Tool::Pen,
             base_width: 4.0,
             seed: 0,
+            custom: None,
         };
         assert_eq!(
-            m.live_mesh(vec![], brush, 0xff, 0.25),
-            points_mesh(m.points(), brush, 0xff, StrokeEnd::Live, 0.25),
+            m.live_mesh(vec![], brush.clone(), 0xff, 0.25),
+            points_mesh(m.points(), brush.clone(), 0xff, StrokeEnd::Live, 0.25),
             "live_mesh is points_mesh of the modeler's points"
         );
         let done = m.finish();
-        let mesh = points_mesh(done.clone(), brush, 0xff, StrokeEnd::Complete, 0.25);
+        let mesh = points_mesh(done.clone(), brush.clone(), 0xff, StrokeEnd::Complete, 0.25);
         assert!(mesh.index_count >= 3 && mesh.index_count.is_multiple_of(3));
         assert_eq!(
             mesh.indices.len(),
@@ -493,6 +659,7 @@ mod tests {
                 kind: PointKind::PolylineSample,
                 points: done.clone(),
                 created_ms: 0,
+                brush: None,
             },
             0.25,
         );
@@ -545,6 +712,7 @@ mod tests {
             tool: Tool::Pen,
             base_width: 4.0,
             seed: 0,
+            custom: None,
         };
         let preview = shape_outline_mesh(rec.shape, brush, 0xff, 0.25);
         let committed = element_mesh(

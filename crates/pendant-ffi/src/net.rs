@@ -24,7 +24,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
 use crate::engine::{CoreListener, NoteListener, Shared, SyncTarget};
-use crate::types::{NoteInfo, SyncState, rgba_to_u32};
+use crate::types::{BrushInfo, NoteInfo, SyncState, rgba_to_u32};
 
 pub(crate) enum Cmd {
     Connect(SyncTarget),
@@ -425,13 +425,14 @@ fn dispatch_wet(shared: &Shared, doc: DocKey, payload: &[u8]) {
             tool,
             color,
             base_width,
-            ..
+            spec,
         } => listener.wet_begin(
             sketch.to_string(),
             stroke.to_string(),
             tool.into(),
             rgba_to_u32(color),
             base_width,
+            spec,
         ),
         WetInk::Points {
             stroke, sent_ms, ..
@@ -460,6 +461,7 @@ fn dispatch_wet(shared: &Shared, doc: DocKey, payload: &[u8]) {
 /// is released.
 enum Notify {
     Notes(Arc<dyn CoreListener>, Vec<NoteInfo>),
+    Brushes(Arc<dyn CoreListener>, Vec<BrushInfo>),
     Text(Arc<dyn NoteListener>, String),
     Strokes(Arc<dyn NoteListener>, String),
 }
@@ -468,6 +470,7 @@ impl Notify {
     fn dispatch(self) {
         match self {
             Self::Notes(listener, notes) => listener.notes_changed(notes),
+            Self::Brushes(listener, brushes) => listener.brushes_changed(brushes),
             Self::Text(listener, text) => listener.text_changed(text),
             Self::Strokes(listener, sketch) => listener.strokes_changed(sketch),
         }
@@ -497,7 +500,14 @@ impl ClientDocs for Docs<'_> {
                     .into_iter()
                     .map(Into::into)
                     .collect();
-                self.pending.push(Notify::Notes(listener, notes));
+                self.pending.push(Notify::Notes(listener.clone(), notes));
+                let brushes = state
+                    .workspace
+                    .brushes()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect();
+                self.pending.push(Notify::Brushes(listener, brushes));
             }
             return Ok(());
         }

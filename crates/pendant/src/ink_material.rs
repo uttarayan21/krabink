@@ -26,7 +26,7 @@ use bevy::render::render_resource::{
 use bevy::render::storage::ShaderBuffer;
 use bevy::shader::ShaderRef;
 use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dKey, Material2dPlugin};
-use pendant_core::{Blend, GrainMapping, InkStyle, Overlap, Rgba};
+use pendant_core::{Blend, GrainMapping, InkStyle, MaskStyle, Overlap, Rgba};
 
 /// Stroke-space uv: `u` arc length in canvas units, `v` the side in -1..1.
 pub const ATTRIBUTE_INK_UV: MeshVertexAttribute =
@@ -64,6 +64,8 @@ pub struct StrokeStyle {
 
 impl StrokeStyle {
     /// Bits 0-1, mask kind 3: feather the ribbon edge by `mask.z`.
+    /// Mask kind 1: rounded superellipse in tip space (stamped dabs).
+    pub const MASK_SHAPE: u32 = 1;
     pub const MASK_EDGE: u32 = 3;
     /// Bits 2-3, grain kind 1: procedural value noise seeded by
     /// `grain_layer`.
@@ -92,10 +94,19 @@ impl From<InkStyle> for StrokeStyle {
             blue,
             alpha,
         } = linear(style.color);
-        let edge = if style.hardness < 1.0 {
-            Self::MASK_EDGE
-        } else {
-            0
+        let (mask, edge) = match style.mask {
+            MaskStyle::Ribbon => (
+                Vec4::new(1.0, 0.0, style.hardness, 0.0),
+                if style.hardness < 1.0 {
+                    Self::MASK_EDGE
+                } else {
+                    0
+                },
+            ),
+            MaskStyle::Shape { corner } => (
+                Vec4::new(1.0, corner, style.hardness, 0.0),
+                Self::MASK_SHAPE,
+            ),
         };
         let multiply = match style.blend {
             Blend::Multiply => Self::MULTIPLY,
@@ -121,7 +132,7 @@ impl From<InkStyle> for StrokeStyle {
         };
         Self {
             color: Vec4::new(red, green, blue, alpha * style.opacity),
-            mask: Vec4::new(1.0, 0.0, style.hardness, 0.0),
+            mask,
             grain,
             depth: 0.0,
             flags: edge | multiply | discard | grain_flags,

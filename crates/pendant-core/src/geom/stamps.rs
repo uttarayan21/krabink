@@ -179,7 +179,14 @@ mod tests {
 
     #[test]
     fn one_point_is_one_dab_in_tip_space() {
-        let mesh = stamped_mesh(&[([5.0, 5.0], tip(4.0, 0.0))], &plain(), 4.0, 1, true, InkStyle::PLAIN);
+        let mesh = stamped_mesh(
+            &[([5.0, 5.0], tip(4.0, 0.0))],
+            &plain(),
+            4.0,
+            1,
+            true,
+            InkStyle::PLAIN,
+        );
         assert_eq!(dab_count(&mesh), 1);
         assert!(mesh.zoom_independent);
         let uvs: Vec<[f32; 2]> = mesh.vertices.iter().map(|v| v.uv).collect();
@@ -199,7 +206,11 @@ mod tests {
         ];
         let mesh = stamped_mesh(&pts, &plain(), 4.0, 1, true, InkStyle::PLAIN);
         assert_eq!(dab_count(&mesh), 11);
-        let xs: Vec<f32> = mesh.vertices.chunks(4).map(|q| (q[0].pos[0] + q[2].pos[0]) / 2.0).collect();
+        let xs: Vec<f32> = mesh
+            .vertices
+            .chunks(4)
+            .map(|q| (q[0].pos[0] + q[2].pos[0]) / 2.0)
+            .collect();
         for (i, x) in xs.iter().enumerate() {
             assert!((x - i as f32).abs() < 1e-4, "dab {i} at {x}");
         }
@@ -247,11 +258,28 @@ mod tests {
     fn motion_tips_lie_across_the_path() {
         // Height 1 along the path, width 4 across: on a horizontal path the
         // quad spans 4 in y and 1 in x.
-        let pts = [([0.0, 0.0], TipState { h: 1.0, ..tip(4.0, 0.0) }), ([10.0, 0.0], TipState { h: 1.0, ..tip(4.0, 10.0) })];
+        let pts = [
+            (
+                [0.0, 0.0],
+                TipState {
+                    h: 1.0,
+                    ..tip(4.0, 0.0)
+                },
+            ),
+            (
+                [10.0, 0.0],
+                TipState {
+                    h: 1.0,
+                    ..tip(4.0, 10.0)
+                },
+            ),
+        ];
         let mesh = stamped_mesh(&pts, &plain(), 4.0, 0, true, InkStyle::PLAIN);
         let q = &mesh.vertices[..4];
         let (xs, ys): (Vec<f32>, Vec<f32>) = q.iter().map(|v| (v.pos[0], v.pos[1])).unzip();
-        let span = |v: &[f32]| v.iter().cloned().fold(f32::MIN, f32::max) - v.iter().cloned().fold(f32::MAX, f32::min);
+        let span = |v: &[f32]| {
+            v.iter().cloned().fold(f32::MIN, f32::max) - v.iter().cloned().fold(f32::MAX, f32::min)
+        };
         assert!((span(&xs) - 1.0).abs() < 1e-4, "{xs:?}");
         assert!((span(&ys) - 4.0).abs() < 1e-4, "{ys:?}");
         let _ = MaskStyle::Ribbon;

@@ -10,7 +10,10 @@
 
 use std::path::Path;
 
-use pendant_core::{BrushModeler, DEFAULT_TOLERANCE, Ink, InkMesh, RawSample, Rgba, Tilt, Tool};
+use pendant_core::{
+    BUILTIN_CRAYON, BUILTIN_PENCIL_GRAINY, BrushModeler, BrushSpec, DEFAULT_TOLERANCE, Ink,
+    InkMesh, RawSample, Rgba, Tilt, Tool,
+};
 
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/mesh.txt");
 
@@ -23,9 +26,14 @@ fn tilt(azimuth: f32) -> Option<Tilt> {
 }
 
 /// Deterministic strokes covering the tools: a fast S-curve with varying
-/// force, a slow straight line, a dot, a hairpin, and a nib stroke that
-/// turns against its orientation.
-fn cases() -> Vec<(&'static str, Tool, f32, Vec<RawSample>)> {
+/// force, a slow straight line, a dot, a hairpin, a nib stroke that
+/// turns against its orientation, and the bundled stamped brushes.
+fn cases() -> Vec<(&'static str, Ink<'static>, Vec<RawSample>)> {
+    let preset = |tool, size| Ink::preset(tool, Rgba::BLACK, size);
+    let builtin = |id: &str, size| {
+        let spec = BrushSpec::builtin(id).expect("bundled brush").spec;
+        Ink::custom(spec, Rgba::BLACK, size).with_seed(0x5eed)
+    };
     let s_curve = |force_swing: f32| -> Vec<RawSample> {
         (0..60)
             .map(|i| {
@@ -72,23 +80,47 @@ fn cases() -> Vec<(&'static str, Tool, f32, Vec<RawSample>)> {
     })
     .collect();
     vec![
-        ("pen-s-curve", Tool::Pen, 4.0, s_curve(1.0)),
-        ("pen-slow-line", Tool::Pen, 3.0, line(30, 1.0, 16.0)),
-        ("pen-dot", Tool::Pen, 5.0, vec![line(1, 0.0, 0.0)[0]]),
-        ("pen-hairpin", Tool::Pen, 4.0, hairpin.clone()),
-        ("pencil-s-curve", Tool::Pencil, 3.0, s_curve(0.6)),
-        ("marker-s-curve", Tool::Marker, 10.0, s_curve(0.0)),
-        ("monoline-line", Tool::Monoline, 2.0, line(30, 3.0, 8.0)),
-        ("fountain-s-curve", Tool::Fountain, 12.0, s_curve(0.3)),
+        ("pen-s-curve", preset(Tool::Pen, 4.0), s_curve(1.0)),
+        ("pen-slow-line", preset(Tool::Pen, 3.0), line(30, 1.0, 16.0)),
+        (
+            "pen-dot",
+            preset(Tool::Pen, 5.0),
+            vec![line(1, 0.0, 0.0)[0]],
+        ),
+        ("pen-hairpin", preset(Tool::Pen, 4.0), hairpin.clone()),
+        ("pencil-s-curve", preset(Tool::Pencil, 3.0), s_curve(0.6)),
+        ("marker-s-curve", preset(Tool::Marker, 10.0), s_curve(0.0)),
+        (
+            "monoline-line",
+            preset(Tool::Monoline, 2.0),
+            line(30, 3.0, 8.0),
+        ),
+        (
+            "fountain-s-curve",
+            preset(Tool::Fountain, 12.0),
+            s_curve(0.3),
+        ),
+        ("crayon-s-curve", builtin(BUILTIN_CRAYON, 9.0), s_curve(0.6)),
+        (
+            "crayon-dot",
+            builtin(BUILTIN_CRAYON, 9.0),
+            vec![line(1, 0.0, 0.0)[0]],
+        ),
+        (
+            "pencil-grainy-hairpin",
+            builtin(BUILTIN_PENCIL_GRAINY, 3.0),
+            hairpin,
+        ),
     ]
 }
 
-fn mesh(tool: Tool, size: f32, samples: &[RawSample]) -> InkMesh {
-    let mut modeler = BrushModeler::new(tool, size);
+fn mesh(ink: &Ink<'static>, samples: &[RawSample]) -> InkMesh {
+    let mut modeler =
+        BrushModeler::for_brush(Tool::Pen, ink.spec.clone().into_owned(), ink.base_width);
     for &s in samples {
         modeler.push(s);
     }
-    Ink::preset(tool, Rgba::BLACK, size).mesh(
+    ink.mesh(
         &modeler.finish(),
         pendant_core::StrokeEnd::Complete,
         DEFAULT_TOLERANCE,
@@ -119,8 +151,8 @@ fn fingerprint(mesh: &InkMesh) -> u64 {
 fn golden_meshes_match() {
     let actual: Vec<String> = cases()
         .iter()
-        .map(|(name, tool, size, samples)| {
-            let m = mesh(*tool, *size, samples);
+        .map(|(name, ink, samples)| {
+            let m = mesh(ink, samples);
             format!(
                 "{name} vertices={} indices={} fnv={:016x}",
                 m.vertices.len(),

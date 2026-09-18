@@ -118,7 +118,7 @@ flowchart LR
         SS["ServerSession\nBroadcast / Disconnect effects"]
         WS["WorkspaceDoc\nnotes + device registry"]
         PAIR["pair.rs\nPairInfo <-> pendant://pair URI"]
-        INK["brush/ + geom/ + shape.rs + corpus.rs\nBrushSpec presets, BrushModeler,\nInkMesh + InkStyle (grain, hover dab);\nshape recognizer; element.rs"]
+        INK["brush/ + geom/ + shape.rs + corpus.rs\nBrushSpec presets + builtins, BrushModeler,\nInkMesh + InkStyle (grain, stamps, hover dab);\nshape recognizer; element.rs"]
     end
     subgraph desktop["pendant (desktop bin)"]
         BEVY["Bevy app: ui, sketch, docs"]
@@ -147,10 +147,13 @@ estimated force/tilt is patched in by `update`. Stage 2
 (`brush/dynamics.rs`): a `BrushSpec` — the tool's preset — turns each
 point into a tip state (size, opacity, nib orientation) from pressure,
 speed, tilt and distance to the ends. Stage 3 (`geom/`): the tip states
-become an `InkMesh` — round lyon ribbons or oriented nib ribbons with
-rectangle caps — whose vertices carry position, stroke-space uv and
-opacity, plus an `InkStyle` (colour, opacity, blend, overlap, hardness)
-per stroke. Renderers upload the mesh verbatim and apply the style in one
+become an `InkMesh` — round lyon ribbons, oriented nib hulls, or one quad
+per dab for stamped brushes — whose vertices carry position, stroke-space
+(or tip-space) uv and opacity, plus an `InkStyle` (colour, opacity, blend,
+overlap, hardness, mask) per stroke. A stroke's brush is the tool's preset
+or a custom spec snapshotted on the stroke; the workspace doc carries a
+shared brush library, and the app bundles a stamped crayon and a grainy
+pencil. Renderers upload the mesh verbatim and apply the style in one
 über-shader (Metal on the iPad, WGSL on the desktop): linear-light
 premultiplied blending in an sRGB framebuffer, Multiply for the
 highlighter, and a depth-slot trick that makes `Overlap::Discard` ink

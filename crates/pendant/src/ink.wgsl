@@ -118,7 +118,16 @@ fn fragment(in: InkOutput) -> @location(0) vec4<f32> {
             let q = abs(in.uv) - vec2<f32>(1.0 - r);
             let d = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
             let w = max(fwidth(d), 1.0 - s.mask.z);
-            m = 1.0 - smoothstep(-w, 0.0, d);
+            if ((s.flags & FLAG_DISCARD) != 0u) {
+                // Write-once ink: stipple the soft band instead of
+                // feathering it (see the ribbon case).
+                let t = (d + w) / w;
+                if (d > 0.0 || (t > 0.0 && hash_corner(floor(in.canvas / EDGE_CELL), EDGE_SEED) < t)) {
+                    discard;
+                }
+            } else {
+                m = 1.0 - smoothstep(-w, 0.0, d);
+            }
         }
         case 3u: {
             // Ribbon: v is the side in -1..1; soften the outer band that

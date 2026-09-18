@@ -116,16 +116,24 @@ stroke, thumbnail, SVG) runs the same fold.
    stroker with round caps and joins (`continuous.rs`); oriented nibs are
    the convex hull of the nib rectangle at consecutive points
    (`nib.rs`), so no corner sticks out. Points closer than a fifth of the
-   base width are merged first. `outline.rs` produces one closed polygon for
-   SVG. `Ink::hover_dab` is the one-point mesh for the Pencil hover preview.
+   base width are merged first. Stamped brushes (`stamps.rs`) lay one quad
+   per dab along the arc length with tip-space uv, jittered by `brush/rng.rs`
+   (a hash of seed, dab index and channel, so live and committed dabs are
+   identical); such meshes are `zoom_independent`. `outline.rs` produces
+   one closed polygon for SVG. `Ink::hover_dab` is the one-point mesh for
+   the Pencil hover preview.
 
 `BrushSpec` (`brush/spec.rs`): `input: InputParams`, `tip: Tip{aspect,
 corner, orient: Motion | Nib{fallback} | Fixed, hardness, max_size_rate,
-min_size}`, `dynamics: Vec<Behavior>`, `paint: Paint{opacity, overlap:
-Accumulate | Discard, blend: Normal | Multiply, grain: Option<Grain{source:
-Noise, mapping: Canvas | Stroke, scale, strength}>}`. Specs serialise with
-`SPEC_VERSION` 2 for custom brushes carried inside a stroke or a wet
-`Begin`.
+min_size}`, `dynamics: Vec<Behavior>`, `emit: Continuous |
+Stamped{spacing, scatter, rotation_jitter, size_jitter, opacity_jitter}`,
+`paint: Paint{opacity, overlap: Accumulate | Discard, blend: Normal |
+Multiply, grain: Option<Grain{source: Noise, mapping: Canvas | Stroke,
+scale, strength}>}`. Specs serialise with `SPEC_VERSION` 3 for custom
+brushes carried inside a stroke, a wet `Begin`, or the workspace's
+`brushes` map (`BrushMeta`). `BrushSpec::builtins()` bundles
+`builtin:crayon` and `builtin:pencil-grainy`; `BrushKnobs` is the editor's
+view of a spec (`knobs()` / `with_knobs()`).
 
 Presets (`BrushSpec::preset`):
 
@@ -137,11 +145,13 @@ Presets (`BrushSpec::preset`):
 | Monoline | round | none | opaque, accumulate |
 | Fountain | nib, aspect 0.15, follows azimuth minus roll, fallback −45° | pressure drives width | opaque, accumulate |
 
-`InkMesh` is `vertices: Vec<InkVertex{pos, uv, opacity}>`, `indices`, and
-one `InkStyle{color, opacity, blend, overlap, hardness, grain:
-Option<GrainStyle{mapping, scale, strength, seed}>}`. `uv.x` is arc length
-in canvas units, `uv.y` is the side in −1..1; that is what the shaders map
-masks and grain through. `DEFAULT_TOLERANCE` is 0.25.
+`InkMesh` is `vertices: Vec<InkVertex{pos, uv, opacity}>`, `indices`,
+`zoom_independent`, and one `InkStyle{color, opacity, blend, overlap,
+hardness, mask: Ribbon | Shape{corner}, grain: Option<GrainStyle{mapping,
+scale, strength, seed}>}`. On a ribbon `uv.x` is arc length in canvas units
+and `uv.y` the side in −1..1; on a dab `uv` is the tip space `[-1, 1]²`;
+that is what the shaders map masks and grain through. `DEFAULT_TOLERANCE`
+is 0.25.
 
 ### 3.5 Shapes (`shape.rs`)
 
@@ -222,8 +232,11 @@ UniFFI proc macros (`uniffi::setup_scaffolding!("pendant")`), no UDL.
   sketches, `elements`, `begin_stroke` / `append_points` / `finish_stroke` /
   `cancel_stroke`, `finish_shape`, `erase_at`, `remove_element`). Events
   come back through the foreign traits `CoreListener` (`notes_changed`,
-  `sync_state`) and `NoteListener` (`synced`, `text_changed`,
-  `strokes_changed`, `wet_begin` / `wet_points` / `wet_end` / `wet_cancel`).
+  `brushes_changed`, `sync_state`) and `NoteListener` (`synced`,
+  `text_changed`, `strokes_changed`, `wet_begin` / `wet_points` /
+  `wet_end` / `wet_cancel`). `Core` also owns the shared brush library
+  (`list_brushes` / `upsert_brush` / `remove_brush`) next to
+  `builtin_brushes()` and the `brush_knobs` / `brush_with_knobs` helpers.
 - `net.rs`: the single-socket sync task. Every direct path (desktop
   addresses plus mDNS finds) is dialled in parallel and the first handshake
   wins; the fallback relay is dialled only when none answers, and direct
@@ -274,9 +287,14 @@ Bonjour usage strings, file sharing for recordings).
   diffs are deferred while a local pen is down. `StrokeRecorder` writes
   recorder v2 files under Documents when launched with `-recordStrokes 1`.
 - `StrokeCodec.swift`: the PencilKit tool picker maps onto core presets
-  (pen, pencil, marker, monoline, fountain; crayon → pencil at 1.5× width
-  and 0.9 opacity; watercolour → marker at 0.6 opacity). Picker state
+  (pen, pencil, marker, monoline, fountain; crayon → the bundled
+  `builtin:crayon` at 1.5× width; watercolour → marker at 0.6 opacity) or,
+  for a `PKToolPickerCustomItem`, a `BrushLibrary` brush. Picker state
   autosaves under `sketch`.
+- `BrushLibrary.swift` + `BrushAttributesView.swift`: bundled brushes plus
+  the workspace's (`brushesChanged`), one custom picker item each with the
+  brush drawn as its icon and width swatches, and a popover of `BrushKnobs`
+  sliders persisted per brush in `UserDefaults` (`brush.<id>.knobs`).
 - `InkRenderer.swift` + `Shaders.metal`: `MTKViewDelegate`, demand-driven.
   Committed ink is one batched upload drawn as runs split only where the
   pipeline changes; wet, live, hover and settling strokes are separate

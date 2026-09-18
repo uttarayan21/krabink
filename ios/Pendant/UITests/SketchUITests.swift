@@ -164,6 +164,32 @@ final class SketchUITests: XCTestCase {
         waitStatus(app, contains: "strokes=2 ", timeout: 10)
     }
 
+    /// A stroke drawn with a bundled custom brush (the crayon) commits with
+    /// its spec attached and survives a reload of the sketch.
+    func testCustomBrushStrokeRoundTrips() {
+        let app = launch(extra: ["-tool", "crayon"])
+        waitConnected(app)
+
+        app.buttons["newNote"].tap()
+        app.buttons["sketchMenu"].tap()
+        app.buttons["newSketch"].tap()
+
+        let canvas = app.descendants(matching: .any)["sketchCanvas"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        let a = canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.3))
+        let b = canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.5))
+        a.press(forDuration: 0.1, thenDragTo: b, withVelocity: .slow, thenHoldForDuration: 0.1)
+
+        waitStatus(app, contains: "strokes=1 ", timeout: 10)
+        waitStatus(app, contains: "custom=1", timeout: 5)
+
+        // Leave and reopen: the element list is re-read from the CRDT.
+        app.buttons["sketchDone"].tap()
+        app.buttons["sketchMenu"].tap()
+        app.buttons["sketch-0"].tap()
+        waitStatus(app, contains: "custom=1", timeout: 10)
+    }
+
     func testHoldSnapsToShape() {
         let app = launch()
         waitConnected(app)

@@ -21,8 +21,8 @@ use bevy::render::render_resource::TextureUsages;
 use bevy::render::storage::ShaderBuffer;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, EguiUserTextures, egui};
 use pendant_core::{
-    DEFAULT_TOLERANCE, DocKey, Element, Ink, InkStyle, Rgba, SKETCH_URI_PREFIX, SketchId,
-    StrokeEnd, StrokeId, StrokePoint, Tool, WetInk,
+    BrushSpec, DEFAULT_TOLERANCE, DocKey, Element, Ink, InkStyle, Rgba, SKETCH_URI_PREFIX,
+    SketchId, StrokeEnd, StrokeId, StrokePoint, Tool, WetInk,
 };
 
 use crate::docs::{Docs, now_ms};
@@ -74,10 +74,26 @@ struct WetStroke {
     tool: Tool,
     color: Rgba,
     base_width: f32,
+    /// A custom brush's spec from `Begin`; `None` draws the tool's preset.
+    spec: Option<BrushSpec>,
     points: Vec<StrokePoint>,
     last_seq: u32,
     /// Set at `End`: drop at this deadline even without a commit.
     expires_ms: Option<u64>,
+}
+
+impl WetStroke {
+    fn ink(&self) -> Ink<'_> {
+        match &self.spec {
+            Some(spec) => Ink {
+                spec: std::borrow::Cow::Borrowed(spec),
+                color: self.color,
+                base_width: self.base_width,
+                seed: 0,
+            },
+            None => Ink::preset(self.tool, self.color, self.base_width),
+        }
+    }
 }
 
 /// The off-screen image a sketch renders into and the camera drawing it.
@@ -480,8 +496,15 @@ fn apply_wet_ink(
                 tool,
                 color,
                 base_width,
-                ..
+                spec,
             } => {
+                let spec = spec.and_then(|bytes| match BrushSpec::decode(&bytes) {
+                    Ok(spec) => Some(spec),
+                    Err(err) => {
+                        tracing::warn!(%err, "unreadable wet-ink brush spec; using the preset");
+                        None
+                    }
+                });
                 let Some(layer) = scenes.scenes.get(&sketch).map(|s| s.layer) else {
                     continue; // sketch not on screen yet; CRDT commit will cover it
                 };
@@ -496,6 +519,7 @@ fn apply_wet_ink(
                         tool,
                         color,
                         base_width,
+                        spec,
                         points: Vec::new(),
                         last_seq: 0,
                         expires_ms: None,
@@ -524,7 +548,7 @@ fn apply_wet_ink(
                         continue;
                     }
                 }
-                let ink = Ink::preset(wet.tool, wet.color, wet.base_width);
+                let ink = wet.ink();
                 let Some((mesh, style)) = ink_mesh(&ink, &wet.points, StrokeEnd::Live) else {
                     continue; // nothing drawable yet
                 };
@@ -568,7 +592,7 @@ fn apply_wet_ink(
                     if let Ok(tail) = msg.decode_points() {
                         wet.points.extend(tail);
                     }
-                    let ink = Ink::preset(wet.tool, wet.color, wet.base_width);
+                    let ink = wet.ink();
                     if let (Some(handle), Some((mesh, _))) =
                         (&wet.mesh, ink_mesh(&ink, &wet.points, StrokeEnd::Complete))
                         && let Err(err) = meshes.insert(handle, mesh)

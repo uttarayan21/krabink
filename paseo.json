@@ -1,0 +1,7 @@
+{
+  "scripts": {
+    "deploy-ipad": {
+      "command": "scripts/deploy-ipad.sh"
+    }
+  }
+}

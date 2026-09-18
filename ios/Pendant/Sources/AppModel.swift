@@ -319,10 +319,12 @@ final class NoteModel: Identifiable {
     // stroke id, so remember the mapping for the stroke's lifetime.
     private var wetStrokeSketch: [String: String] = [:]
 
-    func wetBegin(sketch: String, stroke: String, tool: Tool, color: UInt32, baseWidth: Float) {
+    func wetBegin(
+        sketch: String, stroke: String, tool: Tool, color: UInt32, baseWidth: Float, spec: Data?
+    ) {
         wetStrokeSketch[stroke] = sketch
         sketches[sketch]?.remoteWetBegin(
-            stroke: stroke, tool: tool, color: color, baseWidth: baseWidth)
+            stroke: stroke, tool: tool, color: color, baseWidth: baseWidth, spec: spec)
     }
 
     func wetPoints(stroke: String, points: [StrokePoint]) {
@@ -349,6 +351,10 @@ private final class CoreEvents: CoreListener {
 
     func notesChanged(notes: [NoteInfo]) {
         Task { @MainActor [weak model] in model?.notes = notes }
+    }
+
+    func brushesChanged(brushes: [BrushInfo]) {
+        Task { @MainActor in BrushLibrary.shared.setShared(brushes) }
     }
 
     func syncState(state: SyncState) {
@@ -385,10 +391,13 @@ private final class NoteEvents: NoteListener {
     func strokesChanged(sketch: String) {
         Task { @MainActor [weak model] in model?.remoteStrokes(sketch: sketch) }
     }
-    func wetBegin(sketch: String, stroke: String, tool: Tool, color: UInt32, baseWidth: Float) {
+    func wetBegin(
+        sketch: String, stroke: String, tool: Tool, color: UInt32, baseWidth: Float, spec: Data?
+    ) {
         Task { @MainActor [weak model] in
             model?.wetBegin(
-                sketch: sketch, stroke: stroke, tool: tool, color: color, baseWidth: baseWidth)
+                sketch: sketch, stroke: stroke, tool: tool, color: color, baseWidth: baseWidth,
+                spec: spec)
         }
     }
 

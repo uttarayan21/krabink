@@ -1,6 +1,7 @@
 # Brush engine: stamp/texture brushes for Pendant
 
-Status: P0, P1 and P2 implemented (notes at the end); P3–P4 planned.
+Status: P0–P3 implemented (notes at the end; P3 without image assets);
+P4 planned.
 
 ## Context
 
@@ -504,3 +505,72 @@ regression entry was not kept so the suite stays green.
 Not done in P2: the Pencil Pro hover check on hardware, and
 `InkMesh::zoom_independent` (no stamped meshes exist before P3, so
 nothing to skip yet).
+
+### P3 (done, except image assets)
+
+Core/FFI:
+
+- `BrushSpec.emit: Emit { Continuous | Stamped(Stamped { spacing,
+  scatter, rotation_jitter, size_jitter, opacity_jitter }) }`;
+  `SPEC_VERSION` is 3 (no custom specs were stored under 2).
+  `geom/stamps.rs` walks arc length with a carried remainder, one quad per
+  dab with `uv ∈ [-1, 1]²` in tip space, tip state interpolated between
+  the input points, `Orient::Motion` dabs turned across the path;
+  `MAX_DABS = 50_000` truncates with a warning, spacing floors at 0.02
+  sizes. `brush/rng.rs` is a murmur3-finaliser hash of (seed, dab index,
+  channel): no state, so the live prefix lays exactly the committed dabs
+  (`jitter_is_a_function_of_seed_and_index`).
+- `InkStyle.mask: MaskStyle { Ribbon | Shape { corner } }` tells the
+  renderers which mask to run (kind 3 or kind 1); `InkMesh.zoom_independent`
+  is set on stamped meshes and the iOS renderer skips them when the zoom
+  bucket changes. Under `Overlap::Discard` the shape mask stipples its
+  soft band the way the ribbon does, so stamped write-once ink has no
+  scalloped overlaps.
+- Bundled brushes (`BrushSpec::builtins()`, `builtin:crayon` and
+  `builtin:pencil-grainy`, both stamped + Discard + canvas noise) with
+  `BrushKnobs` (`knobs()` / `with_knobs()`): the eight numbers an editor
+  shows, applied without knowing the spec layout; setting a stamp knob on
+  a continuous brush makes it stamped, a grain knob on flat ink adds noise.
+  Golden meshes gained `crayon-s-curve`, `crayon-dot`,
+  `pencil-grainy-hairpin`.
+- Workspace `brushes` LoroMap (`BrushMeta { id, name, spec bytes,
+  updated_ms }`, `upsert_brush` / `remove_brush` / `brushes()`), FFI
+  `list_brushes` / `upsert_brush` (rejects undecodable specs) /
+  `remove_brush`, `CoreListener.brushes_changed` fired with every workspace
+  import; the relay test round-trips an add and a removal between two
+  cores.
+- FFI: `BrushRef.custom: Option<CustomBrush { id, spec }>` (default
+  `None`), `BrushModeler.for_brush(brush)` so a custom brush's input
+  smoothing applies, `Stroke.brush`, `builtin_brushes()`, `brush_knobs` /
+  `brush_with_knobs`, `begin_stroke(…, spec)` and `wet_begin(…, spec)`
+  carry the spec on the wire (the desktop receiver decodes it and draws
+  with it).
+
+iOS:
+
+- `SketchModel.picked: PickedTool { ink(BrushSelection) | eraser }`
+  replaces the `PKTool`; the coordinator maps inking, eraser and
+  `PKToolPickerCustomItem`s through `StrokeCodec`. PencilKit's crayon is
+  `builtin:crayon` (`StrokeCodec.custom`), so every crayon stroke stores
+  its spec and `custom=` in the status label counts them
+  (`testCustomBrushStrokeRoundTrips`: draw, leave, reopen).
+- `BrushLibrary` (bundled + workspace brushes, updated by
+  `brushesChanged`) builds one `PKToolPickerCustomItem` per brush PencilKit
+  has no ink for: the icon and the width variants are the brush itself
+  rendered through `InkRenderer.renderThumbnail`; the attributes popover is
+  `BrushAttributesView`, sliders over `BrushKnobs`, persisted in
+  `UserDefaults` `brush.<id>.knobs` and re-read at pen-down
+  (`BrushSelection.refreshed`). The picker's item list is built when the
+  canvas is made, so a brush that arrives from a peer shows after the
+  sketch is reopened.
+- Brush lab rows for the two bundled brushes.
+
+Not done in P3: `Mask::Image` / `GrainSource::Image` with the workspace
+`assets` map, PNG import and the texture arrays on both renderers
+(procedural noise and shape masks cover the bundled brushes); the iOS 17
+`BrushSheet` fallback (custom items need iOS 18; on 17 the crayon still
+draws with the bundled brush, the grainy pencil is not offered); the
+`LiveInk` mesh delta (`GPUGeometry.append/truncate`): a stamped stroke at
+spacing 0.15 re-uploads a few thousand quads per frame, which has not
+shown up in the redraw timings; a "new brush" UI that writes to the
+workspace library (the FFI is there, the picker has no button yet).

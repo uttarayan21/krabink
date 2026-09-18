@@ -12,7 +12,7 @@ func createAndEdit(dir: String) throws -> (note: String, sketch: String, stroke:
     try note.applyTextEdit(at: 0, del: 0, insert: "# hello from swift")
 
     let sketch = try note.createSketch()
-    let strokeId = try note.beginStroke(sketch: sketch, tool: .pen, color: 0x1E3C_C8FF, baseWidth: 3.0)
+    let strokeId = try note.beginStroke(sketch: sketch, tool: .pen, color: 0x1E3C_C8FF, baseWidth: 3.0, spec: nil)
 
     // Model raw touches the way the iPad canvas will: push, predict, finish.
     let modeler = BrushModeler(tool: .pen, size: 3.0)
@@ -58,7 +58,7 @@ func createAndEdit(dir: String) throws -> (note: String, sketch: String, stroke:
     _ = rectModeler.push(samples: rectSamples)
     guard let snapped = recognizeShape(points: rectModeler.points(), holdRadius: 4.5),
           case .rect = snapped.shape else { fatalError("rectangle not recognised") }
-    let shapeId = try note.beginStroke(sketch: sketch, tool: .pen, color: 0xFF00_00FF, baseWidth: 3.0)
+    let shapeId = try note.beginStroke(sketch: sketch, tool: .pen, color: 0xFF00_00FF, baseWidth: 3.0, spec: nil)
     let shape = ShapeElement(
         id: shapeId, shape: snapped.shape, tool: .pen, color: 0xFF00_00FF, width: 3.0,
         start: nil, end: nil, createdMs: 2)
@@ -68,10 +68,36 @@ func createAndEdit(dir: String) throws -> (note: String, sketch: String, stroke:
     }
     try note.finishShape(sketch: sketch, shape: shape)
 
+    // A bundled stamped brush: dabs masked in the shader, spec snapshotted on the stroke.
+    let builtins = builtinBrushes()
+    guard let crayon = builtins.first(where: { $0.id == "builtin:crayon" }) else { fatalError("no crayon") }
+    let crayonRef = BrushRef(
+        tool: .pencil, baseWidth: 9.0, custom: CustomBrush(id: crayon.id, spec: crayon.spec))
+    let crayonId = try note.beginStroke(
+        sketch: sketch, tool: .pencil, color: 0xC800_00FF, baseWidth: 9.0, spec: crayon.spec)
+    let crayonModeler = BrushModeler.forBrush(brush: crayonRef)
+    _ = crayonModeler.push(samples: (0..<24).map {
+        RawSample(x: Float($0) * 6, y: 40 + Float($0 % 3), force: 0.6, tMs: 2000 + Double($0) * 8, tilt: nil,
+                  estimationId: nil, expectsUpdate: false)
+    })
+    let crayonPoints = crayonModeler.finish()
+    let dabs = pointsMesh(points: crayonPoints, brush: crayonRef, color: 0xC800_00FF, end: .complete,
+                          tolerance: defaultTolerance())
+    guard dabs.zoomIndependent, dabs.indexCount % 6 == 0, dabs.indexCount >= 6 * 20,
+          case .shape = dabs.style.mask
+    else { fatalError("crayon did not stamp: \(dabs.indexCount) indices, \(dabs.style.mask)") }
+    let crayonStroke = Stroke(
+        id: crayonId, tool: .pencil, color: 0xC800_00FF, baseWidth: 9.0, kind: .polylineSample,
+        points: crayonPoints, createdMs: 3, brush: CustomBrush(id: crayon.id, spec: crayon.spec))
+    guard strokeMesh(stroke: crayonStroke, tolerance: defaultTolerance()).indexCount == dabs.indexCount else {
+        fatalError("committed crayon lost its spec")
+    }
+    try note.finishStroke(sketch: sketch, stroke: crayonStroke, tail: crayonPoints)
+
     guard try note.text() == "# hello from swift" else { fatalError("text mismatch") }
-    guard try note.strokes(sketch: sketch).count == 1 else { fatalError("stroke missing") }
+    guard try note.strokes(sketch: sketch).count == 2 else { fatalError("stroke missing") }
     let elements = try note.elements(sketch: sketch)
-    guard elements.count == 2, case .shape(let stored) = elements[1], stored.id == shapeId else {
+    guard elements.count == 3, case .shape(let stored) = elements[1], stored.id == shapeId else {
         fatalError("shape missing from elements")
     }
     guard core.listNotes().first?.title == "smoke" else { fatalError("registry mismatch") }
@@ -86,10 +112,13 @@ func verifyPersisted(dir: String, ids: (note: String, sketch: String, stroke: St
     let note = try core.openNote(id: ids.note)
     guard try note.text() == "# hello from swift" else { fatalError("persisted text mismatch") }
     let strokes = try note.strokes(sketch: ids.sketch)
-    guard strokes.count == 1, strokes[0].id == ids.stroke, strokes[0].points.count > 1 else {
+    guard strokes.count == 2, strokes[0].id == ids.stroke, strokes[0].points.count > 1 else {
         fatalError("persisted stroke mismatch")
     }
-    guard try note.elements(sketch: ids.sketch).count == 2 else { fatalError("persisted shape mismatch") }
+    guard strokes[0].brush == nil, strokes[1].brush?.id == "builtin:crayon" else {
+        fatalError("persisted brush mismatch: \(String(describing: strokes[1].brush?.id))")
+    }
+    guard try note.elements(sketch: ids.sketch).count == 3 else { fatalError("persisted shape mismatch") }
     print("swift smoke OK — note \(ids.note), device \(core.deviceId())")
 }
 

@@ -73,6 +73,8 @@ struct StrokeStyle {
     var maskLayer: UInt32 = 0
     var grainLayer: UInt32 = 0
 
+    /// Mask kind 1: rounded superellipse in tip space (stamped dabs).
+    static let maskShape: UInt32 = 1
     static let maskEdge: UInt32 = 3
     /// Grain kind 1: value noise seeded by `grainLayer`.
     static let grainNoise: UInt32 = 4
@@ -85,10 +87,16 @@ struct StrokeStyle {
     init(_ style: InkStyle, depth: Float) {
         let c = Self.linearColor(style.color)
         color = SIMD4(c.x, c.y, c.z, c.w * style.opacity)
-        mask = SIMD4(1, 0, style.hardness, 0)
         self.depth = depth
         var flags: UInt32 = 0
-        if style.hardness < 1 { flags |= Self.maskEdge }
+        switch style.mask {
+        case .ribbon:
+            mask = SIMD4(1, 0, style.hardness, 0)
+            if style.hardness < 1 { flags |= Self.maskEdge }
+        case .shape(let corner):
+            mask = SIMD4(1, corner, style.hardness, 0)
+            flags |= Self.maskShape
+        }
         if style.blend == .multiply { flags |= Self.multiply }
         if style.overlap == .discard { flags |= Self.discard }
         if let g = style.grain {
@@ -553,7 +561,8 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         meshBucket = Self.bucket(for: viewport.zoom)
         committedStale = false
         for id in order {
-            guard let entry = committed[id] else { continue }
+            // Stamped ink is masked in the shader, exact at every zoom.
+            guard let entry = committed[id], !entry.mesh.zoomIndependent else { continue }
             committed[id]?.mesh = elementMesh(element: entry.element, tolerance: tolerance)
         }
         batchDirty = true
