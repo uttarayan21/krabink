@@ -7,6 +7,7 @@ use bevy_egui::egui;
 use pendant_core::{DeviceId, DeviceMeta, PairInfo};
 
 use crate::sync::{LOCAL_PLATFORM, LinkKind, LinkStatus, SyncStatus, local_device_name};
+use crate::theme;
 
 /// Quiet-zone border around the QR matrix, in modules (spec minimum is 4).
 const QUIET_ZONE: usize = 4;
@@ -137,13 +138,21 @@ impl Settings {
         let texture = self.qr_texture(ctx);
         let mut open = self.open;
         let mut action = None;
-        egui::Window::new("settings")
+        // The window is not resizable, so it takes its content's size; hand
+        // the scroll area a screen-relative budget so long content scrolls.
+        let max_height = (ctx.content_rect().height() - 96.0).max(240.0);
+        egui::Window::new(egui::RichText::new("Settings").strong())
             .open(&mut open)
             .resizable(false)
+            .collapsible(false)
+            .default_width(500.0)
+            .default_height(max_height)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
-                    .max_height(640.0)
+                    .max_height(max_height - 56.0)
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
+                        ui.add_space(6.0);
                         self.sync_section(ui, view);
                         if let Some(id) = self.devices_section(ui, view) {
                             action = Some(SettingsAction::RemoveDevice(id));
@@ -159,169 +168,202 @@ impl Settings {
     }
 
     fn sync_section(&self, ui: &mut egui::Ui, view: &SettingsView) {
-        ui.heading("sync");
-        egui::Grid::new("links").num_columns(3).show(ui, |ui| {
-            for link in &view.links {
-                let (dot, label) = match link.status {
-                    SyncStatus::Connected => (egui::Color32::LIGHT_GREEN, "connected"),
-                    SyncStatus::Connecting => (egui::Color32::YELLOW, "connecting…"),
-                };
-                ui.colored_label(dot, "●");
-                ui.label(match link.kind {
-                    LinkKind::Embedded => "this desktop's relay",
-                    LinkKind::Remote => "dedicated relay",
+        theme::section(ui, "Sync", |ui| {
+            egui::Grid::new("links")
+                .num_columns(3)
+                .spacing([16.0, 8.0])
+                .show(ui, |ui| {
+                    for link in &view.links {
+                        let (dot, label) = match link.status {
+                            SyncStatus::Connected => (theme::SUCCESS, "connected"),
+                            SyncStatus::Connecting => (theme::WARN, "connecting…"),
+                        };
+                        theme::status_dot(ui, dot, label);
+                        ui.label(match link.kind {
+                            LinkKind::Embedded => "this desktop's relay",
+                            LinkKind::Remote => "dedicated relay",
+                        });
+                        ui.monospace(
+                            egui::RichText::new(match link.kind {
+                                // Show the address peers use, not the loopback one.
+                                LinkKind::Embedded => &self.info.server,
+                                LinkKind::Remote => &link.server,
+                            })
+                            .color(theme::MUTED),
+                        );
+                        ui.end_row();
+                    }
                 });
-                ui.horizontal(|ui| {
-                    ui.label(label);
-                    ui.monospace(match link.kind {
-                        // Show the address peers use, not the loopback one.
-                        LinkKind::Embedded => &self.info.server,
-                        LinkKind::Remote => &link.server,
-                    });
-                });
-                ui.end_row();
+            if !self.info.alt.is_empty() {
+                ui.add_space(4.0);
+                ui.weak("also reachable at:");
+                for alt in &self.info.alt {
+                    ui.monospace(egui::RichText::new(alt).color(theme::MUTED));
+                }
             }
-        });
-        if !self.info.alt.is_empty() {
-            ui.weak("also reachable at:");
-            for alt in &self.info.alt {
-                ui.monospace(alt);
-            }
-        }
-        ui.weak(match &view.mdns_name {
-            Some(name) => format!("mDNS: {name}"),
-            None => "mDNS: off (advertising failed)".to_string(),
-        });
-        if view.links.len() == 1 {
-            ui.weak("no dedicated relay: devices must reach this desktop directly.");
-            ui.weak("add one with --server / config.toml to sync across networks.");
-        }
-        ui.add_space(6.0);
-        ui.heading("this device");
-        egui::Grid::new("this-device")
-            .num_columns(2)
-            .show(ui, |ui| {
-                ui.label("name");
-                ui.label(local_device_name());
-                ui.end_row();
-                ui.label("platform");
-                ui.label(LOCAL_PLATFORM);
-                ui.end_row();
-                ui.label("id");
-                ui.monospace(view.this_device.to_string());
-                ui.end_row();
+            ui.add_space(4.0);
+            ui.weak(match &view.mdns_name {
+                Some(name) => format!("mDNS: {name}"),
+                None => "mDNS: off (advertising failed)".to_string(),
             });
-        ui.separator();
+            if view.links.len() == 1 {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "No dedicated relay: devices must reach this desktop directly. \
+                         Add one with --server or config.toml to sync across networks.",
+                    )
+                    .color(theme::WARN),
+                );
+            }
+        });
+
+        theme::section(ui, "This device", |ui| {
+            egui::Grid::new("this-device")
+                .num_columns(2)
+                .spacing([24.0, 8.0])
+                .show(ui, |ui| {
+                    ui.weak("name");
+                    ui.label(local_device_name());
+                    ui.end_row();
+                    ui.weak("platform");
+                    ui.label(LOCAL_PLATFORM);
+                    ui.end_row();
+                    ui.weak("id");
+                    ui.monospace(
+                        egui::RichText::new(view.this_device.to_string()).color(theme::MUTED),
+                    );
+                    ui.end_row();
+                });
+        });
     }
 
     /// Returns the id of a device the user confirmed removing.
     fn devices_section(&mut self, ui: &mut egui::Ui, view: &SettingsView) -> Option<DeviceId> {
-        ui.heading("paired devices");
         let others: Vec<&DeviceMeta> = view
             .devices
             .iter()
             .filter(|d| d.id != view.this_device)
             .collect();
+        // A row vanishing from the registry cancels its pending removal.
+        if let Some(pending) = &self.pending_remove
+            && !others.iter().any(|d| d.id == *pending)
+        {
+            self.pending_remove = None;
+        }
         let mut removed = None;
-        if others.is_empty() {
-            ui.label("none yet — devices appear here once they connect");
-            ui.label("to the same workspace.");
-        } else {
-            // A row vanishing from the registry cancels its pending removal.
-            if let Some(pending) = &self.pending_remove
-                && !others.iter().any(|d| d.id == *pending)
-            {
-                self.pending_remove = None;
+        let mut pending = self.pending_remove;
+        theme::section(ui, "Paired devices", |ui| {
+            if others.is_empty() {
+                ui.weak("None yet. Devices appear here once they connect to the same workspace.");
+                return;
             }
             egui::Grid::new("devices")
                 .num_columns(4)
                 .striped(true)
+                .spacing([16.0, 8.0])
                 .show(ui, |ui| {
                     for d in others {
-                        ui.label(&d.name);
+                        ui.label(egui::RichText::new(&d.name).strong());
                         ui.label(&d.platform);
                         ui.weak(format!("seen {}", ago(view.now_ms, d.last_seen_ms)));
-                        if self.pending_remove == Some(d.id) {
+                        if pending == Some(d.id) {
                             ui.horizontal(|ui| {
-                                let confirm = egui::Button::new(
-                                    egui::RichText::new("confirm remove")
-                                        .color(egui::Color32::LIGHT_RED),
-                                );
-                                if ui.add(confirm).clicked() {
+                                if ui.add(theme::danger_button("confirm remove")).clicked() {
                                     removed = Some(d.id);
                                 }
                                 if ui.small_button("cancel").clicked() {
-                                    self.pending_remove = None;
+                                    pending = None;
                                 }
                             });
                         } else if ui.small_button("remove").clicked() {
-                            self.pending_remove = Some(d.id);
+                            pending = Some(d.id);
                         }
                         ui.end_row();
                     }
                 });
-            ui.weak("removing only forgets the row; the device re-appears if");
-            ui.weak("it reconnects with the same token.");
-        }
-        if removed.is_some() {
-            self.pending_remove = None;
-        }
-        ui.separator();
+            ui.add_space(4.0);
+            ui.weak("Removing only forgets the row; the device re-appears if it reconnects with the same token.");
+        });
+        self.pending_remove = if removed.is_some() { None } else { pending };
         removed
     }
 
     fn pair_section(&self, ui: &mut egui::Ui, texture: Option<&egui::TextureHandle>) {
-        ui.heading("pair a device");
-        ui.label("scan with the other device's camera (iPad: settings →");
-        ui.label("scan pairing code), or run: pendant pair '<uri below>'");
-        ui.label("the device connects straight to this desktop on the LAN");
-        match &self.info.fallback {
-            Some(fallback) => ui.label(format!("and falls back to {fallback} elsewhere.")),
-            None => ui.label("(no fallback relay: it must be on the same network)."),
-        };
-        ui.add_space(8.0);
-        let uri = self.info.to_uri();
-        match texture {
-            Some(texture) => {
-                let side = 6.0 * texture.size()[0] as f32;
-                ui.image((texture.id(), egui::Vec2::splat(side)));
+        theme::section(ui, "Pair a device", |ui| {
+            ui.label(
+                "Scan with the other device's camera (iPad: Settings, then Scan pairing code), \
+                 or run: pendant pair '<uri below>'.",
+            );
+            ui.weak(match &self.info.fallback {
+                Some(fallback) => format!(
+                    "The device connects straight to this desktop on the LAN and falls back \
+                     to {fallback} elsewhere."
+                ),
+                None => "The device connects straight to this desktop on the LAN \
+                         (no fallback relay: it must be on the same network)."
+                    .to_string(),
+            });
+            ui.add_space(10.0);
+            let uri = self.info.to_uri();
+            match texture {
+                Some(texture) => {
+                    let side = 6.0 * texture.size()[0] as f32;
+                    ui.vertical_centered(|ui| {
+                        egui::Frame::new()
+                            .fill(egui::Color32::WHITE)
+                            .corner_radius(egui::CornerRadius::same(theme::RADIUS))
+                            .inner_margin(egui::Margin::same(6))
+                            .show(ui, |ui| {
+                                ui.image((texture.id(), egui::Vec2::splat(side)));
+                            });
+                    });
+                }
+                None => {
+                    ui.colored_label(theme::DANGER, "pairing uri too long for a QR");
+                }
             }
-            None => {
-                ui.colored_label(egui::Color32::LIGHT_RED, "pairing uri too long for a QR");
-            }
-        }
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if ui.button("copy uri").clicked() {
-                ui.ctx().copy_text(uri.clone());
-            }
-            ui.monospace(&uri);
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Copy URI").clicked() {
+                    ui.ctx().copy_text(uri.clone());
+                }
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&uri).monospace().color(theme::MUTED))
+                        .truncate(),
+                );
+            });
         });
-        ui.separator();
     }
 
     fn join_section(&mut self, ui: &mut egui::Ui) -> Option<PairInfo> {
         let mut joined = None;
-        ui.heading("join another workspace");
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.join_uri)
-                    .hint_text("pendant://pair?…")
-                    .desired_width(320.0),
-            );
-            if ui.button("join").clicked() {
-                match PairInfo::parse(self.join_uri.trim()) {
-                    Some(info) => {
-                        self.join_error = false;
-                        joined = Some(info);
+        let mut join_error = self.join_error;
+        theme::section(ui, "Join another workspace", |ui| {
+            ui.weak("Paste a pairing URI from another desktop.");
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let width = (ui.available_width() - 90.0).max(160.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.join_uri)
+                        .hint_text("pendant://pair?…")
+                        .desired_width(width),
+                );
+                if ui.add(theme::primary_button("Join")).clicked() {
+                    match PairInfo::parse(self.join_uri.trim()) {
+                        Some(info) => {
+                            join_error = false;
+                            joined = Some(info);
+                        }
+                        None => join_error = true,
                     }
-                    None => self.join_error = true,
                 }
+            });
+            if join_error {
+                ui.colored_label(theme::DANGER, "not a pendant://pair URI");
             }
         });
-        if self.join_error {
-            ui.colored_label(egui::Color32::LIGHT_RED, "not a pendant://pair URI");
-        }
+        self.join_error = join_error;
         joined
     }
 }

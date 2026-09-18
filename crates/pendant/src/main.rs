@@ -10,6 +10,7 @@ mod replay;
 mod settings;
 mod sketch;
 mod sync;
+mod theme;
 mod ui;
 
 use bevy::prelude::*;
@@ -122,7 +123,6 @@ fn run_app(args: cli::Cli) -> Result<()> {
     };
 
     App::new()
-        .insert_resource(ClearColor(Color::srgb(0.09, 0.09, 0.11)))
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "pendant".into(),
@@ -133,6 +133,7 @@ fn run_app(args: cli::Cli) -> Result<()> {
         .add_plugins(bevy_egui::EguiPlugin::default())
         .add_plugins((
             SyncPlugin,
+            theme::ThemePlugin,
             EditorUiPlugin,
             crate::sketch::SketchPlugin,
             settings::SettingsPlugin,
