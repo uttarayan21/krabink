@@ -133,6 +133,37 @@ final class SketchUITests: XCTestCase {
         sleep(1)
     }
 
+    /// `-fakeEstimates 1`: every finger sample claims a pending estimate
+    /// that the model revises 60 ms after pen-up, so the commit takes the
+    /// settling path. The stroke must land exactly once, with its
+    /// revisions counted, and the next stroke must land after it.
+    func testEstimateUpdateDoesNotDuplicateStroke() {
+        let app = launch(extra: ["-fakeEstimates", "1"])
+        waitConnected(app)
+
+        app.buttons["newNote"].tap()
+        app.buttons["sketchMenu"].tap()
+        app.buttons["newSketch"].tap()
+
+        let canvas = app.descendants(matching: .any)["sketchCanvas"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        let a = canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.3))
+        let b = canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.5))
+        a.press(forDuration: 0.1, thenDragTo: b, withVelocity: .slow, thenHoldForDuration: 0.1)
+
+        waitStatus(app, contains: "strokes=1 ", timeout: 10)
+        let status = app.staticTexts["sketchStatus"]
+        let revised = status.label.firstMatch(of: /est=(\d+)/).map { Int($0.output.1) ?? 0 } ?? 0
+        XCTAssertGreaterThan(revised, 0, "no estimate was revised before commit: \(status.label)")
+        sleep(1)
+        XCTAssertTrue(status.label.contains("strokes=1 "), "stroke duplicated: \(status.label)")
+
+        let c = canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.6))
+        let d = canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.8))
+        c.press(forDuration: 0.1, thenDragTo: d, withVelocity: .slow, thenHoldForDuration: 0.1)
+        waitStatus(app, contains: "strokes=2 ", timeout: 10)
+    }
+
     func testHoldSnapsToShape() {
         let app = launch()
         waitConnected(app)

@@ -32,11 +32,11 @@ struct Uniforms {
 struct StrokeStyle {
     float4 color;      // linear RGBA, straight alpha (opacity folded in)
     float4 mask;       // aspect, corner, hardness, 0
-    float4 grain;      // scale, strength, seed, 0
+    float4 grain;      // scale, strength, 0, 0
     float  depth;      // NDC z slot, strictly monotone in draw order
     uint   flags;      // see MASK_* / FLAG_* below
     uint   maskLayer;
-    uint   grainLayer;
+    uint   grainLayer; // image layer for grain kind 2, hash seed for kind 1
 };
 
 constant uint MASK_KIND   = 3u;   // bits 0-1: 0 none, 1 shape (tip space), 2 image, 3 ribbon edge
@@ -86,12 +86,11 @@ static float lattice(float2 c, uint s)
     return float(q.x & 0xffffu) / 65535.0;
 }
 
-static float value_noise(float2 p, float seed)
+static float value_noise(float2 p, uint s)
 {
     float2 i = floor(p);
     float2 f = p - i;
     f = f * f * (3.0 - 2.0 * f);
-    uint s = uint(seed);
     float a = lattice(i, s);
     float b = lattice(i + float2(1, 0), s);
     float c = lattice(i + float2(0, 1), s);
@@ -127,7 +126,7 @@ fragment float4 ink_fragment(V2F in [[stage_in]],
     float g = 1.0;
     if ((s.flags & GRAIN_KIND) == 4u) {
         float2 p = ((s.flags & FLAG_GRAIN_STROKE) ? in.uv : in.canvas) / max(s.grain.x, 1e-3);
-        float n = value_noise(p, s.grain.z);
+        float n = value_noise(p, s.grainLayer);
         g = mix(1.0, n, s.grain.y * saturate(s.grain.x * u.zoom / 1.5));
     }
     float a = s.color.a * in.opacity * m * g;

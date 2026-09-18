@@ -52,6 +52,12 @@ private let settleTimeout: Duration = .milliseconds(200)
 /// about 4; full ink width sits at twice average so hard pressure has room
 /// to show. Fingers report no force and get the nominal 0.5.
 private let forceFullScale: CGFloat = 2
+/// Alpha of the hover preview dab relative to the ink's own.
+private let hoverAlpha: Float = 0.35
+/// `-fakeEstimates 1`: finger samples pretend to be estimates that the
+/// model revises 60 ms after pen-up, so the settling path (ink held on
+/// screen, points patched, early commit) runs on the simulator.
+private let fakeEstimates = UserDefaults.standard.bool(forKey: "fakeEstimates")
 /// Canvas grows in steps this far beyond the ink (infinite canvas v1:
 /// down/right only).
 private let canvasMargin: CGFloat = 400
@@ -108,13 +114,19 @@ extension RawSample {
                 roll: Float(roll))
         }
         let expecting = touch.estimatedPropertiesExpectingUpdates
+        var estimationId = touch.estimationUpdateIndex?.uint32Value
+        var expectsUpdate = !expecting.intersection([.force, .azimuth, .altitude]).isEmpty
+        if fakeEstimates, !pencil {
+            estimationId = UInt32(truncatingIfNeeded: Int(touch.timestamp * 1_000_000))
+            expectsUpdate = true
+        }
         self.init(
             x: Float(location.x), y: Float(location.y),
             force: pencil ? Float(min(touch.force / forceFullScale, 1)) : 0.5,
             tMs: touch.timestamp * 1000,
             tilt: tilt,
-            estimationId: touch.estimationUpdateIndex?.uint32Value,
-            expectsUpdate: !expecting.intersection([.force, .azimuth, .altitude]).isEmpty)
+            estimationId: estimationId,
+            expectsUpdate: expectsUpdate)
     }
 }
 
@@ -207,6 +219,8 @@ final class SketchModel {
     /// unreliable): outbound wet flushes and inbound wet batches this session.
     var wetSent = 0
     var wetRecv = 0
+    /// Points whose estimated force or tilt was revised before commit.
+    var estUpdated = 0
     /// Selected in the PencilKit tool picker; inking tools draw, the eraser
     /// erases, anything else is ignored.
     var tool: PKTool
@@ -293,6 +307,7 @@ final class SketchModel {
 
     func penBegan(_ sample: RawSample) {
         penDown = true
+        renderer?.clearHover()
         if let eraser = tool as? PKEraserTool {
             erasing = true
             erase(at: sample, radius: Self.eraserRadius(eraser))
@@ -489,6 +504,21 @@ final class SketchModel {
             self?.commitSettled(id)
         }
         settling[id] = stroke
+        if fakeEstimates { fakeSettle(id) }
+    }
+
+    /// Deliver the revisions a real Pencil would, 60 ms after pen-up.
+    private func fakeSettle(_ id: String) {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(60))
+            guard let self, let stroke = settling[id] else { return }
+            let revised = stroke.modeler.pendingEstimates().map {
+                RawSample(
+                    x: 0, y: 0, force: 0.9, tMs: 0, tilt: nil, estimationId: $0,
+                    expectsUpdate: false)
+            }
+            penEstimateUpdated(revised)
+        }
     }
 
     private func commitSettled(_ id: String) {
@@ -522,6 +552,7 @@ final class SketchModel {
             try? session.finishStroke(sketch: sketchId, stroke: committed, tail: tail)
             element = .stroke(committed)
         }
+        estUpdated += stroke.estUpdated
         if stroke.estPushed > 0 {
             let waited = stroke.endedAt.map { Date().timeIntervalSince($0) * 1000 } ?? 0
             NSLog(
@@ -552,6 +583,25 @@ final class SketchModel {
         let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
         live!.redraws += 1
         live!.maxRedrawMs = max(live!.maxRedrawMs, ms)
+    }
+
+    // MARK: hover
+
+    /// The Pencil hovering over the canvas: preview the tip at that spot
+    /// and tilt at reduced alpha; `nil` when it leaves. Nothing while the
+    /// pen is down or the eraser is selected.
+    func hover(_ sample: RawSample?) {
+        guard let renderer else { return }
+        guard let sample, !penDown, let ink = tool as? PKInkingTool else {
+            renderer.clearHover()
+            return
+        }
+        let selection = StrokeCodec.selection(inking: ink)
+        let alpha = UInt32((Float(selection.color & 0xff) * hoverAlpha).rounded())
+        renderer.setHover(
+            mesh: hoverDabMesh(
+                brush: selection.brush, color: (selection.color & ~0xff) | alpha,
+                x: sample.x, y: sample.y, tilt: sample.tilt, tolerance: renderer.tolerance))
     }
 
     private func flushWet() {
@@ -766,6 +816,10 @@ final class SketchCanvasView: UIView, UIScrollViewDelegate {
     let metal: MTKView
     let renderer: InkRenderer
     let pen: PenGestureRecognizer
+    /// Pencil hover (Pencil 2 on M2 iPads, Pencil Pro): the sample under
+    /// the tip while it hovers, `nil` when it leaves.
+    var onHover: ((RawSample?) -> Void)?
+    private let hoverRecognizer = UIHoverGestureRecognizer()
 
     init?(policy: InputPolicy) {
         metal = MTKView(frame: .zero, device: MTLCreateSystemDefaultDevice())
@@ -808,9 +862,30 @@ final class SketchCanvasView: UIView, UIScrollViewDelegate {
 
         pen.canvasSpace = content
         scroll.addGestureRecognizer(pen)
+        hoverRecognizer.addTarget(self, action: #selector(hoverChanged))
+        hoverRecognizer.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
+        scroll.addGestureRecognizer(hoverRecognizer)
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    @objc private func hoverChanged(_ gesture: UIHoverGestureRecognizer) {
+        switch gesture.state {
+        case .began, .changed:
+            let location = gesture.location(in: content)
+            var roll: CGFloat = 0
+            if #available(iOS 17.5, *) { roll = gesture.rollAngle }
+            let tilt = Tilt(
+                azimuth: Float(gesture.azimuthAngle(in: content)),
+                altitude: Float(gesture.altitudeAngle), roll: Float(roll))
+            onHover?(
+                RawSample(
+                    x: Float(location.x), y: Float(location.y), force: 0.5, tMs: 0, tilt: tilt,
+                    estimationId: nil, expectsUpdate: false))
+        default:
+            onHover?(nil)
+        }
+    }
 
     override var canBecomeFirstResponder: Bool { true }
 
@@ -885,7 +960,7 @@ struct SketchScreen: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("strokes=\(model.strokeCount) shapes=\(model.shapeCount) wetSent=\(model.wetSent) wetRecv=\(model.wetRecv)")
+                Text("strokes=\(model.strokeCount) shapes=\(model.shapeCount) wetSent=\(model.wetSent) wetRecv=\(model.wetRecv) est=\(model.estUpdated)")
                     .font(.system(size: 13, design: .monospaced))
                     .accessibilityIdentifier("sketchStatus")
                 Spacer()
@@ -926,6 +1001,7 @@ struct SketchCanvas: UIViewRepresentable {
             case .cancelled: model.penEnded(cancelled: true)
             }
         }
+        canvas.onHover = { model.hover($0) }
 
         // PencilKit's picker works with any first responder; it hands us
         // the selected tool through the observer. `-tool` pins the tool

@@ -74,6 +74,10 @@ struct StrokeStyle {
     var grainLayer: UInt32 = 0
 
     static let maskEdge: UInt32 = 3
+    /// Grain kind 1: value noise seeded by `grainLayer`.
+    static let grainNoise: UInt32 = 4
+    /// Grain follows the stroke's own uv rather than the canvas.
+    static let grainStroke: UInt32 = 16
     static let multiply: UInt32 = 32
     static let discard: UInt32 = 64
     static let stride = MemoryLayout<StrokeStyle>.stride
@@ -82,12 +86,19 @@ struct StrokeStyle {
         let c = Self.linearColor(style.color)
         color = SIMD4(c.x, c.y, c.z, c.w * style.opacity)
         mask = SIMD4(1, 0, style.hardness, 0)
-        grain = .zero
         self.depth = depth
         var flags: UInt32 = 0
         if style.hardness < 1 { flags |= Self.maskEdge }
         if style.blend == .multiply { flags |= Self.multiply }
         if style.overlap == .discard { flags |= Self.discard }
+        if let g = style.grain {
+            grain = SIMD4(g.scale, g.strength, 0, 0)
+            grainLayer = g.seed
+            flags |= Self.grainNoise
+            if g.mapping == .stroke { flags |= Self.grainStroke }
+        } else {
+            grain = .zero
+        }
         self.flags = flags
     }
 
@@ -295,6 +306,9 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     private var wetOrder: [String] = []
     /// The local live stroke.
     private let local: GPUGeometry
+    /// The Pencil Pro hover preview: one dab above everything.
+    private let hover: GPUGeometry
+    private var hasHover = false
     private var localGeometry: InkGeometry?
     private var hasLocal = false
     /// Local strokes past pen-up whose commit is held for estimated-property
@@ -334,6 +348,7 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         0.1 + 0.001 * Float(w - j)
     }
     static let liveDepth: Float = 0.01
+    static let hoverDepth: Float = 0.005
 
     init?(view: MTKView) {
         view.colorPixelFormat = Self.colorFormat
@@ -354,6 +369,7 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         self.view = view
         batch = GPUGeometry(device: device)
         local = GPUGeometry(device: device)
+        hover = GPUGeometry(device: device)
         super.init()
     }
 
@@ -614,6 +630,23 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         needsDisplay()
     }
 
+    // MARK: hover preview
+
+    /// Show the tip the pen would leave where it hovers (`hoverDabMesh`,
+    /// colour alpha already reduced); replaces the previous dab.
+    func setHover(mesh: InkMesh) {
+        let geometry = InkGeometry(mesh, depth: Self.hoverDepth)
+        hover.upload(geometry)
+        hasHover = !geometry.isEmpty
+        needsDisplay()
+    }
+
+    func clearHover() {
+        guard hasHover else { return }
+        hasHover = false
+        needsDisplay()
+    }
+
     // MARK: drawing
 
     func needsDisplay() {
@@ -661,6 +694,7 @@ final class InkRenderer: NSObject, MTKViewDelegate {
                     draw(entry)
                 }
                 if hasLocal { draw(local) }
+                if hasHover { draw(hover) }
             }
         }
         encoder.endEncoding()
