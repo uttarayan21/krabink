@@ -19,6 +19,8 @@ required-features = ["bindgen"]
 [features]
 # Pulls in the uniffi CLI for the bindgen bin; keep it off for iOS lib builds.
 bindgen = ["uniffi/cli"]
+# The ink-stroke-modeler input model trial; the iOS build turns it on.
+ism = ["pendant-core/ism"]
 
 [dependencies]
 pendant-core.workspace = true

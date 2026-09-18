@@ -14,8 +14,9 @@ mod types;
 
 pub use brush::{
     AssetInfo, AssetKind, Blend, BrushKnobs, BrushModeler, BrushRef, BuiltinBrush, CustomBrush,
-    INK_VERTEX_FLOATS, InkMesh, InkStyle, MaskStyle, Overlap, RawSample, StrokeEnd, builtin_assets,
-    builtin_brushes,
+    INK_VERTEX_FLOATS, InkMesh, InkStyle, InputModel, MaskStyle, Overlap, RawSample, Recording,
+    StrokeEnd, StrokeMetrics, builtin_assets, builtin_brushes, ism_available, measure_recording,
+    parse_recording,
 };
 pub use engine::{Core, CoreListener, NoteListener, NoteSession, PendantError};
 pub use types::{

@@ -1,6 +1,6 @@
 # Brush engine: stamp/texture brushes for Pendant
 
-Status: P0–P3 implemented (notes at the end); P4 planned.
+Status: P0–P4 implemented (notes at the end). P4's decision: the EMA model ships, ISM stays a feature-gated trial.
 
 ## Context
 
@@ -611,3 +611,82 @@ simulator and the iPad are on 18.
 Not done in P3: the `LiveInk` mesh delta (`GPUGeometry.append/truncate`):
 a stamped stroke at spacing 0.15 re-uploads a few thousand quads per
 frame, which has not shown up in the redraw timings.
+
+### P4 (done): ISM trial and decision
+
+Core:
+
+- `brush/ism.rs` (feature `ism`, `ink-stroke-modeler-rs` 0.1, MIT/Apache,
+  MSRV 1.85) wraps the spring-mass `StrokeModeler`. Positions stay in
+  canvas units (the model is linear in position, so only the wobble speed
+  window and the stopping distance carry a unit; `IsmParams::units_per_cm`
+  = 64 scales the suggested cm/s values). Time is seconds from the first
+  sample; a clock that runs backwards is clamped, an identical input is
+  skipped, a pause longer than the engine takes in one `update` (~105 ms
+  at 180 Hz × 20 outputs) is bridged with synthetic "held" moves so
+  `TooFarApart` never fires. Tilt is not modelled by ISM: it is carried by
+  interpolating between the previous and current raw sample over the
+  modelled times (azimuth the short way round). `predict` runs the EMA
+  rule from the last modelled point (the engine has no `Clone`, so it
+  cannot be run ahead without committing). `finish` sends `Up` one output
+  period after the last sample and then lands the stroke on the pen (the
+  spring gets at most 20 settling steps, a fast lift beats it).
+- `InputModelKind { Ema, Ism }` + `Modeler` enum behind `BrushModeler`
+  (`with_model`, `model()`, `ism_available()`, `InputModelKind::{name,
+  parse, available}`). `push` now returns `Vec<StrokePoint>` (ISM upsamples
+  a slow pen), `finish` takes `&mut self` and appends the model's tail.
+- `corpus::StrokeMetrics::{measure, measure_with}` (points, raw jitter,
+  jitter, lag = distance to the raw sample nearest in time, deviation =
+  distance to the raw polyline, overshoot, width range, vertices, µs) and
+  `corpus::model_points`; `tests/brush_corpus.rs` measures every model the
+  build has and `PENDANT_METRICS_JSON=path` dumps the rows.
+
+FFI/iOS/desktop:
+
+- `InputModel` enum, `BrushModeler.for_brush_with(brush, model)`,
+  `ism_available()`, `parse_recording(text) -> Recording`,
+  `measure_recording(recording, brush, model) -> StrokeMetrics`.
+  `scripts/build-ios-core.sh` builds the iOS core with `--features ism`.
+- Brush lab: an EMA/ISM segmented control on the presets page and a new
+  "corpus" page that replays the bundled recordings (the corpus folder is
+  copied into the app as `brush/`) through every model, raw path in grey
+  under each, metrics line above; `-labPage 0|1|2` and `-labModel ema|ism`
+  preselect. `testBrushLabReplaysCorpus` asserts both models report.
+- `pendant brush-lab --corpus <file|dir> [--presets self,pen,…,builtin:x]
+  [--models ema,ism] [--out dir] [--svg] [--metrics]` (desktop feature
+  `ism` for the ISM row): one SVG grid per recording via
+  `elements_to_svg` (columns presets, rows models, raw path under each) and
+  `metrics.json`. Not done: the headless bevy PNG path and
+  `--dump-sketch`; the SVG comes from the same outline code the export
+  uses, which was enough to judge the models.
+
+Decision memo (fifteen iPad recordings, debug build, `PENDANT_METRICS_JSON`):
+
+| tool / stroke | model | points | jitter | lag | deviation | µs |
+|---|---|---|---|---|---|---|
+| fountain slow calligraphy (6 files) | EMA | 195–690 | 0.19–0.35 | 0.3–0.8 | 0.03–0.04 | 40–130 |
+| | ISM | +10–15 % | 0.07–0.13 | 2.8–9.1 | 0.10–0.28 | 2.2× |
+| pencil size 45, fast (5 files) | EMA | 126–289 | 0.08–0.13 | 2.3–4.2 | 0.05–0.09 | 20–70 |
+| | ISM | +12 % | 0.09–0.14 | 25–47 | 0.6–1.3 | 2× |
+| marker / monoline / pen, fast | EMA | 73–468 | 0.11–0.18 | 1.6–4.5 | 0.03–0.14 | 15–100 |
+| | ISM | +12–20 % | 0.13–0.16 | 8–41 | 0.4–1.1 | 2× |
+
+- ISM halves the residual jitter on slow strokes (the wobble smoother is
+  doing what it is for) and leaves fast strokes unchanged.
+- ISM trails a fast pen by 25–47 canvas units at pencil speed: that is the
+  spring's time constant (~15 ms at the suggested drag), and it is what the
+  library's own predictor exists to hide. Without that predictor wired
+  (it needs the engine to be cloneable or a `&mut predict`) the live stroke
+  would visibly hang behind the Pencil, which is the one thing the P1 lag
+  fix was about.
+- The committed shape deviates from the raw path by 0.6–1.3 units on the
+  wide pencil (corner rounding) versus < 0.1 for EMA; on a 45-unit tip that
+  is invisible, on a 0.5-unit monoline it is 1 unit.
+- Cost: 2× the input-stage CPU (still ≤ 0.3 ms per stroke in a debug
+  build) and 10–20 % more stored points.
+
+Call: EMA ships. ISM stays behind the `ism` feature (built into the iOS lab
+for side-by-side feel, not selectable on the canvas). Revisit only if slow
+calligraphy wobble becomes a complaint; the cheap next step then is ISM's
+wobble smoother alone in front of the EMA, not the spring model, and the
+full model only with its predictor exposed upstream.

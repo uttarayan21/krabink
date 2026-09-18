@@ -4257,6 +4257,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a257582fdcde896fd96463bf2d40eefea0580021c0712a0e2b028b60b47a837a"
 
 [[package]]
+name = "ink-stroke-modeler-rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd1c3066d5abcd42e8fcfd14f76e5397b373e202b3fdf7628d269b05b889bdd6"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "inotify"
 version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5667,6 +5676,7 @@ dependencies = [
 name = "pendant-core"
 version = "0.1.0"
 dependencies = [
+ "ink-stroke-modeler-rs",
  "loro",
  "lyon_tessellation",
  "postcard",

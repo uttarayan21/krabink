@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Document model, CRDT wrapper, sync protocol and storage for pendant"
 
+[features]
+# The ink-stroke-modeler input model trial (P4); off by default.
+ism = ["dep:ink-stroke-modeler-rs"]
+
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
@@ -14,6 +18,7 @@ tracing.workspace = true
 loro.workspace = true
 redb.workspace = true
 lyon_tessellation.workspace = true
+ink-stroke-modeler-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true

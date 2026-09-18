@@ -20,7 +20,7 @@ for target in "${targets[@]}"; do
   # staticlib only: no link step, so the (macOS-targeting) nix cc-wrapper and
   # its libiconv never get involved. The cdylib crate-type would try to link
   # a per-target dylib nobody needs on iOS.
-  cargo rustc -p pendant-ffi --release --target "$target" --crate-type staticlib
+  cargo rustc -p pendant-ffi --release --features ism --target "$target" --crate-type staticlib
 done
 
 # Library-mode bindgen off one static lib (the metadata is target-independent).

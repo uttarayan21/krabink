@@ -19,8 +19,9 @@
 //! input model (a stroke dumped at hold time). Every header the parser
 //! does not know is ignored, so recorders may add more.
 
-use crate::brush::RawSample;
-use crate::stroke::{Rgba, Tilt, Tool};
+use crate::brush::{BrushModeler, BrushSpec, InputModelKind, RawSample, StrokeEnd, TipEvaluator};
+use crate::geom::{DEFAULT_TOLERANCE, Ink};
+use crate::stroke::{Rgba, StrokePoint, Tilt, Tool};
 use crate::{Error, Result};
 
 /// One recorded stroke.
@@ -121,6 +122,174 @@ pub fn parse(text: &str) -> Result<Recording> {
         }
     }
     Ok(rec)
+}
+
+/// How an input model behaved on one recording. Every number is a
+/// canvas-unit or a count; bounds live with the callers (the corpus test
+/// gates, the labs report).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StrokeMetrics {
+    pub samples: usize,
+    pub points: usize,
+    /// Mean second difference over mean step of the raw samples: the hand
+    /// jitter the model starts from.
+    pub raw_jitter: f32,
+    /// The same over the modelled points: what is left after smoothing.
+    pub jitter: f32,
+    /// Mean distance between each modelled point and the raw sample
+    /// nearest in time: how far the live stroke trails the pen.
+    pub lag: f32,
+    /// Mean distance from each modelled point to the raw polyline: how far
+    /// the committed shape strays from where the pen went.
+    pub deviation: f32,
+    /// Distance from the finished stroke's last point to the last raw
+    /// sample.
+    pub overshoot: f32,
+    /// Lowest and highest tip width the preset produced.
+    pub width: (f32, f32),
+    pub vertices: usize,
+    /// Wall time of push + finish, microseconds.
+    pub micros: u64,
+}
+
+impl StrokeMetrics {
+    /// Model `rec` with the recording's own tool preset.
+    pub fn measure(rec: &Recording, model: InputModelKind) -> Result<Self> {
+        let spec = BrushSpec::preset(rec.tool);
+        Self::measure_with(rec, &spec, rec.size, model).map(|(m, _)| m)
+    }
+
+    /// Model `rec` with any spec; also the points, for drawing.
+    pub fn measure_with(
+        rec: &Recording,
+        spec: &BrushSpec,
+        size: f32,
+        model: InputModelKind,
+    ) -> Result<(Self, Vec<StrokePoint>)> {
+        let started = std::time::Instant::now();
+        let points = model_points(rec, spec, size, model)?;
+        let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let origin = rec.samples.first().map_or(0.0, |s| s.t_ms);
+        let lag = mean(points.iter().map(|p| {
+            let t = origin + f64::from(p.t_ms);
+            rec.samples
+                .iter()
+                .min_by(|a, b| (a.t_ms - t).abs().total_cmp(&(b.t_ms - t).abs()))
+                .map_or(0.0, |s| (p.x - s.x).hypot(p.y - s.y))
+        }));
+        let raw_path: Vec<[f32; 2]> = rec.samples.iter().map(|s| [s.x, s.y]).collect();
+        let deviation = mean(
+            points
+                .iter()
+                .map(|p| distance_to_polyline([p.x, p.y], &raw_path)),
+        );
+        let overshoot = match (points.last(), rec.samples.last()) {
+            (Some(p), Some(s)) => (p.x - s.x).hypot(p.y - s.y),
+            _ => 0.0,
+        };
+        let ink = Ink::custom(spec.clone(), rec.color.unwrap_or(Rgba::BLACK), size);
+        let tips = TipEvaluator::evaluate(spec, size, &points, StrokeEnd::Complete);
+        let width = tips.iter().fold((f32::INFINITY, 0.0_f32), |(lo, hi), t| {
+            (lo.min(t.w), hi.max(t.w))
+        });
+        let mesh = ink.mesh(&points, StrokeEnd::Complete, DEFAULT_TOLERANCE);
+        let metrics = Self {
+            samples: rec.samples.len(),
+            points: points.len(),
+            raw_jitter: jitter(rec.samples.iter().map(|s| [s.x, s.y])),
+            jitter: jitter(points.iter().map(|p| [p.x, p.y])),
+            lag,
+            deviation,
+            overshoot,
+            width,
+            vertices: mesh.vertices.len(),
+            micros,
+        };
+        Ok((metrics, points))
+    }
+
+    /// One JSON object, `file` and `model` included, no serializer needed.
+    pub fn json(&self, file: &str, model: InputModelKind) -> String {
+        format!(
+            "{{\"file\":\"{file}\",\"model\":\"{}\",\"samples\":{},\"points\":{},\"raw_jitter\":{},\"jitter\":{},\"lag\":{},\"deviation\":{},\"overshoot\":{},\"width_min\":{},\"width_max\":{},\"vertices\":{},\"micros\":{}}}",
+            model.name(),
+            self.samples,
+            self.points,
+            self.raw_jitter,
+            self.jitter,
+            self.lag,
+            self.deviation,
+            self.overshoot,
+            self.width.0,
+            self.width.1,
+            self.vertices,
+            self.micros
+        )
+    }
+}
+
+/// The points `model` makes of `rec` under `spec`: push every sample,
+/// finish.
+pub fn model_points(
+    rec: &Recording,
+    spec: &BrushSpec,
+    size: f32,
+    model: InputModelKind,
+) -> Result<Vec<StrokePoint>> {
+    let mut modeler = BrushModeler::with_model(rec.tool, spec.clone(), size, model)?;
+    for &s in &rec.samples {
+        modeler.push(s);
+    }
+    Ok(modeler.finish())
+}
+
+fn mean(values: impl Iterator<Item = f32>) -> f32 {
+    let (sum, n) = values.fold((0.0_f32, 0_usize), |(s, n), v| (s + v, n + 1));
+    sum / n.max(1) as f32 // ast-grep-ignore: no-as-cast (count to float)
+}
+
+/// Mean second difference of position over the mean step: jitter that
+/// does not depend on how densely the points fall.
+pub fn jitter(points: impl Iterator<Item = [f32; 2]>) -> f32 {
+    let pts: Vec<[f32; 2]> = points.collect();
+    if pts.len() < 3 {
+        return 0.0;
+    }
+    let second: f32 = pts
+        .windows(3)
+        .map(|w| {
+            let ax = w[0][0] - 2.0 * w[1][0] + w[2][0];
+            let ay = w[0][1] - 2.0 * w[1][1] + w[2][1];
+            ax.hypot(ay)
+        })
+        .sum();
+    let step: f32 = pts
+        .windows(2)
+        .map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]))
+        .sum();
+    let steps = (pts.len() - 1) as f32; // ast-grep-ignore: no-as-cast (count to float)
+    (second / (pts.len() - 2) as f32) / (step / steps).max(1e-3) // ast-grep-ignore: no-as-cast (count to float)
+}
+
+fn distance_to_polyline(p: [f32; 2], path: &[[f32; 2]]) -> f32 {
+    let to_segment = |a: [f32; 2], b: [f32; 2]| {
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 > 0.0 {
+            (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (p[0] - (a[0] + t * dx)).hypot(p[1] - (a[1] + t * dy))
+    };
+    match path {
+        [] => 0.0,
+        [only] => to_segment(*only, *only),
+        _ => path
+            .windows(2)
+            .map(|w| to_segment(w[0], w[1]))
+            .fold(f32::INFINITY, f32::min),
+    }
 }
 
 #[cfg(test)]

@@ -176,8 +176,13 @@ confidence; pen-up commits a `ShapeElement` under the wet stroke's id.
   and an `est` flag) files. `tests/corpus/shapes/` has seven recordings for
   `tests/shape_corpus.rs`; `tests/corpus/brush/` has fifteen iPad
   recordings (fountain, pencil, pen, marker, monoline) for
-  `tests/brush_corpus.rs`, which prints jitter, lag, overshoot, width range
-  and vertex count and asserts loose bounds.
+  `tests/brush_corpus.rs`, which measures every input model the build has
+  (`corpus::StrokeMetrics`: jitter, lag, deviation from the raw path,
+  overshoot, width range, vertex count, µs), asserts loose bounds and
+  dumps rows with `PENDANT_METRICS_JSON=path`.
+- `brush/ism.rs` (feature `ism`): the ink-stroke-modeler input model
+  behind `InputModelKind::Ism` / `BrushModeler::with_model`; the P4 trial,
+  not what the canvas uses (decision in `docs/plans/brush-engine.md`).
 
 ## 4. Relay (`pendant-server`)
 
@@ -214,6 +219,10 @@ Bevy app with egui UI. Modules:
   `pendant://` texture loader. Committed elements are ink meshes at z
   `k/100`; remote wet strokes at `990 + j/100` are dropped when the commit
   lands or on timeout.
+- `lab.rs`: `pendant brush-lab --corpus <file|dir> --presets … --models
+  ema,ism --out dir --svg --metrics`, the tuning bench: SVG grids per
+  recording through `elements_to_svg` and `metrics.json` from
+  `corpus::StrokeMetrics`; the `ism` feature adds the ISM row.
 - `ink_assets.rs`: `InkAssets` resource, the mask and grain `r8` texture
   arrays (CPU box mips, `image` crate decoding) from the bundled PNGs and
   the workspace's assets, rebuilt when `asset_ids()` changes; scenes
@@ -321,11 +330,13 @@ Bonjour usage strings, file sharing for recordings).
   tints a black canvas instead of vanishing. Thumbnails render offscreen
   through the same pipeline at 2× with MSAA 4.
 - `BrushLabScreen.swift`: preset grid (five tools × three widths from one
-  canned stroke) and a PencilKit calibration page for the `widthScale` /
-  `opacityScale` ratios, currently 1.0.
+  canned stroke, EMA/ISM toggle), a PencilKit calibration page for the
+  `widthScale` / `opacityScale` ratios (currently 1.0) and a corpus page
+  that replays the bundled `brush/` recordings through every input model
+  with their metrics (`-labPage`, `-labModel` preselect).
 
 Launch arguments read from `UserDefaults`: `serverURL`, `altURLs`,
-`fallbackURL`, `token`, `relayId`, `pairURI`, `spike`, `brushLab`,
+`fallbackURL`, `token`, `relayId`, `pairURI`, `spike`, `brushLab`, `labPage`, `labModel`,
 `recordStrokes`, `tool`, `figureEight`, `fakeEstimates`, `pencilOnly`,
 `anyInput`. UI tests take the relay from `PENDANT_TEST_SERVER` and
 `PENDANT_TEST_TOKEN`.

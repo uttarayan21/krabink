@@ -15,6 +15,11 @@ targets:
     platform: iOS
     sources:
       - Sources
+      # The brush corpus, copied as a folder so the brush lab can replay
+      # the same recordings the core tests measure.
+      - path: ../../crates/pendant-core/tests/corpus/brush
+        type: folder
+        buildPhase: resources
     dependencies:
       - package: PendantCore
     # Explicit Info.plist (instead of GENERATE_INFOPLIST_FILE) because the

@@ -4,6 +4,7 @@ mod docs;
 mod errors;
 mod ink_assets;
 mod ink_material;
+mod lab;
 mod relay;
 mod replay;
 mod settings;
@@ -42,6 +43,21 @@ fn main() -> Result<()> {
             server,
             token,
             strokes,
+        }),
+        Some(cli::SubCommand::BrushLab {
+            corpus,
+            presets,
+            models,
+            out,
+            svg,
+            metrics,
+        }) => lab::run(lab::LabArgs {
+            corpus,
+            presets,
+            models,
+            out,
+            svg,
+            metrics,
         }),
         Some(cli::SubCommand::Pair { uri }) => config::adopt_pair(&uri),
         None => run_app(args),

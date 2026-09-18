@@ -16,6 +16,8 @@ test = false
 # Dev-only fast linking: `cargo run -p pendant --features dev`.
 # Never enable for release/Nix builds - it links against libbevy_dylib.
 dev = ["bevy/dynamic_linking"]
+# The ink-stroke-modeler input model row in `pendant brush-lab`.
+ism = ["pendant-core/ism"]
 
 [dependencies]
 pendant-core.workspace = true

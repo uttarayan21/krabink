@@ -61,6 +61,19 @@ final class SketchUITests: XCTestCase {
         XCTAssertEqual(result, .completed, "sketch status never showed \(text); at: \(status.label)")
     }
 
+    /// The brush lab's corpus page replays a bundled recording through
+    /// every input model the core was built with and prints their metrics.
+    func testBrushLabReplaysCorpus() {
+        let app = launch(extra: ["-brushLab", "1", "-labPage", "2"])
+        let metrics = app.staticTexts["labMetrics"]
+        XCTAssertTrue(metrics.waitForExistence(timeout: 10))
+        let text = metrics.label
+        XCTAssertTrue(text.contains("EMA points="), text)
+        XCTAssertTrue(text.contains("lag="), text)
+        // The iOS core is built with the `ism` feature.
+        XCTAssertTrue(text.contains("ISM points="), text)
+    }
+
     func testPhase1CreateSketchAndDraw() {
         let app = launch()
         waitConnected(app)

@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use pendant_core as pcore;
 
+use crate::engine::Result;
+
 use crate::types::{
     Element, Point2, Recognition, Shape, Stroke, StrokePoint, Tilt, Tool, rgba_from_u32,
     rgba_to_u32,
@@ -30,6 +32,155 @@ pub struct RawSample {
     /// Whether a revision is expected (`estimatedPropertiesExpectingUpdates`
     /// non-empty).
     pub expects_update: bool,
+}
+
+impl From<pcore::RawSample> for RawSample {
+    fn from(s: pcore::RawSample) -> Self {
+        Self {
+            x: s.x,
+            y: s.y,
+            force: s.force,
+            t_ms: s.t_ms,
+            tilt: s.tilt.map(Into::into),
+            estimation_id: s.estimate.map(|e| e.id),
+            expects_update: s.estimate.is_some_and(|e| e.pending),
+        }
+    }
+}
+
+/// Which smoother turns raw samples into stored points. `Ema` ships;
+/// `Ism` (ink-stroke-modeler) is the P4 trial and only builds with the
+/// `ism` feature ([`ism_available`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum InputModel {
+    Ema,
+    Ism,
+}
+
+impl From<InputModel> for pcore::InputModelKind {
+    fn from(m: InputModel) -> Self {
+        match m {
+            InputModel::Ema => Self::Ema,
+            InputModel::Ism => Self::Ism,
+        }
+    }
+}
+
+impl From<pcore::InputModelKind> for InputModel {
+    fn from(m: pcore::InputModelKind) -> Self {
+        match m {
+            pcore::InputModelKind::Ema => Self::Ema,
+            pcore::InputModelKind::Ism => Self::Ism,
+        }
+    }
+}
+
+/// Whether this build can make an [`InputModel::Ism`] modeler.
+#[uniffi::export]
+pub fn ism_available() -> bool {
+    pcore::ism_available()
+}
+
+/// One recorded stroke (`-recordStrokes 1` output, the test corpora):
+/// what [`parse_recording`] reads from the text.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct Recording {
+    pub version: u8,
+    pub tool: Tool,
+    /// Base width, canvas units.
+    pub size: f32,
+    /// Packed RGBA, when the file says.
+    pub color: Option<u32>,
+    /// Rows already went through an input model.
+    pub modeled: bool,
+    pub has_tilt: bool,
+    pub samples: Vec<RawSample>,
+}
+
+impl From<pcore::corpus::Recording> for Recording {
+    fn from(r: pcore::corpus::Recording) -> Self {
+        Self {
+            version: r.version,
+            tool: r.tool.into(),
+            size: r.size,
+            color: r.color.map(crate::types::rgba_to_u32),
+            modeled: r.modeled,
+            has_tilt: r.has_tilt(),
+            samples: r.samples.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<Recording> for pcore::corpus::Recording {
+    fn from(r: Recording) -> Self {
+        Self {
+            version: r.version,
+            expect: None,
+            tool: r.tool.into(),
+            size: r.size,
+            color: r.color.map(crate::types::rgba_from_u32),
+            modeled: r.modeled,
+            samples: r.samples.into_iter().map(Into::into).collect(),
+            estimated: Vec::new(),
+        }
+    }
+}
+
+/// Parse a recorded stroke; malformed rows are an error, unknown headers
+/// are skipped.
+#[uniffi::export]
+pub fn parse_recording(text: String) -> Result<Recording> {
+    Ok(pcore::corpus::parse(&text)?.into())
+}
+
+/// How an input model behaved on a recording; see
+/// `pendant_core::corpus::StrokeMetrics` for what each number means.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct StrokeMetrics {
+    pub samples: u32,
+    pub points: u32,
+    pub raw_jitter: f32,
+    pub jitter: f32,
+    pub lag: f32,
+    pub deviation: f32,
+    pub overshoot: f32,
+    pub width_min: f32,
+    pub width_max: f32,
+    pub vertices: u32,
+    pub micros: u64,
+}
+
+impl From<pcore::corpus::StrokeMetrics> for StrokeMetrics {
+    fn from(m: pcore::corpus::StrokeMetrics) -> Self {
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        Self {
+            samples: count(m.samples),
+            points: count(m.points),
+            raw_jitter: m.raw_jitter,
+            jitter: m.jitter,
+            lag: m.lag,
+            deviation: m.deviation,
+            overshoot: m.overshoot,
+            width_min: m.width.0,
+            width_max: m.width.1,
+            vertices: count(m.vertices),
+            micros: m.micros,
+        }
+    }
+}
+
+/// Replay `recording` through `model` with `brush` and measure it. Fails
+/// for a model this build lacks.
+#[uniffi::export]
+pub fn measure_recording(
+    recording: Recording,
+    brush: BrushRef,
+    model: InputModel,
+) -> Result<StrokeMetrics> {
+    let rec: pcore::corpus::Recording = recording.into();
+    let (spec, size) = brush.resolved();
+    let (metrics, _) = pcore::corpus::StrokeMetrics::measure_with(&rec, &spec, size, model.into())?;
+    Ok(metrics.into())
 }
 
 impl From<RawSample> for pcore::RawSample {
@@ -290,6 +441,18 @@ pub fn builtin_brushes() -> Vec<BuiltinBrush> {
 }
 
 impl BrushRef {
+    /// The spec this brush draws with (custom when it decodes, the tool's
+    /// preset otherwise) and its width.
+    fn resolved(&self) -> (pcore::BrushSpec, f32) {
+        let tool = self.tool.into();
+        let spec = self
+            .custom
+            .as_ref()
+            .and_then(CustomBrush::decoded)
+            .map_or_else(|| pcore::BrushSpec::preset(tool), |c| c.spec);
+        (spec, self.base_width)
+    }
+
     fn ink(&self, color: u32) -> pcore::Ink<'static> {
         let color = rgba_from_u32(color);
         match self.custom.as_ref().and_then(CustomBrush::decoded) {
@@ -357,14 +520,27 @@ impl BrushModeler {
     #[uniffi::constructor]
     pub fn for_brush(brush: BrushRef) -> Arc<Self> {
         let tool = brush.tool.into();
-        let spec = brush
-            .custom
-            .as_ref()
-            .and_then(CustomBrush::decoded)
-            .map_or_else(|| pcore::BrushSpec::preset(tool), |c| c.spec);
+        let (spec, size) = brush.resolved();
         Arc::new(Self {
-            inner: Mutex::new(pcore::BrushModeler::for_brush(tool, spec, brush.base_width)),
+            inner: Mutex::new(pcore::BrushModeler::for_brush(tool, spec, size)),
         })
+    }
+
+    /// [`for_brush`](Self::for_brush) with a chosen input model. Fails for
+    /// a model this build lacks ([`ism_available`]).
+    #[uniffi::constructor]
+    pub fn for_brush_with(brush: BrushRef, model: InputModel) -> Result<Arc<Self>> {
+        let tool = brush.tool.into();
+        let (spec, size) = brush.resolved();
+        let inner = pcore::BrushModeler::with_model(tool, spec, size, model.into())?;
+        Ok(Arc::new(Self {
+            inner: Mutex::new(inner),
+        }))
+    }
+
+    /// Which input model this modeler runs.
+    pub fn model(&self) -> InputModel {
+        self.lock().model().into()
     }
 
     /// Feed raw samples in order; the points they produced (fewer than the
@@ -373,7 +549,7 @@ impl BrushModeler {
         let mut inner = self.lock();
         samples
             .into_iter()
-            .filter_map(|s| inner.push(s.into()))
+            .flat_map(|s| inner.push(s.into()))
             .map(Into::into)
             .collect()
     }

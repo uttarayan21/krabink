@@ -36,6 +36,30 @@ pub enum SubCommand {
         /// URI shown next to the QR code on the sharing device.
         uri: String,
     },
+    /// Replay recorded strokes through the input models and presets and
+    /// write SVG grids + metrics.json (the brush engine's tuning bench).
+    BrushLab {
+        /// A recording (`# pendant-stroke v2` text) or a directory of them.
+        #[clap(long)]
+        corpus: std::path::PathBuf,
+        /// Columns: tool names (pen, pencil, marker, monoline, fountain),
+        /// bundled brush ids (builtin:crayon) or `self`, the recording's
+        /// own tool.
+        #[clap(long, value_delimiter = ',', default_value = "self")]
+        presets: Vec<String>,
+        /// Rows: ema, ism (needs the `ism` feature).
+        #[clap(long, value_delimiter = ',', default_value = "ema")]
+        models: Vec<String>,
+        /// Output directory.
+        #[clap(long, default_value = "target/lab")]
+        out: std::path::PathBuf,
+        /// Write one SVG per recording.
+        #[clap(long)]
+        svg: bool,
+        /// Write metrics.json.
+        #[clap(long)]
+        metrics: bool,
+    },
     /// Stream synthetic 120Hz pen strokes through the relay (latency rig).
     Replay {
         /// Sync server url, e.g. ws://127.0.0.1:8722/ws.

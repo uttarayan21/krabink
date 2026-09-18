@@ -6,6 +6,11 @@
 // Calibration: PencilKit draws the same stroke with its own ink above ours
 // with the same tool, for the width/opacity ratios in `StrokeCodec`
 // (`widthScale`, `opacityScale`): 1.0 until measured here.
+// Corpus: the recordings bundled from `crates/pendant-core/tests/corpus/
+// brush/` replayed through every input model this build has (EMA, and
+// ISM when the core was built with the `ism` feature), the raw pen path
+// in grey under each, with the corpus metrics; the desktop's
+// `pendant brush-lab` draws the same grid from the same core.
 
 import MetalKit
 import PencilKit
@@ -14,20 +19,41 @@ import SwiftUI
 import UIKit
 
 struct BrushLabScreen: View {
-    @State private var page = 0
+    /// `-labPage 0|1|2` and `-labModel ema|ism` preselect (screenshots,
+    /// UI tests).
+    @State private var page = UserDefaults.standard.integer(forKey: "labPage")
+    @State private var model: InputModel =
+        UserDefaults.standard.string(forKey: "labModel") == "ism" && ismAvailable() ? .ism : .ema
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker("page", selection: $page) {
-                Text("presets").tag(0)
-                Text("calibration").tag(1)
+            HStack {
+                Picker("page", selection: $page) {
+                    Text("presets").tag(0)
+                    Text("calibration").tag(1)
+                    Text("corpus").tag(2)
+                }
+                .pickerStyle(.segmented)
+                if page == 0 && ismAvailable() {
+                    Picker("model", selection: $model) {
+                        ForEach(LabStroke.models, id: \.self) { m in
+                            Text(LabStroke.name(m)).tag(m)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 140)
+                    .accessibilityIdentifier("labModel")
+                }
             }
-            .pickerStyle(.segmented)
             .padding(8)
-            if page == 0 {
-                LabCanvas(elements: LabStroke.presetGrid())
-            } else {
+            switch page {
+            case 0:
+                LabCanvas(elements: LabStroke.presetGrid(model: model))
+                    .id(model)
+            case 1:
                 BrushCalibration()
+            default:
+                CorpusReplay()
             }
         }
     }
@@ -79,10 +105,28 @@ enum LabStroke {
         return "01ARZ3NDEKTSV4RRFFQ69G5F" + String(alphabet[n / 32 % 32]) + String(alphabet[n % 32])
     }
 
+    /// The input models this build offers: EMA always, ISM with the
+    /// `ism` core feature.
+    static var models: [InputModel] { ismAvailable() ? [.ema, .ism] : [.ema] }
+
+    static func name(_ model: InputModel) -> String {
+        switch model {
+        case .ema: "EMA"
+        case .ism: "ISM"
+        }
+    }
+
+    /// A modeler for `brush` running `model`, the EMA one when the build
+    /// lacks the model asked for.
+    static func modeler(_ brush: BrushRef, model: InputModel) -> BrushModeler {
+        (try? BrushModeler.forBrushWith(brush: brush, model: model)) ?? BrushModeler.forBrush(brush: brush)
+    }
+
     static func stroke(
-        _ n: Int, tool: Tool, custom: CustomBrush? = nil, width: Float, color: UInt32, origin: CGPoint
+        _ n: Int, tool: Tool, custom: CustomBrush? = nil, width: Float, color: UInt32, origin: CGPoint,
+        model: InputModel = .ema
     ) -> Stroke {
-        let modeler = BrushModeler.forBrush(brush: BrushRef(tool: tool, baseWidth: width, custom: custom))
+        let modeler = modeler(BrushRef(tool: tool, baseWidth: width, custom: custom), model: model)
         _ = modeler.push(samples: samples(origin: origin))
         return Stroke(
             id: id(n), tool: tool, color: color, baseWidth: width, kind: .polylineSample,
@@ -91,7 +135,7 @@ enum LabStroke {
 
     /// Rows: presets; columns: widths. A translucent blue bar under every
     /// row shows blend and self-overlap behaviour.
-    static func presetGrid() -> [Element] {
+    static func presetGrid(model: InputModel = .ema) -> [Element] {
         var out: [Element] = []
         for (row, (tool, _, custom)) in presets.enumerated() {
             let y = 40 + CGFloat(row) * rowHeight
@@ -101,9 +145,98 @@ enum LabStroke {
                     .stroke(
                         stroke(
                             out.count, tool: tool, custom: custom, width: width, color: 0x1E3CC8FF,
-                            origin: CGPoint(x: x, y: y))))
+                            origin: CGPoint(x: x, y: y), model: model)))
             }
         }
+        return out
+    }
+}
+
+/// One bundled recording replayed through every input model.
+struct CorpusReplay: View {
+    @State private var files: [URL] = CorpusReplay.bundled()
+    @State private var index = 0
+
+    var body: some View {
+        VStack(spacing: 4) {
+            if files.isEmpty {
+                Text("no recordings bundled (Pendant/corpus)").padding()
+            } else {
+                Picker("recording", selection: $index) {
+                    ForEach(files.indices, id: \.self) { i in
+                        Text(files[i].deletingPathExtension().lastPathComponent).tag(i)
+                    }
+                }
+                .pickerStyle(.menu)
+                .accessibilityIdentifier("labRecording")
+                let replay = CorpusReplay.replay(files[index])
+                Text(replay.summary)
+                    .font(.system(.caption, design: .monospaced))
+                    .accessibilityIdentifier("labMetrics")
+                LabCanvas(elements: replay.elements).id(index)
+            }
+        }
+    }
+
+    /// The `*.txt` recordings copied into the bundle's `brush` folder.
+    static func bundled() -> [URL] {
+        (Bundle.main.urls(forResourcesWithExtension: "txt", subdirectory: "brush") ?? [])
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    struct Replay {
+        var elements: [Element] = []
+        var summary = ""
+    }
+
+    /// Rows: models, each the raw path in grey under the modelled stroke,
+    /// stacked down the canvas. The summary is one metrics line per model.
+    static func replay(_ url: URL) -> Replay {
+        guard let text = try? String(contentsOf: url, encoding: .utf8),
+            let rec = try? parseRecording(text: text)
+        else {
+            return Replay(summary: "unreadable recording")
+        }
+        let xs = rec.samples.map(\.x)
+        let ys = rec.samples.map(\.y)
+        let minX = xs.min() ?? 0, minY = ys.min() ?? 0, maxY = ys.max() ?? 0
+        let pad: Float = 24
+        let cellHeight = maxY - minY + 2 * pad
+        let brush = BrushRef(tool: rec.tool, baseWidth: rec.size)
+        var out = Replay()
+        var lines: [String] = []
+        for (row, model) in LabStroke.models.enumerated() {
+            let shift = SIMD2<Float>(pad - minX, Float(row) * cellHeight + pad - minY)
+            let origin = rec.samples.first?.tMs ?? 0
+            let raw = rec.samples.map { s in
+                StrokePoint(
+                    x: s.x + shift.x, y: s.y + shift.y, force: 1,
+                    tMs: UInt32(max(0, (s.tMs - origin).rounded())), tilt: nil, size: nil)
+            }
+            out.elements.append(
+                .stroke(
+                    Stroke(
+                        id: LabStroke.id(out.elements.count), tool: .monoline, color: 0xA0A0A0FF,
+                        baseWidth: 0.6, kind: .polylineSample, points: raw, createdMs: 0, brush: nil)))
+            let modeler = LabStroke.modeler(brush, model: model)
+            _ = modeler.push(samples: rec.samples)
+            let points = modeler.finish().map { p in
+                StrokePoint(x: p.x + shift.x, y: p.y + shift.y, force: p.force, tMs: p.tMs, tilt: p.tilt, size: p.size)
+            }
+            out.elements.append(
+                .stroke(
+                    Stroke(
+                        id: LabStroke.id(out.elements.count), tool: rec.tool,
+                        color: rec.color ?? 0x000000FF, baseWidth: rec.size, kind: .polylineSample,
+                        points: points, createdMs: 0, brush: nil)))
+            if let m = try? measureRecording(recording: rec, brush: brush, model: model) {
+                lines.append(
+                    String(
+                        format: "%@ points=%d jitter=%.3f lag=%.2f dev=%.2f over=%.3f %dµs",
+                        LabStroke.name(model), m.points, m.jitter, m.lag, m.deviation, m.overshoot, m.micros))
+            }
+        }
+        out.summary = lines.joined(separator: "\n")
         return out
     }
 }

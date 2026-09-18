@@ -34,10 +34,12 @@ mod workspace;
 pub use brush::{
     Asset, AssetId, AssetKind, BUILTIN_CHALK, BUILTIN_CRAYON, BUILTIN_PENCIL_GRAINY, Behavior,
     Blend, BrushId, BrushKnobs, BrushModeler, BrushSpec, BuiltinBrush, Curve, CustomBrush,
-    EmaModel, Emit, Estimate, Grain, GrainMapping, GrainSource, InputParams, MAX_ASSET_BYTES, Mask,
-    Orient, Overlap, Paint, RawSample, Source, Stamped, StrokeEnd, Target, Tip, TipEvaluator,
-    TipState,
+    EmaModel, Emit, Estimate, Grain, GrainMapping, GrainSource, InputModelKind, InputParams,
+    MAX_ASSET_BYTES, Mask, Orient, Overlap, Paint, RawSample, Source, Stamped, StrokeEnd, Target,
+    Tip, TipEvaluator, TipState, ism_available,
 };
+#[cfg(feature = "ism")]
+pub use brush::{IsmModel, IsmParams, UNITS_PER_CM};
 pub use element::{Binding, Element, ShapeElement, Style};
 pub use export::{ExportAsset, ExportBundle, SKETCH_URI_PREFIX, elements_to_svg};
 pub use geom::{

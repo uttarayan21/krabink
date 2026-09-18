@@ -25,6 +25,8 @@
 
 mod dynamics;
 mod input;
+#[cfg(feature = "ism")]
+mod ism;
 pub(crate) mod rng;
 mod spec;
 
@@ -32,6 +34,8 @@ pub(crate) use dynamics::MIN_TIP;
 pub use dynamics::{StrokeEnd, TipEvaluator, TipState};
 pub(crate) use input::distance;
 pub use input::{EmaModel, Estimate, InputParams, RawSample};
+#[cfg(feature = "ism")]
+pub use ism::{IsmModel, IsmParams, UNITS_PER_CM};
 pub use spec::{
     Asset, AssetId, AssetKind, BUILTIN_CHALK, BUILTIN_CRAYON, BUILTIN_PENCIL_GRAINY, Behavior,
     Blend, BrushId, BrushKnobs, BrushSpec, BuiltinBrush, Curve, CustomBrush, Emit, Grain,
@@ -39,18 +43,122 @@ pub use spec::{
     Target, Tip,
 };
 
+use crate::Result;
 use crate::stroke::{StrokePoint, Tilt, Tool};
+
+/// Which input model smooths raw samples. [`Ema`](Self::Ema) is what
+/// ships; [`Ism`](Self::Ism) is the spring-mass trial, present without
+/// the `ism` feature so callers can name it, but only built with it
+/// (see [`ism_available`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputModelKind {
+    #[default]
+    Ema,
+    Ism,
+}
+
+impl InputModelKind {
+    pub const ALL: [Self; 2] = [Self::Ema, Self::Ism];
+
+    /// Short lower-case name, as on command lines and in metrics rows.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ema => "ema",
+            Self::Ism => "ism",
+        }
+    }
+
+    /// The inverse of [`name`](Self::name), case-insensitive.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|k| k.name().eq_ignore_ascii_case(name.trim()))
+    }
+
+    /// The models this binary can build.
+    pub fn available() -> Vec<Self> {
+        Self::ALL
+            .into_iter()
+            .filter(|k| *k != Self::Ism || ism_available())
+            .collect()
+    }
+}
+
+/// Whether [`InputModelKind::Ism`] can be built in this binary.
+pub const fn ism_available() -> bool {
+    cfg!(feature = "ism")
+}
+
+/// The input model behind a [`BrushModeler`].
+#[derive(Debug)]
+enum Modeler {
+    Ema(EmaModel),
+    /// Boxed: the spring-mass engine is several hundred bytes, the EMA
+    /// state a few dozen.
+    #[cfg(feature = "ism")]
+    Ism(Box<IsmModel>),
+}
+
+impl Modeler {
+    fn new(kind: InputModelKind, params: InputParams) -> Result<Self> {
+        match kind {
+            InputModelKind::Ema => Ok(Self::Ema(EmaModel::new(params))),
+            #[cfg(feature = "ism")]
+            InputModelKind::Ism => Ok(Self::Ism(Box::new(IsmModel::new(
+                params,
+                IsmParams::default(),
+            )?))),
+            #[cfg(not(feature = "ism"))]
+            InputModelKind::Ism => Err(crate::Error::Schema(
+                "built without the `ism` feature".into(),
+            )),
+        }
+    }
+
+    fn kind(&self) -> InputModelKind {
+        match self {
+            Self::Ema(_) => InputModelKind::Ema,
+            #[cfg(feature = "ism")]
+            Self::Ism(_) => InputModelKind::Ism,
+        }
+    }
+
+    fn push(&mut self, raw: RawSample) -> Vec<StrokePoint> {
+        match self {
+            Self::Ema(m) => m.push(raw).into_iter().collect(),
+            #[cfg(feature = "ism")]
+            Self::Ism(m) => m.push(raw),
+        }
+    }
+
+    fn predict(&self, raw: &[RawSample]) -> Vec<StrokePoint> {
+        match self {
+            Self::Ema(m) => m.predict(raw),
+            #[cfg(feature = "ism")]
+            Self::Ism(m) => m.predict(raw),
+        }
+    }
+
+    /// The points that end the stroke after everything pushed so far.
+    fn tail(&mut self) -> Vec<StrokePoint> {
+        match self {
+            Self::Ema(m) => m.landing().into_iter().collect(),
+            #[cfg(feature = "ism")]
+            Self::Ism(m) => m.finish(),
+        }
+    }
+}
 
 /// Turns one stroke's raw samples into stored [`StrokePoint`]s. Owns the
 /// points emitted so far; renderers draw [`points`](Self::points) plus a
 /// [`predict`](Self::predict) tail every frame and commit
 /// [`finish`](Self::finish) at pen-up.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct BrushModeler {
     tool: Tool,
     spec: BrushSpec,
     base_width: f32,
-    input: EmaModel,
+    input: Modeler,
     points: Vec<StrokePoint>,
     /// `(estimate id, index into points, revision still pending)` for
     /// emitted samples the platform may revise.
@@ -67,7 +175,7 @@ impl BrushModeler {
     pub fn for_brush(tool: Tool, spec: BrushSpec, size: f32) -> Self {
         Self {
             tool,
-            input: EmaModel::new(spec.input),
+            input: Modeler::Ema(EmaModel::new(spec.input)),
             spec,
             base_width: size.max(0.0),
             points: Vec::new(),
@@ -75,8 +183,26 @@ impl BrushModeler {
         }
     }
 
+    /// [`for_brush`](Self::for_brush) with a chosen input model. Fails for
+    /// a model this build lacks.
+    pub fn with_model(
+        tool: Tool,
+        spec: BrushSpec,
+        size: f32,
+        model: InputModelKind,
+    ) -> Result<Self> {
+        Ok(Self {
+            input: Modeler::new(model, spec.input)?,
+            ..Self::for_brush(tool, spec, size)
+        })
+    }
+
     pub fn tool(&self) -> Tool {
         self.tool
+    }
+
+    pub fn model(&self) -> InputModelKind {
+        self.input.kind()
     }
 
     pub fn spec(&self) -> &BrushSpec {
@@ -92,15 +218,21 @@ impl BrushModeler {
         &self.points
     }
 
-    /// Feed one raw sample; the point it produced, if it moved far enough
-    /// from the previous one to be worth emitting.
-    pub fn push(&mut self, raw: RawSample) -> Option<StrokePoint> {
-        let point = self.input.push(raw)?;
-        if let Some(e) = raw.estimate {
-            self.estimates.push((e.id, self.points.len(), e.pending));
+    /// Feed one raw sample; the points it produced: none when it was too
+    /// close to the previous one to be worth emitting, one for the EMA
+    /// model, several when the ISM model upsamples a slow pen. An
+    /// estimate id attaches to the last of them.
+    pub fn push(&mut self, raw: RawSample) -> Vec<StrokePoint> {
+        let points = self.input.push(raw);
+        if points.is_empty() {
+            return points;
         }
-        self.points.push(point);
-        Some(point)
+        if let Some(e) = raw.estimate {
+            self.estimates
+                .push((e.id, self.points.len() + points.len() - 1, e.pending));
+        }
+        self.points.extend_from_slice(&points);
+        points
     }
 
     /// The points `raw` would produce if pushed now, without pushing them.
@@ -136,12 +268,13 @@ impl BrushModeler {
             .collect()
     }
 
-    /// The finished stroke: every emitted point plus the last raw sample
-    /// landed exactly (streamline always lags the pen).
-    pub fn finish(&self) -> Vec<StrokePoint> {
-        let mut points = self.points.clone();
-        points.extend(self.input.landing());
-        points
+    /// The finished stroke: every emitted point plus the model's tail
+    /// (the EMA lands on the last raw sample it always lags; the ISM
+    /// spring settles onto it). Calling it again yields the same points.
+    pub fn finish(&mut self) -> Vec<StrokePoint> {
+        let tail = self.input.tail();
+        self.points.extend(tail);
+        self.points.clone()
     }
 }
 
@@ -228,16 +361,16 @@ mod tests {
         for s in line(10, 2.0, 8.0, 0.7) {
             m.push(s);
         }
-        let before = m.clone();
+        let before = m.points().to_vec();
         let tail: Vec<RawSample> = (10..14)
             .map(|i| raw(i as f32 * 2.0, 1.0, 0.7, 1000.0 + i as f64 * 8.0))
             .collect();
         let predicted = m.predict(&tail);
-        assert_eq!(m, before);
+        assert_eq!(m.points(), before);
         assert!(!predicted.is_empty());
 
         // And prediction is exactly what pushing would have produced.
-        let pushed: Vec<StrokePoint> = tail.iter().filter_map(|&s| m.push(s)).collect();
+        let pushed: Vec<StrokePoint> = tail.iter().flat_map(|&s| m.push(s)).collect();
         assert_eq!(predicted, pushed);
     }
 
@@ -299,10 +432,10 @@ mod tests {
     #[test]
     fn near_duplicates_are_dropped() {
         let mut m = BrushModeler::new(Tool::Pen, 4.0);
-        assert!(m.push(raw(0.0, 0.0, 0.5, 0.0)).is_some());
+        assert!(!m.push(raw(0.0, 0.0, 0.5, 0.0)).is_empty());
         // 0.1 unit raw step, halved by streamline: below min_distance.
-        assert!(m.push(raw(0.1, 0.0, 0.5, 4.0)).is_none());
-        assert!(m.push(raw(5.0, 0.0, 0.5, 8.0)).is_some());
+        assert!(m.push(raw(0.1, 0.0, 0.5, 4.0)).is_empty());
+        assert!(!m.push(raw(5.0, 0.0, 0.5, 8.0)).is_empty());
         assert_eq!(m.points().len(), 2);
     }
 
