@@ -39,7 +39,46 @@ pub struct BrushSpec {
     pub input: InputParams,
     pub tip: Tip,
     pub dynamics: Vec<Behavior>,
+    pub emit: Emit,
     pub paint: Paint,
+}
+
+/// How the tip lays its ink along the path.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Emit {
+    /// One ribbon swept along the path: a stroker for round tips, hulls
+    /// of the nib rectangle for oriented ones.
+    Continuous,
+    /// The tip's shape stamped at intervals along the path, each dab
+    /// masked in the fragment shader; jitter roughens the edge the way a
+    /// crayon or a grainy pencil does.
+    Stamped(Stamped),
+}
+
+/// Dab placement for [`Emit::Stamped`]. Lengths are in sizes (multiples
+/// of `base_width`), jitters are symmetric unless noted.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Stamped {
+    /// Distance between dab centres along the path.
+    pub spacing: f32,
+    /// Random offset of each dab in any direction, up to this far.
+    pub scatter: f32,
+    /// Random rotation of each dab, up to ± this many radians.
+    pub rotation_jitter: f32,
+    /// Random size of each dab, up to ± this fraction.
+    pub size_jitter: f32,
+    /// Random opacity taken off each dab, up to this fraction.
+    pub opacity_jitter: f32,
+}
+
+/// A brush bundled with the app under a `builtin:` id, offered next to
+/// the tool presets. Strokes snapshot the spec inline like any custom
+/// brush, so a bundled brush can be retuned without restyling old ink.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuiltinBrush {
+    pub id: BrushId,
+    pub name: &'static str,
+    pub spec: BrushSpec,
 }
 
 /// The shape the tip leaves at one point, before dynamics.
@@ -217,9 +256,91 @@ pub enum Blend {
 
 /// Bump when the serialised layout changes; older readers fall back to the
 /// tool's preset.
-const SPEC_VERSION: u8 = 2;
+const SPEC_VERSION: u8 = 3;
+
+/// A wide, soft, stamped tip with paper grain, [`Tool::Pencil`]'s cousin.
+pub const BUILTIN_CRAYON: &str = "builtin:crayon";
+/// The pencil preset laid as scattered dabs: a rougher edge than the
+/// continuous pencil.
+pub const BUILTIN_PENCIL_GRAINY: &str = "builtin:pencil-grainy";
 
 impl BrushSpec {
+    /// Every brush bundled with the app.
+    pub fn builtins() -> Vec<BuiltinBrush> {
+        let pencil = Self::preset(Tool::Pencil);
+        vec![
+            BuiltinBrush {
+                id: BrushId(BUILTIN_CRAYON.into()),
+                name: "Crayon",
+                spec: Self {
+                    tip: Tip {
+                        hardness: 0.6,
+                        ..pencil.tip
+                    },
+                    dynamics: vec![
+                        Behavior {
+                            source: Source::Pressure,
+                            curve: Curve::Linear,
+                            range: [0.85, 1.0],
+                            target: Target::Size,
+                            damping_ms: 0.0,
+                        },
+                        Behavior {
+                            source: Source::Pressure,
+                            curve: Curve::Pow(0.8),
+                            range: [0.5, 1.0],
+                            target: Target::Opacity,
+                            damping_ms: 0.0,
+                        },
+                        Behavior {
+                            source: Source::Tilt,
+                            curve: Curve::Linear,
+                            range: [1.0, 1.6],
+                            target: Target::Size,
+                            damping_ms: 0.0,
+                        },
+                    ],
+                    emit: Emit::Stamped(Stamped {
+                        spacing: 0.15,
+                        scatter: 0.06,
+                        rotation_jitter: 0.0,
+                        size_jitter: 0.1,
+                        opacity_jitter: 0.3,
+                    }),
+                    paint: Paint {
+                        opacity: 0.9,
+                        grain: Some(Grain {
+                            source: GrainSource::Noise,
+                            mapping: GrainMapping::Canvas,
+                            scale: 2.0,
+                            strength: 0.6,
+                        }),
+                        ..pencil.paint
+                    },
+                    ..pencil.clone()
+                },
+            },
+            BuiltinBrush {
+                id: BrushId(BUILTIN_PENCIL_GRAINY.into()),
+                name: "Pencil (grainy)",
+                spec: Self {
+                    emit: Emit::Stamped(Stamped {
+                        spacing: 0.15,
+                        scatter: 0.1,
+                        rotation_jitter: 0.0,
+                        size_jitter: 0.05,
+                        opacity_jitter: 0.1,
+                    }),
+                    ..pencil
+                },
+            },
+        ]
+    }
+
+    /// The bundled brush with this id, if there is one.
+    pub fn builtin(id: &str) -> Option<BuiltinBrush> {
+        Self::builtins().into_iter().find(|b| b.id.0 == id)
+    }
     /// The tuned brush for a built-in tool.
     pub fn preset(tool: Tool) -> Self {
         let input = InputParams {
@@ -280,6 +401,7 @@ impl BrushSpec {
                         0.0,
                     ),
                 ],
+                emit: Emit::Continuous,
                 paint: opaque,
             },
             Tool::Pencil => Self {
@@ -312,6 +434,7 @@ impl BrushSpec {
                         0.0,
                     ),
                 ],
+                emit: Emit::Continuous,
                 paint: Paint {
                     opacity: 0.9,
                     overlap: Overlap::Discard,
@@ -339,6 +462,7 @@ impl BrushSpec {
                     ..round
                 },
                 dynamics: Vec::new(),
+                emit: Emit::Continuous,
                 paint: Paint {
                     opacity: 0.45,
                     overlap: Overlap::Discard,
@@ -353,6 +477,7 @@ impl BrushSpec {
                 },
                 tip: round,
                 dynamics: Vec::new(),
+                emit: Emit::Continuous,
                 paint: opaque,
             },
             Tool::Fountain => Self {
@@ -372,9 +497,15 @@ impl BrushSpec {
                     Target::Width,
                     0.0,
                 )],
+                emit: Emit::Continuous,
                 paint: opaque,
             },
         }
+    }
+
+    /// Is the ink laid as dabs rather than one ribbon?
+    pub fn is_stamped(&self) -> bool {
+        matches!(self.emit, Emit::Stamped(_))
     }
 
     /// Does the tip follow the pen's orientation rather than the motion?
@@ -422,6 +553,20 @@ mod tests {
         }
         assert!(BrushSpec::decode(&[]).is_err());
         assert!(BrushSpec::decode(&[SPEC_VERSION, 0xff, 0xff]).is_err());
+    }
+
+    #[test]
+    fn builtins_are_stamped_and_findable_by_id() {
+        let all = BrushSpec::builtins();
+        assert_eq!(all.len(), 2);
+        for b in &all {
+            assert!(b.id.0.starts_with("builtin:"), "{}", b.id);
+            assert!(b.spec.is_stamped(), "{}", b.id);
+            let bytes = b.spec.encode().unwrap();
+            assert_eq!(BrushSpec::decode(&bytes).unwrap(), b.spec);
+        }
+        assert_eq!(BrushSpec::builtin(BUILTIN_CRAYON).unwrap().name, "Crayon");
+        assert!(BrushSpec::builtin("builtin:nope").is_none());
     }
 
     #[test]

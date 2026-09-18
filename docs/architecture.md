@@ -3,6 +3,7 @@
 How a desktop, an iPad, and the relays fit together. Source of truth:
 `crates/pendant/src/{relay,sync}.rs`, `crates/pendant-server/src/relay.rs`,
 `crates/pendant-ffi/src/net.rs`, `crates/pendant-core/src/{sync,pair}.rs`.
+For the whole stack and where each piece lives, see `docs/implementation.md`.
 
 ## 1. Topology: two desktops, two iPads, one dedicated relay
 

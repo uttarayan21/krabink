@@ -62,5 +62,6 @@ pub(super) fn round_mesh(pts: &[([f32; 2], TipState)], style: InkStyle, toleranc
         vertices: buffers.vertices,
         indices: buffers.indices,
         style,
+        zoom_independent: false,
     }
 }

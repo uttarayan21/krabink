@@ -1,7 +1,7 @@
 //! The mesh every renderer draws: triangles in canvas space with the
 //! per-vertex attributes a brush shader needs, plus the per-stroke style.
 
-use crate::brush::{Blend, GrainMapping, Overlap, Paint, Tip};
+use crate::brush::{Blend, Emit, GrainMapping, Overlap, Paint, Tip};
 use crate::stroke::Rgba;
 
 /// One mesh vertex.
@@ -9,9 +9,11 @@ use crate::stroke::Rgba;
 pub struct InkVertex {
     /// Canvas position (x right, y down).
     pub pos: [f32; 2],
-    /// Stroke-space coordinate: `u` is arc length along the stroke in
-    /// canvas units, `v` is the side, -1 on the left edge through +1 on
-    /// the right. Renderers map grain and masks through it.
+    /// Stroke-space coordinate. On a ribbon ([`MaskStyle::Ribbon`]) `u`
+    /// is arc length along the stroke in canvas units and `v` the side,
+    /// -1 on the left edge through +1 on the right. On a dab
+    /// ([`MaskStyle::Shape`]) it is the tip space, `[-1, 1]²` over the
+    /// dab's rectangle. Renderers map grain and masks through it.
     pub uv: [f32; 2],
     /// 0..=1, multiplied into the stroke colour's alpha.
     pub opacity: f32,
@@ -27,9 +29,23 @@ pub struct InkStyle {
     pub overlap: Overlap,
     /// Edge feathering, 1 for a hard edge (see [`Tip::hardness`]).
     pub hardness: f32,
+    /// What the vertex `uv` means and how the shader cuts the ink's edge.
+    pub mask: MaskStyle,
     /// Paper texture the shader multiplies into the alpha; `None` for flat
     /// ink.
     pub grain: Option<GrainStyle>,
+}
+
+/// How the fragment shader shapes the ink inside the triangles.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MaskStyle {
+    /// The triangles are the ink: `v` is the side, and a soft tip feathers
+    /// the outer band of `|v|`.
+    Ribbon,
+    /// Each quad is one dab in tip space; the shader keeps the rounded
+    /// superellipse with this corner radius (0 square … 1 ellipse) and
+    /// drops the rest.
+    Shape { corner: f32 },
 }
 
 /// Procedural grain as the shader evaluates it (see
@@ -54,10 +70,11 @@ impl InkStyle {
         blend: Blend::Normal,
         overlap: Overlap::Accumulate,
         hardness: 1.0,
+        mask: MaskStyle::Ribbon,
         grain: None,
     };
 
-    pub(crate) fn of(color: Rgba, tip: &Tip, paint: &Paint, seed: u32) -> Self {
+    pub(crate) fn of(color: Rgba, tip: &Tip, emit: Emit, paint: &Paint, seed: u32) -> Self {
         let grain = paint.grain.map(|g| GrainStyle {
             mapping: g.mapping,
             scale: g.scale.max(1e-3),
@@ -73,6 +90,12 @@ impl InkStyle {
             blend: paint.blend,
             overlap: paint.overlap,
             hardness: tip.hardness.clamp(0.0, 1.0),
+            mask: match emit {
+                Emit::Continuous => MaskStyle::Ribbon,
+                Emit::Stamped(_) => MaskStyle::Shape {
+                    corner: tip.corner.clamp(0.0, 1.0),
+                },
+            },
             grain,
         }
     }
@@ -86,6 +109,9 @@ pub struct InkMesh {
     /// Triangle list into `vertices`.
     pub indices: Vec<u32>,
     pub style: InkStyle,
+    /// The mesh is exact at every zoom (dabs masked in the shader), so a
+    /// renderer need not rebuild it when its flattening tolerance changes.
+    pub zoom_independent: bool,
 }
 
 impl Default for InkMesh {
@@ -100,6 +126,7 @@ impl InkMesh {
             vertices: Vec::new(),
             indices: Vec::new(),
             style,
+            zoom_independent: false,
         }
     }
 

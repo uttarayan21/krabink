@@ -14,12 +14,14 @@ mod continuous;
 mod mesh;
 mod nib;
 mod outline;
+mod stamps;
 
 use std::borrow::Cow;
 
-pub use mesh::{GrainStyle, InkMesh, InkStyle, InkVertex};
+pub use mesh::{GrainStyle, InkMesh, InkStyle, InkVertex, MaskStyle};
+pub use stamps::MAX_DABS;
 
-use crate::brush::{BrushSpec, StrokeEnd, TipEvaluator, TipState, distance};
+use crate::brush::{BrushSpec, Emit, StrokeEnd, TipEvaluator, TipState, distance};
 use crate::stroke::{PointKind, Rgba, Stroke, StrokePoint, Tilt, Tool};
 
 /// Curve samples evaluated per spline segment. 8 keeps a typical pen segment
@@ -165,13 +167,31 @@ impl Ink<'static> {
     }
 }
 
+impl Ink<'static> {
+    /// Any spec at `color` and `base_width`, seed 0.
+    pub fn custom(spec: BrushSpec, color: Rgba, base_width: f32) -> Self {
+        Self {
+            spec: Cow::Owned(spec),
+            color,
+            base_width,
+            seed: 0,
+        }
+    }
+}
+
 impl Ink<'_> {
     pub fn with_seed(self, seed: u32) -> Self {
         Self { seed, ..self }
     }
 
     pub fn style(&self) -> InkStyle {
-        InkStyle::of(self.color, &self.spec.tip, &self.spec.paint, self.seed)
+        InkStyle::of(
+            self.color,
+            &self.spec.tip,
+            self.spec.emit,
+            &self.spec.paint,
+            self.seed,
+        )
     }
 
     /// The mark the tip would leave touching down at (`x`, `y`) with the
@@ -196,10 +216,17 @@ impl Ink<'_> {
     /// units; see [`DEFAULT_TOLERANCE`].
     pub fn mesh(&self, points: &[StrokePoint], end: StrokeEnd, tolerance: f32) -> InkMesh {
         let pts = self.tips(points, end);
-        if self.spec.has_nib() {
-            nib::nib_mesh(&pts, self.style())
-        } else {
-            continuous::round_mesh(&pts, self.style(), tolerance)
+        match self.spec.emit {
+            Emit::Stamped(stamped) => stamps::stamped_mesh(
+                &pts,
+                &stamped,
+                self.base_width,
+                self.seed,
+                !self.spec.has_nib(),
+                self.style(),
+            ),
+            Emit::Continuous if self.spec.has_nib() => nib::nib_mesh(&pts, self.style()),
+            Emit::Continuous => continuous::round_mesh(&pts, self.style(), tolerance),
         }
     }
 
