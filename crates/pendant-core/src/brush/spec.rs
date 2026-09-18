@@ -199,8 +199,11 @@ pub enum Overlap {
     /// itself, like real ink.
     Accumulate,
     /// Each pixel is painted at most once per stroke: a highlighter that
-    /// doubles back stays one shade. Renderers guarantee this; only hard
-    /// tips may use it.
+    /// doubles back stays one shade, and a wide translucent tip does not
+    /// light up where the stroker's joins overlap themselves. Renderers
+    /// guarantee this. A soft tip under it gets a stippled edge (fragments
+    /// dropped by the paper noise) rather than a feathered one, since the
+    /// first fragment at a pixel wins and must carry the full alpha.
     Discard,
 }
 
@@ -311,6 +314,7 @@ impl BrushSpec {
                 ],
                 paint: Paint {
                     opacity: 0.9,
+                    overlap: Overlap::Discard,
                     grain: Some(Grain {
                         source: GrainSource::Noise,
                         mapping: GrainMapping::Canvas,

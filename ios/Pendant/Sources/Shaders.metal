@@ -44,6 +44,9 @@ constant uint GRAIN_KIND  = 12u;  // bits 2-3: 0 none, 1 noise, 2 image
 constant uint FLAG_GRAIN_STROKE = 16u;
 constant uint FLAG_MULTIPLY     = 32u;
 constant uint FLAG_DISCARD      = 64u;
+// Cell size of the stipple that softens edges under write-once ink.
+constant float EDGE_CELL = 0.75;
+constant uint  EDGE_SEED = 0x9e37u;
 
 struct V2F {
     float4 position [[position]];
@@ -115,10 +118,21 @@ fragment float4 ink_fragment(V2F in [[stage_in]],
             break;
         }
         case 3u: {
-            // Ribbon: v is the side in -1..1; feather the outer band that
-            // hardness leaves soft. MSAA covers the hard edge itself.
+            // Ribbon: v is the side in -1..1; soften the outer band that
+            // hardness leaves. MSAA covers the hard edge itself.
             float h = s.mask.z;
-            m = h >= 1.0 ? 1.0 : 1.0 - smoothstep(h, 1.0, abs(in.uv.y));
+            if (h < 1.0) {
+                float t = (abs(in.uv.y) - h) / (1.0 - h);
+                if (s.flags & FLAG_DISCARD) {
+                    // Write-once ink keeps the first fragment at a pixel,
+                    // so the band cannot carry partial alpha: thin it by
+                    // dropping fragments where the paper noise says so.
+                    if (t > 0.0 && lattice(floor(in.canvas / EDGE_CELL), EDGE_SEED) < t)
+                        discard_fragment();
+                } else {
+                    m = 1.0 - smoothstep(0.0, 1.0, t);
+                }
+            }
             break;
         }
         default: break;

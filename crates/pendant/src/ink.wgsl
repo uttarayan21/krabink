@@ -37,7 +37,12 @@ struct InkParams {
 const MASK_KIND: u32 = 3u;   // bits 0-1: 0 none, 1 shape (tip space), 2 image, 3 ribbon edge
 const GRAIN_KIND: u32 = 12u; // bits 2-3: 0 none, 1 noise, 2 image
 const FLAG_GRAIN_STROKE: u32 = 16u;
-// Bits 5 (multiply) and 6 (discard) pick the pipeline on the CPU side.
+// Bits 5 (multiply) and 6 (discard) pick the pipeline on the CPU side;
+// the fragment still reads discard for the stippled edge.
+const FLAG_DISCARD: u32 = 64u;
+// Cell size of the stipple that softens edges under write-once ink.
+const EDGE_CELL: f32 = 0.75;
+const EDGE_SEED: u32 = 0x9e37u;
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<storage, read> styles: array<StrokeStyle>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var<uniform> params: InkParams;
@@ -116,12 +121,22 @@ fn fragment(in: InkOutput) -> @location(0) vec4<f32> {
             m = 1.0 - smoothstep(-w, 0.0, d);
         }
         case 3u: {
-            // Ribbon: v is the side in -1..1; feather the outer band that
-            // hardness leaves soft. MSAA covers the hard edge itself.
-            // `select` evaluates both arms, so keep the soft arm finite.
+            // Ribbon: v is the side in -1..1; soften the outer band that
+            // hardness leaves. MSAA covers the hard edge itself.
             let h = s.mask.z;
-            let soft = 1.0 - smoothstep(min(h, 0.999), 1.0, abs(in.uv.y));
-            m = select(soft, 1.0, h >= 1.0);
+            if (h < 1.0) {
+                let t = (abs(in.uv.y) - h) / (1.0 - h);
+                if ((s.flags & FLAG_DISCARD) != 0u) {
+                    // Write-once ink keeps the first fragment at a pixel,
+                    // so the band cannot carry partial alpha: thin it by
+                    // dropping fragments where the paper noise says so.
+                    if (t > 0.0 && hash_corner(floor(in.canvas / EDGE_CELL), EDGE_SEED) < t) {
+                        discard;
+                    }
+                } else {
+                    m = 1.0 - smoothstep(0.0, 1.0, t);
+                }
+            }
         }
         default: {}
     }

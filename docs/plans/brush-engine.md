@@ -459,6 +459,16 @@ Core/FFI:
   the base width: the tilt behaviour is live on real data.
 - Tilt/pressure behaviours and the hardness feather were already in the
   P1 presets and shaders; P2 only added grain on top.
+- Pencil is `Overlap::Discard` (`64b84c9`, then this): a crayon at 140
+  units wide doubling back on itself stacked hundreds of join fans, and
+  accumulating ink lit them up. Write-once ink makes any self-overlap of
+  the stroker invisible. The soft edge under Discard is a stipple rather
+  than a feather: in the outer band the fragment is dropped where a
+  0.75-unit white-noise cell falls below its band position, so every
+  drawn fragment carries the full alpha and overlaps show no seams. Also
+  points closer than a fifth of the base width are merged before
+  tessellation (`SEGMENT_FRACTION`), which removes the sub-unit
+  reversals a still pen produces.
 
 iOS:
 
