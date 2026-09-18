@@ -117,7 +117,7 @@ flowchart LR
         SS["ServerSession\nBroadcast / Disconnect effects"]
         WS["WorkspaceDoc\nnotes + device registry"]
         PAIR["pair.rs\nPairInfo <-> pendant://pair URI"]
-        INK["brush.rs + geom.rs + shape.rs\nBrushModeler, lyon stroke_mesh,\nshape recognizer; element.rs"]
+        INK["brush/ + geom/ + shape.rs\nBrushSpec presets, BrushModeler,\nInkMesh (lyon + nib ribbons);\nshape recognizer; element.rs"]
     end
     subgraph desktop["pendant (desktop bin)"]
         BEVY["Bevy app: ui, sketch, docs"]
@@ -139,14 +139,25 @@ flowchart LR
     end
 ```
 
-Ink is one pipeline on both platforms: raw pen samples go through the
-core's `BrushModeler` (smoothing, width from force and speed, tapers) into
-`StrokePoint`s that carry their rendered width, and `stroke_mesh` (lyon,
-round caps and joins) turns those into the triangles every renderer draws
-(bevy `Mesh2d` on the desktop, `MTKView` on the iPad, CoreGraphics for
-thumbnails). The live stroke, the committed stroke and every remote copy
-are the same geometry; wet ink carries the width per point so receivers
-draw what the sender drew. See `docs/plans/ink-renderer.md`.
+Ink is one pipeline on both platforms, in three stages inside the core.
+Stage 1 (`brush/input.rs`): raw pen samples are smoothed by `BrushModeler`
+into the `StrokePoint`s the stroke stores (position, force, time, tilt);
+estimated force/tilt is patched in by `update`. Stage 2
+(`brush/dynamics.rs`): a `BrushSpec` — the tool's preset — turns each
+point into a tip state (size, opacity, nib orientation) from pressure,
+speed, tilt and distance to the ends. Stage 3 (`geom/`): the tip states
+become an `InkMesh` — round lyon ribbons or oriented nib ribbons with
+rectangle caps — whose vertices carry position, stroke-space uv and
+opacity, plus an `InkStyle` (colour, opacity, blend, overlap, hardness)
+per stroke. Renderers upload the mesh verbatim and apply the style in one
+über-shader (Metal on the iPad, WGSL on the desktop): linear-light
+premultiplied blending in an sRGB framebuffer, Multiply for the
+highlighter, and a depth-slot trick that makes `Overlap::Discard` ink
+write once per pixel so a marker never darkens where it crosses itself.
+Thumbnails render through the same Metal pipeline offscreen. The live
+stroke, the committed stroke and every remote copy are the same geometry;
+wet ink carries the stage-1 points so receivers run the same fold. See
+`docs/plans/ink-renderer.md` and `docs/plans/brush-engine.md`.
 
 A sketch is one z-ordered list of `Element`s: freehand `Stroke`s and
 `ShapeElement`s (line, arrow, rectangle, ellipse, with reserved

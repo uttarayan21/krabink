@@ -325,7 +325,7 @@ final class NoteModel: Identifiable {
             stroke: stroke, tool: tool, color: color, baseWidth: baseWidth)
     }
 
-    func wetPoints(stroke: String, points: [WetPoint]) {
+    func wetPoints(stroke: String, points: [StrokePoint]) {
         guard let sketch = wetStrokeSketch[stroke] else { return }
         sketches[sketch]?.remoteWetPoints(stroke: stroke, points: points)
     }
@@ -392,7 +392,7 @@ private final class NoteEvents: NoteListener {
         }
     }
 
-    func wetPoints(stroke: String, sentMs: UInt64, points: [WetPoint]) {
+    func wetPoints(stroke: String, sentMs: UInt64, points: [StrokePoint]) {
         Task { @MainActor [weak model] in
             model?.wetPoints(stroke: stroke, points: points)
         }

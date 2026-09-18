@@ -8,15 +8,39 @@
 import XCTest
 
 final class SketchUITests: XCTestCase {
-    private func launch() -> XCUIApplication {
+    private func launch(extra: [String] = []) -> XCUIApplication {
         let app = XCUIApplication()
         let env = ProcessInfo.processInfo.environment
         app.launchArguments = [
             "-serverURL", env["PENDANT_TEST_SERVER"] ?? "ws://127.0.0.1:8722/ws",
             "-token", env["PENDANT_TEST_TOKEN"] ?? "demo",
-        ]
+        ] + extra
         app.launch()
         return app
+    }
+
+    /// Relative luminance (0…1) of the screen pixel at `point` (screen
+    /// points) in a fresh screenshot.
+    private func luminance(at point: CGPoint) -> Double {
+        let image = XCUIScreen.main.screenshot().image
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let one = UIGraphicsImageRenderer(size: CGSize(width: 1, height: 1), format: format).image { _ in
+            image.draw(at: CGPoint(x: -point.x, y: -point.y))
+        }
+        guard let cg = one.cgImage, let data = cg.dataProvider?.data, let bytes = CFDataGetBytePtr(data)
+        else { return -1 }
+        let alphaFirst = cg.alphaInfo == .premultipliedFirst || cg.alphaInfo == .first
+        let littleEndian = cg.bitmapInfo.contains(.byteOrder32Little)
+        let (r, g, b): (UInt8, UInt8, UInt8)
+        if alphaFirst, littleEndian {
+            (r, g, b) = (bytes[2], bytes[1], bytes[0])
+        } else if alphaFirst {
+            (r, g, b) = (bytes[1], bytes[2], bytes[3])
+        } else {
+            (r, g, b) = (bytes[0], bytes[1], bytes[2])
+        }
+        return (0.2126 * Double(r) + 0.7152 * Double(g) + 0.0722 * Double(b)) / 255
     }
 
     private func waitConnected(_ app: XCUIApplication) {
@@ -84,6 +108,31 @@ final class SketchUITests: XCTestCase {
 
     // Draw-and-hold: a drag that ends with the pen held still snaps to a
     // shape (a straight drag is a line) and commits a shape element.
+    /// The marker is write-once ink: where a stroke crosses itself it is no
+    /// darker than along an arm. `-figureEight 1` commits a lemniscate
+    /// (XCUITest drags are straight lines) crossing at canvas (300, 300),
+    /// arm tip at (440, 300).
+    func testMarkerSelfOverlapDoesNotDarken() {
+        let app = launch(extra: ["-tool", "marker", "-figureEight", "1"])
+        waitConnected(app)
+
+        app.buttons["newNote"].tap()
+        app.buttons["sketchMenu"].tap()
+        app.buttons["newSketch"].tap()
+
+        let canvas = app.descendants(matching: .any)["sketchCanvas"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        waitStatus(app, contains: "strokes=1", timeout: 10)
+        sleep(1)
+        let origin = canvas.frame.origin
+        let crossing = luminance(at: CGPoint(x: origin.x + 300, y: origin.y + 300))
+        let arm = luminance(at: CGPoint(x: origin.x + 440, y: origin.y + 300))
+        let paper = luminance(at: CGPoint(x: origin.x + 300, y: origin.y + 520))
+        XCTAssertLessThan(arm, paper - 0.08, "no marker ink on the arm: arm=\(arm) paper=\(paper)")
+        XCTAssertEqual(crossing, arm, accuracy: 0.05, "self-crossing darkened: crossing=\(crossing) arm=\(arm)")
+        sleep(1)
+    }
+
     func testHoldSnapsToShape() {
         let app = launch()
         waitConnected(app)

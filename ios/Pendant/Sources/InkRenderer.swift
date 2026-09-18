@@ -1,21 +1,27 @@
 // Metal ink renderer. Every stroke on screen — committed, remote wet, the
-// local live stroke and its predicted tail — is an indexed triangle mesh
-// from the Rust core (`elementMesh` / `wetMesh` / `pointsMesh`), drawn with
-// one flat-colour pipeline under 4x MSAA. The view is demand-driven: it
-// redraws only when ink or the viewport changes, so an idle canvas costs
-// no GPU time.
+// local live stroke and its predicted tail, strokes settling after pen-up —
+// is an `InkMesh` from the Rust core drawn under 4x MSAA into an
+// sRGB-encoded framebuffer with linear, premultiplied blending. The view
+// is demand-driven: it redraws only when ink or the viewport changes.
 //
-// Committed ink is batched: all strokes share one vertex/index buffer with
-// the colour stored per vertex, so a page of thousands of strokes is one
-// draw call. The batch is rebuilt (CPU concat + one upload) when strokes
-// are added, removed, reordered or re-tessellated for a new zoom bucket;
-// none of that happens per frame. Wet and live strokes change every event
-// and stay as their own small buffers.
+// Geometry rides exactly as the core emits it (position, uv, opacity per
+// vertex) plus a per-vertex stroke index; everything per stroke — linear
+// colour, edge mask, grain, depth slot, blend and overlap — sits in a
+// `StrokeStyle` array. Committed ink is one batch: one vertex/index/style
+// upload, drawn as runs that split only where the pipeline state changes
+// (Normal vs Multiply blend, Accumulate vs Discard overlap), in z order.
+//
+// Write-once ink (`Overlap::Discard`, the marker): every stroke gets a
+// depth slot strictly monotone in draw order and writes depth. A Discard
+// run compares `.less`, so a stroke's own later fragments at a sample are
+// rejected and it never darkens where it crosses itself; an Accumulate
+// run compares `.lessEqual` and layers. Later strokes are strictly nearer
+// and blend over either. MSAA keeps depth per sample, so edges stay
+// antialiased and shared triangle edges give neither double hits nor seams.
 //
 // Coordinates: the core is canvas space (points, y down). `Viewport` maps
 // that onto the view through the scroll view's zoom and content offset,
-// so the Metal view stays pinned to the screen at any zoom and never needs
-// a texture the size of the canvas.
+// so the Metal view stays pinned to the screen at any zoom.
 
 import Metal
 import MetalKit
@@ -32,70 +38,129 @@ struct Viewport: Equatable {
     var size: CGSize = .zero
 }
 
-/// Mirrors `Uniforms` in Shaders.metal (float2, float2).
+/// Mirrors `Uniforms` in Shaders.metal.
 private struct Uniforms {
     var scale: SIMD2<Float>
     var translate: SIMD2<Float>
-}
+    var zoom: Float
+    var pad: Float = 0
 
-/// Mirrors `VertexIn` in Shaders.metal: float2 position, uchar4 colour
-/// (RGBA, normalised in the shader). 12 bytes.
-struct InkVertex {
-    var x: Float
-    var y: Float
-    /// R in the lowest byte, A in the highest (little-endian uchar4).
-    var color: UInt32
-
-    static let stride = MemoryLayout<InkVertex>.stride
-
-    /// 0xRRGGBBAA → in-memory uchar4.
-    static func vertexColor(_ packed: UInt32) -> UInt32 {
-        let r = (packed >> 24) & 0xff
-        let g = (packed >> 16) & 0xff
-        let b = (packed >> 8) & 0xff
-        let a = packed & 0xff
-        return r | (g << 8) | (b << 16) | (a << 24)
-    }
-
-    static var descriptor: MTLVertexDescriptor {
-        let d = MTLVertexDescriptor()
-        d.attributes[0].format = .float2
-        d.attributes[0].offset = 0
-        d.attributes[0].bufferIndex = 0
-        d.attributes[1].format = .uchar4Normalized
-        d.attributes[1].offset = 8
-        d.attributes[1].bufferIndex = 0
-        d.layouts[0].stride = stride
-        return d
+    /// canvas → clip: x' = (x·zoom − off.x) / w · 2 − 1, y flipped.
+    init(_ viewport: Viewport) {
+        let zoom = Float(viewport.zoom)
+        let w = Float(viewport.size.width)
+        let h = Float(viewport.size.height)
+        scale = SIMD2(2 * zoom / w, -2 * zoom / h)
+        translate = SIMD2(
+            -2 * Float(viewport.offset.x) / w - 1,
+            2 * Float(viewport.offset.y) / h + 1)
+        self.zoom = zoom
     }
 }
 
-/// CPU-side interleaved geometry for one or many strokes.
+/// Mirrors `StrokeStyle` in Shaders.metal: 64 bytes, the same on the
+/// desktop's WGSL.
+struct StrokeStyle {
+    /// Linear RGBA, straight alpha; the brush opacity is folded in.
+    var color: SIMD4<Float>
+    /// aspect, corner, hardness, 0
+    var mask: SIMD4<Float>
+    /// scale, strength, seed, 0
+    var grain: SIMD4<Float>
+    /// NDC z slot, strictly monotone in draw order.
+    var depth: Float
+    var flags: UInt32
+    var maskLayer: UInt32 = 0
+    var grainLayer: UInt32 = 0
+
+    static let maskEdge: UInt32 = 3
+    static let multiply: UInt32 = 32
+    static let discard: UInt32 = 64
+    static let stride = MemoryLayout<StrokeStyle>.stride
+
+    init(_ style: InkStyle, depth: Float) {
+        let c = Self.linearColor(style.color)
+        color = SIMD4(c.x, c.y, c.z, c.w * style.opacity)
+        mask = SIMD4(1, 0, style.hardness, 0)
+        grain = .zero
+        self.depth = depth
+        var flags: UInt32 = 0
+        if style.hardness < 1 { flags |= Self.maskEdge }
+        if style.blend == .multiply { flags |= Self.multiply }
+        if style.overlap == .discard { flags |= Self.discard }
+        self.flags = flags
+    }
+
+    var combo: InkCombo {
+        InkCombo(multiply: flags & Self.multiply != 0, discard: flags & Self.discard != 0)
+    }
+
+    /// sRGB byte (low 8 bits) → linear.
+    static func linearByte(_ byte: UInt32) -> Float {
+        let c = Float(byte & 0xff) / 255
+        return c <= 0.04045 ? c / 12.92 : powf((c + 0.055) / 1.055, 2.4)
+    }
+
+    /// 0xRRGGBBAA → linear RGBA.
+    static func linearColor(_ packed: UInt32) -> SIMD4<Float> {
+        SIMD4(
+            linearByte(packed >> 24), linearByte(packed >> 16), linearByte(packed >> 8),
+            Float(packed & 0xff) / 255)
+    }
+}
+
+/// The pipeline state a run of ink shares.
+struct InkCombo: Hashable {
+    let multiply: Bool
+    let discard: Bool
+}
+
+/// A contiguous range of the index buffer drawn with one pipeline state.
+struct InkRun {
+    let combo: InkCombo
+    let indexOffset: Int
+    var indexCount: Int
+}
+
+/// CPU-side geometry for one or many strokes, laid out for upload as-is.
 struct InkGeometry {
-    var vertices: [InkVertex] = []
+    /// Floats per vertex in `vertices` (`InkMesh` contract).
+    static let vertexFloats = 5
+    var vertices: [Float] = []
+    var strokeIndex: [UInt32] = []
     var indices: [UInt32] = []
+    var styles: [StrokeStyle] = []
+    var runs: [InkRun] = []
 
+    var vertexCount: Int { vertices.count / Self.vertexFloats }
     var isEmpty: Bool { indices.count < 3 }
 
     init() {}
 
-    init(_ mesh: IndexedMesh, color: UInt32) {
-        append(mesh, color: color)
+    init(_ mesh: InkMesh, depth: Float) {
+        append(mesh, depth: depth)
     }
 
-    /// Append a mesh, offsetting its indices past the vertices so far.
-    mutating func append(_ mesh: IndexedMesh, color: UInt32) {
-        guard mesh.indices.count >= 3, mesh.positions.count >= 6 else { return }
-        let base = UInt32(vertices.count)
-        let packed = InkVertex.vertexColor(color)
-        vertices.reserveCapacity(vertices.count + mesh.positions.count / 2)
-        var i = 0
-        while i + 1 < mesh.positions.count {
-            vertices.append(InkVertex(x: mesh.positions[i], y: mesh.positions[i + 1], color: packed))
-            i += 2
-        }
+    /// Append a mesh as one stroke at `depth`, offsetting its indices past
+    /// the vertices so far. Extends the last run when the pipeline state
+    /// matches, so consecutive same-brush strokes are one draw.
+    mutating func append(_ mesh: InkMesh, depth: Float) {
+        let count = mesh.vertices.count / Self.vertexFloats
+        guard mesh.indices.count >= 3, count >= 3 else { return }
+        let base = UInt32(vertexCount)
+        let stroke = UInt32(styles.count)
+        let style = StrokeStyle(mesh.style, depth: depth)
+        styles.append(style)
+        vertices.append(contentsOf: mesh.vertices)
+        strokeIndex.append(contentsOf: repeatElement(stroke, count: count))
+        let start = indices.count
         indices.reserveCapacity(indices.count + mesh.indices.count)
         for index in mesh.indices { indices.append(base + index) }
+        if let last = runs.last, last.combo == style.combo {
+            runs[runs.count - 1].indexCount += mesh.indices.count
+        } else {
+            runs.append(InkRun(combo: style.combo, indexOffset: start, indexCount: mesh.indices.count))
+        }
     }
 }
 
@@ -104,28 +169,33 @@ struct InkGeometry {
 final class GPUGeometry {
     private let device: MTLDevice
     private(set) var vertices: MTLBuffer?
+    private(set) var strokeIndex: MTLBuffer?
     private(set) var indices: MTLBuffer?
-    private(set) var indexCount = 0
+    private(set) var styles: MTLBuffer?
+    private(set) var runs: [InkRun] = []
 
     init(device: MTLDevice) {
         self.device = device
     }
 
-    var isEmpty: Bool { indexCount < 3 || vertices == nil || indices == nil }
-
-    func upload(_ geometry: InkGeometry) {
-        indexCount = geometry.indices.count
-        guard !geometry.isEmpty else { return }
-        vertices = Self.write(
-            geometry.vertices, into: vertices, device: device, stride: InkVertex.stride)
-        indices = Self.write(
-            geometry.indices, into: indices, device: device, stride: MemoryLayout<UInt32>.stride)
+    var isEmpty: Bool {
+        runs.isEmpty || vertices == nil || strokeIndex == nil || indices == nil || styles == nil
     }
 
-    private static func write<T>(
-        _ items: [T], into existing: MTLBuffer?, device: MTLDevice, stride: Int
-    ) -> MTLBuffer? {
-        let length = items.count * stride
+    func upload(_ geometry: InkGeometry) {
+        runs = geometry.runs
+        guard !geometry.isEmpty else {
+            runs = []
+            return
+        }
+        vertices = Self.write(geometry.vertices, into: vertices, device: device)
+        strokeIndex = Self.write(geometry.strokeIndex, into: strokeIndex, device: device)
+        indices = Self.write(geometry.indices, into: indices, device: device)
+        styles = Self.write(geometry.styles, into: styles, device: device)
+    }
+
+    private static func write<T>(_ items: [T], into existing: MTLBuffer?, device: MTLDevice) -> MTLBuffer? {
+        let length = items.count * MemoryLayout<T>.stride
         let buffer: MTLBuffer?
         if let existing, existing.length >= length {
             buffer = existing
@@ -143,7 +213,7 @@ final class GPUGeometry {
     }
 }
 
-extension IndexedMesh {
+extension InkMesh {
     /// Axis-aligned bounds in canvas units; `.null` when empty.
     var bounds: CGRect {
         var minX = Float.infinity
@@ -151,44 +221,17 @@ extension IndexedMesh {
         var maxX = -Float.infinity
         var maxY = -Float.infinity
         var i = 0
-        while i + 1 < positions.count {
-            minX = min(minX, positions[i])
-            maxX = max(maxX, positions[i])
-            minY = min(minY, positions[i + 1])
-            maxY = max(maxY, positions[i + 1])
-            i += 2
+        while i + 1 < vertices.count {
+            minX = min(minX, vertices[i])
+            maxX = max(maxX, vertices[i])
+            minY = min(minY, vertices[i + 1])
+            maxY = max(maxY, vertices[i + 1])
+            i += InkGeometry.vertexFloats
         }
         guard minX <= maxX else { return .null }
         return CGRect(
             x: CGFloat(minX), y: CGFloat(minY),
             width: CGFloat(maxX - minX), height: CGFloat(maxY - minY))
-    }
-
-    /// The triangles as one CGPath (one closed subpath each) for
-    /// CoreGraphics fills, e.g. thumbnails. Every triangle is wound the
-    /// same way so a non-zero fill of a self-overlapping stroke adds up
-    /// instead of cancelling into holes. Fill with antialiasing off:
-    /// adjacent antialiased triangles leave hairline seams.
-    var cgPath: CGPath {
-        let path = CGMutablePath()
-        var i = 0
-        while i + 2 < indices.count {
-            let ia = Int(indices[i]) * 2
-            let ib = Int(indices[i + 1]) * 2
-            let ic = Int(indices[i + 2]) * 2
-            guard max(ia, ib, ic) + 1 < positions.count else { break }
-            let a = CGPoint(x: CGFloat(positions[ia]), y: CGFloat(positions[ia + 1]))
-            var b = CGPoint(x: CGFloat(positions[ib]), y: CGFloat(positions[ib + 1]))
-            var c = CGPoint(x: CGFloat(positions[ic]), y: CGFloat(positions[ic + 1]))
-            let twiceArea = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
-            if twiceArea < 0 { swap(&b, &c) }
-            path.move(to: a)
-            path.addLine(to: b)
-            path.addLine(to: c)
-            path.closeSubpath()
-            i += 3
-        }
-        return path
     }
 }
 
@@ -196,34 +239,44 @@ extension IndexedMesh {
 final class InkRenderer: NSObject, MTKViewDelegate {
     let device: MTLDevice
     private let queue: MTLCommandQueue
-    private let pipeline: MTLRenderPipelineState
+    private let psoNormal: MTLRenderPipelineState
+    private let psoMultiply: MTLRenderPipelineState
+    private let depthAccumulate: MTLDepthStencilState
+    private let depthDiscard: MTLDepthStencilState
     private weak var view: MTKView?
 
     private struct Committed {
         let element: Element
         var z: Int
-        var mesh: IndexedMesh
+        var mesh: InkMesh
     }
 
     private struct Wet {
-        let tool: Tool
+        let brush: BrushRef
         let color: UInt32
-        let baseWidth: Float
-        var points: [WetPoint] = []
+        var points: [StrokePoint] = []
+        var end: StrokeEnd = .live
         let geometry: GPUGeometry
     }
 
     private var committed: [String: Committed] = [:]
     /// Committed ids in draw order (CRDT z).
     private var order: [String] = []
-    /// One buffer for all committed ink; rebuilt when `batchDirty`.
+    /// One upload for all committed ink; rebuilt when `batchDirty`.
     private let batch: GPUGeometry
     private var batchDirty = false
     private var wet: [String: Wet] = [:]
     /// Remote wet ids in arrival order, drawn above committed ink.
     private var wetOrder: [String] = []
+    /// The local live stroke.
     private let local: GPUGeometry
+    private var localGeometry: InkGeometry?
     private var hasLocal = false
+    /// Local strokes past pen-up whose commit is held for estimated-property
+    /// updates; drawn until `show` replaces them.
+    private var locals: [String: GPUGeometry] = [:]
+    private var localsOrder: [String] = []
+    private var settled = 0
     /// Committed meshes are built for this zoom bucket; a bucket change
     /// re-tessellates them lazily on the next draw.
     private var meshBucket: CGFloat = 1
@@ -242,38 +295,120 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     }
 
     static let sampleCount = 4
+    /// sRGB-encoded so blending happens in linear light, as on the desktop.
+    static let colorFormat: MTLPixelFormat = .bgra8Unorm_srgb
+    static let depthFormat: MTLPixelFormat = .depth32Float
+
+    /// Depth slots: committed stroke `k` of `n` in draw order. Later
+    /// strokes are nearer; everything stays inside (0.2, 1).
+    static func committedDepth(_ k: Int, of n: Int) -> Float {
+        0.2 + 0.8 * Float(n - k) / Float(n + 1)
+    }
+    /// Remote wet stroke `j` of `w`, above every committed stroke.
+    static func wetDepth(_ j: Int, of w: Int) -> Float {
+        0.1 + 0.001 * Float(w - j)
+    }
+    static let liveDepth: Float = 0.01
 
     init?(view: MTKView) {
+        view.colorPixelFormat = Self.colorFormat
+        view.depthStencilPixelFormat = Self.depthFormat
+        view.clearDepth = 1
+        view.sampleCount = Self.sampleCount
         guard
             let device = view.device ?? MTLCreateSystemDefaultDevice(),
             let queue = device.makeCommandQueue(),
-            let library = device.makeDefaultLibrary(),
-            let vertex = library.makeFunction(name: "ink_vertex"),
-            let fragment = library.makeFunction(name: "ink_fragment")
+            let pipelines = Self.makePipelines(device: device),
+            let depthStates = Self.makeDepthStates(device: device)
         else { return nil }
-        let descriptor = MTLRenderPipelineDescriptor()
-        descriptor.vertexFunction = vertex
-        descriptor.fragmentFunction = fragment
-        descriptor.vertexDescriptor = InkVertex.descriptor
-        descriptor.rasterSampleCount = Self.sampleCount
-        let target = descriptor.colorAttachments[0]!
-        target.pixelFormat = view.colorPixelFormat
-        // Straight-alpha blending so the marker's translucent ink layers.
-        target.isBlendingEnabled = true
-        target.sourceRGBBlendFactor = .sourceAlpha
-        target.destinationRGBBlendFactor = .oneMinusSourceAlpha
-        target.sourceAlphaBlendFactor = .one
-        target.destinationAlphaBlendFactor = .oneMinusSourceAlpha
-        guard let pipeline = try? device.makeRenderPipelineState(descriptor: descriptor) else {
-            return nil
-        }
+        precondition(inkVertexFloats() == UInt32(InkGeometry.vertexFloats), "InkMesh vertex layout changed")
         self.device = device
         self.queue = queue
-        self.pipeline = pipeline
+        (psoNormal, psoMultiply) = pipelines
+        (depthAccumulate, depthDiscard) = depthStates
         self.view = view
         batch = GPUGeometry(device: device)
         local = GPUGeometry(device: device)
         super.init()
+    }
+
+    /// Mirrors `VertexIn` in Shaders.metal: buffer 0 is the core's
+    /// `InkMesh.vertices` verbatim (float2 position, float2 uv, float
+    /// opacity; 20 bytes), buffer 3 the per-vertex stroke index.
+    private static var vertexDescriptor: MTLVertexDescriptor {
+        let d = MTLVertexDescriptor()
+        d.attributes[0].format = .float2
+        d.attributes[0].offset = 0
+        d.attributes[0].bufferIndex = 0
+        d.attributes[1].format = .float2
+        d.attributes[1].offset = 8
+        d.attributes[1].bufferIndex = 0
+        d.attributes[2].format = .float
+        d.attributes[2].offset = 16
+        d.attributes[2].bufferIndex = 0
+        d.layouts[0].stride = InkGeometry.vertexFloats * MemoryLayout<Float>.stride
+        d.attributes[3].format = .uint
+        d.attributes[3].offset = 0
+        d.attributes[3].bufferIndex = 3
+        d.layouts[3].stride = MemoryLayout<UInt32>.stride
+        return d
+    }
+
+    /// Normal and Multiply pipelines; both premultiplied.
+    private static func makePipelines(device: MTLDevice) -> (MTLRenderPipelineState, MTLRenderPipelineState)? {
+        guard
+            let library = device.makeDefaultLibrary(),
+            let vertex = library.makeFunction(name: "ink_vertex"),
+            let fragment = library.makeFunction(name: "ink_fragment")
+        else { return nil }
+        func make(multiply: Bool) -> MTLRenderPipelineState? {
+            let descriptor = MTLRenderPipelineDescriptor()
+            descriptor.label = multiply ? "ink multiply" : "ink normal"
+            descriptor.vertexFunction = vertex
+            descriptor.fragmentFunction = fragment
+            descriptor.vertexDescriptor = vertexDescriptor
+            descriptor.rasterSampleCount = sampleCount
+            descriptor.depthAttachmentPixelFormat = depthFormat
+            let target = descriptor.colorAttachments[0]!
+            target.pixelFormat = colorFormat
+            target.isBlendingEnabled = true
+            // Normal: out = src + dst·(1 − a). Multiply: out = lerp(dst, c·dst, a)
+            // = c·a·dst + dst·(1 − a), the classic highlighter.
+            target.sourceRGBBlendFactor = multiply ? .destinationColor : .one
+            target.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            target.sourceAlphaBlendFactor = .one
+            target.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            return try? device.makeRenderPipelineState(descriptor: descriptor)
+        }
+        guard let normal = make(multiply: false), let multiply = make(multiply: true) else { return nil }
+        return (normal, multiply)
+    }
+
+    /// Accumulate (`.lessEqual`) and Discard (`.less`), both writing depth.
+    private static func makeDepthStates(device: MTLDevice) -> (MTLDepthStencilState, MTLDepthStencilState)? {
+        func make(_ compare: MTLCompareFunction) -> MTLDepthStencilState? {
+            let d = MTLDepthStencilDescriptor()
+            d.depthCompareFunction = compare
+            d.isDepthWriteEnabled = true
+            return device.makeDepthStencilState(descriptor: d)
+        }
+        guard let accumulate = make(.lessEqual), let discard = make(.less) else { return nil }
+        return (accumulate, discard)
+    }
+
+    /// The clear colour for a UIKit background: the framebuffer is sRGB,
+    /// Metal takes clear values in linear light.
+    static func clearColor(for color: UIColor, trait: UITraitCollection) -> MTLClearColor {
+        var r: CGFloat = 0
+        var g: CGFloat = 0
+        var b: CGFloat = 0
+        var a: CGFloat = 0
+        color.resolvedColor(with: trait).getRed(&r, green: &g, blue: &b, alpha: &a)
+        func linear(_ c: CGFloat) -> Double {
+            let c = Double(c)
+            return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+        }
+        return MTLClearColor(red: linear(r), green: linear(g), blue: linear(b), alpha: 1)
     }
 
     // MARK: tolerance
@@ -292,9 +427,10 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     // MARK: committed ink
 
     /// Show a committed element, stroke or shape (idempotent; re-show only
-    /// updates z).
+    /// updates z). Replaces the settling local copy of the same id.
     func show(_ element: Element, z: Int) {
         let id = element.id
+        if locals.removeValue(forKey: id) != nil { localsOrder.removeAll { $0 == id } }
         if committed[id] != nil {
             if committed[id]?.z != z {
                 committed[id]?.z = z
@@ -326,6 +462,9 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         wet = [:]
         wetOrder = []
         hasLocal = false
+        localGeometry = nil
+        locals = [:]
+        localsOrder = []
         inkBounds = .null
         needsDisplay()
     }
@@ -349,29 +488,43 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     private func rebuildBatch() {
         batchDirty = false
         var geometry = InkGeometry()
-        for id in order {
+        for (k, id) in order.enumerated() {
             guard let entry = committed[id] else { continue }
-            geometry.append(entry.mesh, color: entry.element.color)
+            geometry.append(entry.mesh, depth: Self.committedDepth(k, of: order.count))
         }
         batch.upload(geometry)
     }
 
     // MARK: remote wet ink
 
-    func wetBegin(_ id: String, tool: Tool, color: UInt32, baseWidth: Float) {
+    func wetBegin(_ id: String, brush: BrushRef, color: UInt32) {
         if wet[id] == nil { wetOrder.append(id) }
-        wet[id] = Wet(
-            tool: tool, color: color, baseWidth: baseWidth, geometry: GPUGeometry(device: device))
+        wet[id] = Wet(brush: brush, color: color, geometry: GPUGeometry(device: device))
         needsDisplay()
     }
 
-    func wetAppend(_ id: String, _ points: [WetPoint]) {
-        guard var entry = wet[id] else { return }
-        entry.points.append(contentsOf: points)
-        let mesh = wetMesh(
-            points: entry.points, tool: entry.tool, baseWidth: entry.baseWidth, tolerance: tolerance)
-        entry.geometry.upload(InkGeometry(mesh, color: entry.color))
-        wet[id] = entry
+    /// Stored points the sender emitted; the mesh is the sender's own
+    /// (same core, same points), so the commit changes nothing on screen.
+    func wetAppend(_ id: String, _ points: [StrokePoint]) {
+        guard wet[id] != nil else { return }
+        wet[id]?.points.append(contentsOf: points)
+        remeshWet(id)
+    }
+
+    /// The sender's pen-up: `tail` is what its `finish` added.
+    func wetEnd(_ id: String, tail: [StrokePoint]) {
+        guard wet[id] != nil else { return }
+        wet[id]?.points.append(contentsOf: tail)
+        wet[id]?.end = .complete
+        remeshWet(id)
+    }
+
+    private func remeshWet(_ id: String) {
+        guard let entry = wet[id], let j = wetOrder.firstIndex(of: id) else { return }
+        let mesh = pointsMesh(
+            points: entry.points, brush: entry.brush, color: entry.color, end: entry.end,
+            tolerance: tolerance)
+        entry.geometry.upload(InkGeometry(mesh, depth: Self.wetDepth(j, of: wetOrder.count)))
         needsDisplay()
     }
 
@@ -388,19 +541,20 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     /// Replace the live stroke's ink: the modeler's points plus its
     /// predicted tail, re-tessellated whole (well under a millisecond for
     /// thousands of points).
-    func setLocal(points: [StrokePoint], tool: Tool, color: UInt32, baseWidth: Float) {
-        let mesh = pointsMesh(points: points, tool: tool, baseWidth: baseWidth, tolerance: tolerance)
-        local.upload(InkGeometry(mesh, color: color))
-        hasLocal = true
-        needsDisplay()
+    func setLocal(points: [StrokePoint], brush: BrushRef, color: UInt32) {
+        setLocal(pointsMesh(points: points, brush: brush, color: color, end: .live, tolerance: tolerance))
     }
 
     /// Replace the live stroke's ink with a snapped shape's outline (the
-    /// draw-and-hold preview), in the stroke's tool, colour and width.
-    func setLocalShape(_ shape: Shape, tool: Tool, color: UInt32, baseWidth: Float) {
-        let mesh = shapeOutlineMesh(
-            shape: shape, tool: tool, baseWidth: baseWidth, tolerance: tolerance)
-        local.upload(InkGeometry(mesh, color: color))
+    /// draw-and-hold preview), in the stroke's brush and colour.
+    func setLocalShape(_ shape: Shape, brush: BrushRef, color: UInt32) {
+        setLocal(shapeOutlineMesh(shape: shape, brush: brush, color: color, tolerance: tolerance))
+    }
+
+    private func setLocal(_ mesh: InkMesh) {
+        let geometry = InkGeometry(mesh, depth: Self.liveDepth)
+        local.upload(geometry)
+        localGeometry = geometry
         hasLocal = true
         needsDisplay()
     }
@@ -408,6 +562,30 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     func clearLocal() {
         guard hasLocal else { return }
         hasLocal = false
+        localGeometry = nil
+        needsDisplay()
+    }
+
+    /// Pen is up but the commit waits for estimated-property updates: keep
+    /// the live ink on screen under `id` until `show` lands the element.
+    func settleLocal(as id: String) {
+        guard hasLocal, var geometry = localGeometry else { return }
+        hasLocal = false
+        localGeometry = nil
+        // Distinct slots so two settling markers do not discard each other.
+        settled = (settled + 1) % 40
+        let depth = 0.05 - 0.001 * Float(settled)
+        for i in geometry.styles.indices { geometry.styles[i].depth = depth }
+        let gpu = GPUGeometry(device: device)
+        gpu.upload(geometry)
+        if locals[id] == nil { localsOrder.append(id) }
+        locals[id] = gpu
+        needsDisplay()
+    }
+
+    func dropLocal(_ id: String) {
+        guard locals.removeValue(forKey: id) != nil else { return }
+        localsOrder.removeAll { $0 == id }
         needsDisplay()
     }
 
@@ -438,44 +616,149 @@ final class InkRenderer: NSObject, MTKViewDelegate {
             loggedDrawable = true
             // NSLog: reaches `devicectl --console` on a device, unlike os_log.
             NSLog(
-                "ink view %.0fx%.0fpt drawable %.0fx%.0fpx scale %.2f msaa %d",
+                "ink view %.0fx%.0fpt drawable %.0fx%.0fpx scale %.2f msaa %d srgb %d depth %d",
                 view.bounds.width, view.bounds.height, view.drawableSize.width,
-                view.drawableSize.height, view.contentScaleFactor, view.sampleCount)
+                view.drawableSize.height, view.contentScaleFactor, view.sampleCount,
+                view.colorPixelFormat == Self.colorFormat ? 1 : 0,
+                view.depthStencilPixelFormat == Self.depthFormat ? 1 : 0)
         }
-
         let size = viewport.size
-        guard size.width > 0, size.height > 0 else {
-            encoder.endEncoding()
-            command.present(drawable)
-            command.commit()
-            return
+        if size.width > 0, size.height > 0 {
+            var uniforms = Uniforms(viewport)
+            encode(encoder, uniforms: &uniforms) { draw in
+                draw(batch)
+                for id in wetOrder {
+                    guard let entry = wet[id] else { continue }
+                    draw(entry.geometry)
+                }
+                for id in localsOrder {
+                    guard let entry = locals[id] else { continue }
+                    draw(entry)
+                }
+                if hasLocal { draw(local) }
+            }
         }
-        // canvas → clip: x' = (x·zoom − off.x) / w · 2 − 1, y flipped.
-        let zoom = Float(viewport.zoom)
-        var uniforms = Uniforms(
-            scale: SIMD2(2 * zoom / Float(size.width), -2 * zoom / Float(size.height)),
-            translate: SIMD2(
-                -2 * Float(viewport.offset.x) / Float(size.width) - 1,
-                2 * Float(viewport.offset.y) / Float(size.height) + 1))
-
-        encoder.setRenderPipelineState(pipeline)
-        encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
-        func encode(_ geometry: GPUGeometry) {
-            guard !geometry.isEmpty, let vertices = geometry.vertices, let indices = geometry.indices
-            else { return }
-            encoder.setVertexBuffer(vertices, offset: 0, index: 0)
-            encoder.drawIndexedPrimitives(
-                type: .triangle, indexCount: geometry.indexCount, indexType: .uint32,
-                indexBuffer: indices, indexBufferOffset: 0)
-        }
-        encode(batch)
-        for id in wetOrder {
-            guard let entry = wet[id] else { continue }
-            encode(entry.geometry)
-        }
-        if hasLocal { encode(local) }
         encoder.endEncoding()
         command.present(drawable)
         command.commit()
+    }
+
+    /// Bind the uniforms once, then hand the body a `draw` that encodes a
+    /// geometry's runs, switching pipeline and depth state per run.
+    private func encode(
+        _ encoder: MTLRenderCommandEncoder, uniforms: inout Uniforms,
+        _ body: ((GPUGeometry) -> Void) -> Void
+    ) {
+        encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
+        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
+        body { geometry in
+            guard
+                !geometry.isEmpty, let vertices = geometry.vertices,
+                let strokeIndex = geometry.strokeIndex, let indices = geometry.indices,
+                let styles = geometry.styles
+            else { return }
+            encoder.setVertexBuffer(vertices, offset: 0, index: 0)
+            encoder.setVertexBuffer(styles, offset: 0, index: 2)
+            encoder.setVertexBuffer(strokeIndex, offset: 0, index: 3)
+            encoder.setFragmentBuffer(styles, offset: 0, index: 0)
+            for run in geometry.runs {
+                encoder.setRenderPipelineState(run.combo.multiply ? psoMultiply : psoNormal)
+                encoder.setDepthStencilState(run.combo.discard ? depthDiscard : depthAccumulate)
+                encoder.drawIndexedPrimitives(
+                    type: .triangle, indexCount: run.indexCount, indexType: .uint32,
+                    indexBuffer: indices,
+                    indexBufferOffset: run.indexOffset * MemoryLayout<UInt32>.stride)
+            }
+        }
+    }
+
+    // MARK: thumbnails
+
+    /// Render committed elements offscreen through the same pipeline the
+    /// canvas uses (masks, multiply, write-once ink included), at most
+    /// `maxSide` points on the long edge, 2x pixel density. `nil` when
+    /// there is no ink.
+    func renderThumbnail(elements: [Element], maxSide: CGFloat, background: UIColor, trait: UITraitCollection) -> UIImage? {
+        let tolerance = defaultTolerance()
+        var geometry = InkGeometry()
+        var bounds = CGRect.null
+        for (k, element) in elements.enumerated() {
+            let mesh = elementMesh(element: element, tolerance: tolerance)
+            bounds = bounds.union(mesh.bounds)
+            geometry.append(mesh, depth: Self.committedDepth(k, of: elements.count))
+        }
+        guard !geometry.isEmpty, !bounds.isNull else { return nil }
+        bounds = bounds.insetBy(dx: -8, dy: -8)
+        let scale = max(0.1, min(1, maxSide / max(bounds.width, bounds.height, 1)))
+        let pixelScale: CGFloat = 2
+        let points = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        let width = max(1, Int((points.width * pixelScale).rounded(.up)))
+        let height = max(1, Int((points.height * pixelScale).rounded(.up)))
+
+        let color = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: Self.colorFormat, width: width, height: height, mipmapped: false)
+        color.textureType = .type2DMultisample
+        color.sampleCount = Self.sampleCount
+        color.usage = .renderTarget
+        color.storageMode = .private
+        let resolve = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: Self.colorFormat, width: width, height: height, mipmapped: false)
+        resolve.usage = .renderTarget
+        resolve.storageMode = .shared
+        let depth = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: Self.depthFormat, width: width, height: height, mipmapped: false)
+        depth.textureType = .type2DMultisample
+        depth.sampleCount = Self.sampleCount
+        depth.usage = .renderTarget
+        depth.storageMode = .private
+        guard
+            let colorTexture = device.makeTexture(descriptor: color),
+            let resolveTexture = device.makeTexture(descriptor: resolve),
+            let depthTexture = device.makeTexture(descriptor: depth),
+            let command = queue.makeCommandBuffer()
+        else { return nil }
+
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = colorTexture
+        pass.colorAttachments[0].resolveTexture = resolveTexture
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].storeAction = .multisampleResolve
+        pass.colorAttachments[0].clearColor = Self.clearColor(for: background, trait: trait)
+        pass.depthAttachment.texture = depthTexture
+        pass.depthAttachment.loadAction = .clear
+        pass.depthAttachment.clearDepth = 1
+        pass.depthAttachment.storeAction = .dontCare
+        guard let encoder = command.makeRenderCommandEncoder(descriptor: pass) else { return nil }
+        let gpu = GPUGeometry(device: device)
+        gpu.upload(geometry)
+        var uniforms = Uniforms(
+            Viewport(
+                zoom: scale,
+                offset: CGPoint(x: bounds.minX * scale, y: bounds.minY * scale),
+                size: points))
+        encode(encoder, uniforms: &uniforms) { draw in draw(gpu) }
+        encoder.endEncoding()
+        command.commit()
+        command.waitUntilCompleted()
+
+        let bytesPerRow = width * 4
+        var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
+        pixels.withUnsafeMutableBytes { bytes in
+            guard let base = bytes.baseAddress else { return }
+            resolveTexture.getBytes(
+                base, bytesPerRow: bytesPerRow,
+                from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0)
+        }
+        let info = CGBitmapInfo(
+            rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+        guard
+            let provider = CGDataProvider(data: Data(pixels) as CFData),
+            let image = CGImage(
+                width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                bytesPerRow: bytesPerRow, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: info, provider: provider, decode: nil, shouldInterpolate: true,
+                intent: .defaultIntent)
+        else { return nil }
+        return UIImage(cgImage: image, scale: pixelScale, orientation: .up)
     }
 }
