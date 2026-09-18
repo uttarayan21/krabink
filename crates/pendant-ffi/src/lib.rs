@@ -12,9 +12,12 @@ mod engine;
 mod net;
 mod types;
 
-pub use brush::{BrushModeler, IndexedMesh, RawSample};
+pub use brush::{
+    Blend, BrushModeler, BrushRef, INK_VERTEX_FLOATS, InkMesh, InkStyle, Overlap, RawSample,
+    StrokeEnd,
+};
 pub use engine::{Core, CoreListener, NoteListener, NoteSession, PendantError};
 pub use types::{
     Binding, Element, NoteInfo, Point2, PointKind, Recognition, Shape, ShapeElement, Stroke,
-    StrokePoint, SyncState, Tilt, Tool, WetPoint,
+    StrokePoint, SyncState, Tilt, Tool,
 };

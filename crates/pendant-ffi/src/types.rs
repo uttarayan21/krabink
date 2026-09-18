@@ -3,22 +3,28 @@
 
 use pendant_core as pcore;
 
+/// A built-in brush preset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum Tool {
     Pen,
+    /// Graphite: tilt widens and lightens, pressure darkens.
+    Pencil,
+    /// Chisel highlighter: translucent, never darker where it crosses
+    /// itself.
     Marker,
     Monoline,
     /// Flat calligraphy nib oriented by azimuth + barrel roll.
-    Brush,
+    Fountain,
 }
 
 impl From<Tool> for pcore::Tool {
     fn from(t: Tool) -> Self {
         match t {
             Tool::Pen => Self::Pen,
+            Tool::Pencil => Self::Pencil,
             Tool::Marker => Self::Marker,
             Tool::Monoline => Self::Monoline,
-            Tool::Brush => Self::Brush,
+            Tool::Fountain => Self::Fountain,
         }
     }
 }
@@ -27,9 +33,10 @@ impl From<pcore::Tool> for Tool {
     fn from(t: pcore::Tool) -> Self {
         match t {
             pcore::Tool::Pen => Self::Pen,
+            pcore::Tool::Pencil => Self::Pencil,
             pcore::Tool::Marker => Self::Marker,
             pcore::Tool::Monoline => Self::Monoline,
-            pcore::Tool::Brush => Self::Brush,
+            pcore::Tool::Fountain => Self::Fountain,
         }
     }
 }
@@ -135,43 +142,6 @@ impl From<pcore::StrokePoint> for StrokePoint {
     }
 }
 
-/// One live pen sample on the ephemeral wet-ink channel.
-#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
-pub struct WetPoint {
-    pub x: f32,
-    pub y: f32,
-    pub force: f32,
-    /// Rendered line width at this sample; receivers fall back to
-    /// `base_width * force` when absent.
-    pub width: Option<f32>,
-    /// Flat-nib orientation (azimuth + roll, radians) for nib tools.
-    pub nib: Option<f32>,
-}
-
-impl From<pcore::WetPoint> for WetPoint {
-    fn from(p: pcore::WetPoint) -> Self {
-        Self {
-            x: p.x,
-            y: p.y,
-            force: p.force,
-            width: p.width,
-            nib: p.nib,
-        }
-    }
-}
-
-impl From<WetPoint> for pcore::WetPoint {
-    fn from(p: WetPoint) -> Self {
-        Self {
-            x: p.x,
-            y: p.y,
-            force: p.force,
-            width: p.width,
-            nib: p.nib,
-        }
-    }
-}
-
 /// A finished stroke, as stored in the CRDT.
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct Stroke {
@@ -193,32 +163,15 @@ impl From<Stroke> for pcore::Stroke {
         Self {
             id: s.id.parse().unwrap_or_else(|_| pcore::StrokeId::new()),
             tool: s.tool.into(),
+            // Custom brushes cross the boundary once the brush library
+            // lands; until then every stroke uses its tool's preset.
+            brush: None,
             color: rgba_from_u32(s.color),
             base_width: s.base_width,
             kind: s.kind.into(),
             points: s.points.into_iter().map(Into::into).collect(),
             created_ms: s.created_ms,
         }
-    }
-}
-
-/// Renderers fall back to this width for wet ink whose points carry none.
-pub(crate) const WET_WIDTH_FALLBACK: f32 = 2.0;
-
-pub(crate) fn wet_to_stroke_point(p: &WetPoint) -> pcore::StrokePoint {
-    pcore::StrokePoint {
-        x: p.x,
-        y: p.y,
-        force: p.force,
-        t_ms: 0,
-        // Wet samples carry only the nib orientation; that is all a nib
-        // tool needs to render.
-        tilt: p.nib.map(|angle| pcore::Tilt {
-            azimuth: angle,
-            altitude: 0.0,
-            roll: 0.0,
-        }),
-        size: p.width.map(|w| pcore::PointSize { w, h: w }),
     }
 }
 

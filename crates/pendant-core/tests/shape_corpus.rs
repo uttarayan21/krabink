@@ -59,6 +59,7 @@ fn parse(text: &str) -> Case {
                 force: f[2],
                 t_ms: f64::from(f[3]),
                 tilt: None,
+                estimate: None,
             });
         }
     }

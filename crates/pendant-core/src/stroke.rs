@@ -6,8 +6,11 @@
 //! whenever a delta would overflow its field, so arbitrarily large jumps are
 //! representable.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
+use crate::brush::{BrushSpec, CustomBrush};
 use crate::{Error, Result, StrokeId};
 
 /// Sub-unit resolution of stored coordinates (1/8 canvas unit).
@@ -15,32 +18,40 @@ const QUANT: f32 = 8.0;
 /// Upper bound on points per chunk; keeps individual CRDT values small.
 const MAX_CHUNK_POINTS: usize = 64;
 
-/// Drawing tool a stroke was made with. Maps onto PencilKit ink types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Drawing tool a stroke was made with; names one of the built-in brush
+/// presets ([`BrushSpec::preset`](crate::BrushSpec::preset)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Tool {
     Pen,
+    /// Graphite: tilt widens and lightens, pressure darkens.
+    Pencil,
+    /// Chisel highlighter: translucent, never darker where it crosses
+    /// itself.
     Marker,
     Monoline,
-    /// Flat calligraphy nib: `base_width` wide, oriented by the pen's
-    /// azimuth + barrel roll (Apple Pencil Pro), so the ink is broad across
-    /// the nib and thin along it.
-    Brush,
+    /// Flat calligraphy nib oriented by the pen's azimuth + barrel roll
+    /// (Apple Pencil Pro), so the ink is broad across the nib and thin
+    /// along it. Stored as `"brush"`, its name before pencils existed.
+    Fountain,
 }
 
 impl Tool {
+    pub const ALL: [Self; 5] = [
+        Self::Pen,
+        Self::Pencil,
+        Self::Marker,
+        Self::Monoline,
+        Self::Fountain,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pen => "pen",
+            Self::Pencil => "pencil",
             Self::Marker => "marker",
             Self::Monoline => "monoline",
-            Self::Brush => "brush",
+            Self::Fountain => "brush",
         }
-    }
-
-    /// Does this tool's ink follow the nib orientation rather than the
-    /// direction of motion?
-    pub fn has_nib(self) -> bool {
-        matches!(self, Self::Brush)
     }
 }
 
@@ -50,9 +61,10 @@ impl core::str::FromStr for Tool {
     fn from_str(s: &str) -> Result<Self> {
         match s {
             "pen" => Ok(Self::Pen),
+            "pencil" => Ok(Self::Pencil),
             "marker" => Ok(Self::Marker),
             "monoline" => Ok(Self::Monoline),
-            "brush" => Ok(Self::Brush),
+            "brush" | "fountain" => Ok(Self::Fountain),
             other => Err(Error::Schema(format!("unknown tool {other:?}"))),
         }
     }
@@ -176,13 +188,29 @@ impl Rgba {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stroke {
     pub id: StrokeId,
+    /// The preset this stroke renders with when `brush` is `None`.
     pub tool: Tool,
+    /// A custom brush, snapshotted inline so the stroke renders the same
+    /// on a device without the brush library.
+    pub brush: Option<CustomBrush>,
     pub color: Rgba,
+    /// Full ink width in canvas units, the brush "size".
     pub base_width: f32,
     pub kind: PointKind,
     pub points: Vec<StrokePoint>,
     /// Unix millis at stroke creation.
     pub created_ms: u64,
+}
+
+impl Stroke {
+    /// The brush this stroke renders with: its custom spec, or the tool's
+    /// preset.
+    pub fn spec(&self) -> Cow<'_, BrushSpec> {
+        match &self.brush {
+            Some(custom) => Cow::Borrowed(&custom.spec),
+            None => Cow::Owned(BrushSpec::preset(self.tool)),
+        }
+    }
 }
 
 /// Storage form of a run of points (see module docs for layout).

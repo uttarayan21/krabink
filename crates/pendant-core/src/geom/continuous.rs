@@ -1,34 +1,31 @@
 //! Round-tipped strokes through lyon's stroker: a variable-width path with
-//! round caps and round joins, one width attribute per point.
+//! round caps and round joins, width and opacity attributes per point.
 
 use lyon_tessellation::{
     BuffersBuilder, LineCap, LineJoin, StrokeOptions, StrokeTessellator, StrokeVertex,
     VertexBuffers, math::point, path::Path,
 };
 
-use super::{InkMesh, InkVertex, MIN_SEGMENT, dedupe, half_width};
-use crate::stroke::StrokePoint;
+use super::{InkMesh, InkStyle, InkVertex, MIN_SEGMENT};
+use crate::brush::TipState;
 
-/// Variable-width stroke through lyon: width per point is the point's own
-/// `size.w` when present, otherwise `base_width * force`; caps and joins
-/// are round. A single point (or all-coincident points) becomes a dot of
-/// the point's width.
-pub(super) fn round_mesh(points: &[StrokePoint], base_width: f32, tolerance: f32) -> InkMesh {
-    let pts = dedupe(points);
-    let Some(first) = pts.first() else {
-        return InkMesh::default();
+/// Variable-width stroke through lyon with round caps and joins. A single
+/// point (or all-coincident points) becomes a dot of the point's width.
+pub(super) fn round_mesh(pts: &[([f32; 2], TipState)], style: InkStyle, tolerance: f32) -> InkMesh {
+    let Some((first, first_tip)) = pts.first() else {
+        return InkMesh::empty(style);
     };
-    let width = |p: &StrokePoint| 2.0 * half_width(p, base_width);
+    let attrs = |t: &TipState| [t.w, t.opacity];
 
-    let mut builder = Path::builder_with_attributes(1);
-    builder.begin(point(first.x, first.y), &[width(first)]);
+    let mut builder = Path::builder_with_attributes(2);
+    builder.begin(point(first[0], first[1]), &attrs(first_tip));
     if pts.len() == 1 {
         // A zero-length segment is skipped by the stroker; nudge the end so
         // the two round caps meet as a circle.
-        builder.line_to(point(first.x + MIN_SEGMENT, first.y), &[width(first)]);
+        builder.line_to(point(first[0] + MIN_SEGMENT, first[1]), &attrs(first_tip));
     }
-    for p in pts.iter().skip(1) {
-        builder.line_to(point(p.x, p.y), &[width(p)]);
+    for (p, tip) in pts.iter().skip(1) {
+        builder.line_to(point(p[0], p[1]), &attrs(tip));
     }
     builder.end(false);
     let path = builder.build();
@@ -36,7 +33,7 @@ pub(super) fn round_mesh(points: &[StrokePoint], base_width: f32, tolerance: f32
     // Lyon drops geometry finer than its tolerance, so a coarse tolerance
     // on hairline ink would erase the stroke: never exceed a quarter of the
     // thinnest width in play.
-    let finest = pts.iter().map(width).fold(f32::INFINITY, f32::min);
+    let finest = pts.iter().map(|(_, t)| t.w).fold(f32::INFINITY, f32::min);
     let tolerance = tolerance.clamp(1e-3, (finest / 4.0).max(1e-3));
     let options = StrokeOptions::tolerance(tolerance)
         .with_line_width(1.0)
@@ -47,21 +44,23 @@ pub(super) fn round_mesh(points: &[StrokePoint], base_width: f32, tolerance: f32
     let result = StrokeTessellator::new().tessellate_path(
         &path,
         &options,
-        &mut BuffersBuilder::new(&mut buffers, |v: StrokeVertex| {
+        &mut BuffersBuilder::new(&mut buffers, |mut v: StrokeVertex| {
             let p = v.position();
+            let opacity = v.interpolated_attributes()[1];
             InkVertex {
                 pos: [p.x, p.y],
                 uv: [v.advancement(), v.side().to_f32()],
-                opacity: 1.0,
+                opacity: opacity.clamp(0.0, 1.0),
             }
         }),
     );
     if let Err(err) = result {
         tracing::warn!(?err, points = pts.len(), "stroke tessellation failed");
-        return InkMesh::default();
+        return InkMesh::empty(style);
     }
     InkMesh {
         vertices: buffers.vertices,
         indices: buffers.indices,
+        style,
     }
 }

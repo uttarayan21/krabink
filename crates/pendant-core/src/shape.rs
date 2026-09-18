@@ -1480,6 +1480,7 @@ mod tests {
                 force: 0.7,
                 t_ms: 1000.0 + i as f64 * SAMPLE_MS,
                 tilt: None,
+                estimate: None,
             })
             .collect()
     }

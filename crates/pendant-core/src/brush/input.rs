@@ -10,6 +10,8 @@
 //! sample, which removes hand jitter at the cost of a small lag that
 //! [`EmaModel::landing`] cancels at pen-up.
 
+use serde::{Deserialize, Serialize};
+
 use crate::stroke::{StrokePoint, Tilt};
 
 /// One raw input sample, before smoothing.
@@ -22,10 +24,23 @@ pub struct RawSample {
     /// Milliseconds on any monotonic clock; only differences matter.
     pub t_ms: f64,
     pub tilt: Option<Tilt>,
+    /// Set when the platform may revise `force` or `tilt` after the fact
+    /// (Apple Pencil reports estimates first). See
+    /// [`BrushModeler::update`](super::BrushModeler::update).
+    pub estimate: Option<Estimate>,
+}
+
+/// A sample's estimated-property bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Estimate {
+    /// The platform's update index for this sample.
+    pub id: u32,
+    /// Whether a revision is still expected.
+    pub pending: bool,
 }
 
 /// How raw samples become input points.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct InputParams {
     /// Streamline factor: 0 follows the pen exactly, 1 never moves. The
     /// smoothed point covers `1 - streamline` of the distance to each raw
@@ -34,6 +49,8 @@ pub struct InputParams {
     /// Smoothed samples closer than this to the previous emitted point are
     /// dropped: a slow pen at 240 Hz would otherwise emit near-duplicates.
     pub min_distance: f32,
+    /// Pressure below this counts as this, so a light touch still inks.
+    pub min_force: f32,
 }
 
 /// Everything the smoothing needs to continue from; small so

@@ -425,6 +425,7 @@ fn dispatch_wet(shared: &Shared, doc: DocKey, payload: &[u8]) {
             tool,
             color,
             base_width,
+            ..
         } => listener.wet_begin(
             sketch.to_string(),
             stroke.to_string(),
@@ -433,25 +434,24 @@ fn dispatch_wet(shared: &Shared, doc: DocKey, payload: &[u8]) {
             base_width,
         ),
         WetInk::Points {
-            stroke,
-            points,
-            sent_ms,
-            ..
-        } => listener.wet_points(
-            stroke.to_string(),
-            sent_ms,
-            points
-                .iter()
-                .map(|p| crate::types::WetPoint {
-                    x: p.x,
-                    y: p.y,
-                    force: p.force,
-                    width: p.width,
-                    nib: p.nib,
-                })
-                .collect(),
-        ),
-        WetInk::End { stroke, .. } => listener.wet_end(stroke.to_string()),
+            stroke, sent_ms, ..
+        }
+        | WetInk::End {
+            stroke, sent_ms, ..
+        } => {
+            match ink.decode_points() {
+                Ok(points) if !points.is_empty() => listener.wet_points(
+                    stroke.to_string(),
+                    sent_ms,
+                    points.into_iter().map(Into::into).collect(),
+                ),
+                Ok(_) => {}
+                Err(err) => tracing::warn!("dropping undecodable wet-ink points: {err}"),
+            }
+            if matches!(ink, WetInk::End { .. }) {
+                listener.wet_end(stroke.to_string());
+            }
+        }
         WetInk::Cancel { stroke } => listener.wet_cancel(stroke.to_string()),
     }
 }

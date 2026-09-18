@@ -18,8 +18,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::TextureUsages;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, EguiUserTextures, egui};
 use pendant_core::{
-    DEFAULT_TOLERANCE, DocKey, Element, PointSize, Rgba, SKETCH_URI_PREFIX, SketchId, StrokeId,
-    StrokePoint, Tilt, Tool, WetInk, WetPoint, stroke_mesh,
+    DEFAULT_TOLERANCE, DocKey, Element, Ink, Rgba, SKETCH_URI_PREFIX, SketchId, StrokeEnd,
+    StrokeId, StrokePoint, Tool, WetInk,
 };
 
 use crate::docs::{Docs, now_ms};
@@ -31,7 +31,6 @@ const WET_TTL_MS: u64 = 5_000;
 /// why [`DEFAULT_TOLERANCE`] is the right cap/join flattening tolerance).
 const MIN_TARGET: u32 = 256;
 const MAX_TARGET: u32 = 2048;
-const WET_WIDTH_FALLBACK: f32 = 2.0;
 
 /// An ephemeral frame relayed by the server (raised by the sync layer).
 #[derive(Message)]
@@ -52,7 +51,7 @@ struct WetStroke {
     tool: Tool,
     color: Rgba,
     base_width: f32,
-    points: Vec<WetPoint>,
+    points: Vec<StrokePoint>,
     last_seq: u32,
     /// Set at `End`: drop at this deadline even without a commit.
     expires_ms: Option<u64>,
@@ -229,7 +228,7 @@ fn sync_sketch_scenes(
             if stale.remove(&id).is_some() {
                 continue;
             }
-            let entity = ink_mesh(element.tool(), outline, element.base_width()).map(|mesh| {
+            let entity = ink_mesh(&element.ink(), outline, StrokeEnd::Complete).map(|mesh| {
                 commands
                     .spawn((
                         Mesh2d(meshes.add(mesh)),
@@ -335,8 +334,8 @@ fn color_of(rgba: Rgba) -> ColorMaterial {
 /// `None` when there is nothing to draw: bevy's mesh allocator never
 /// allocates a zero-vertex mesh but still tries to upload it, logging a
 /// "Use-after-free" error every frame the mesh is extracted.
-fn ink_mesh(tool: Tool, points: &[StrokePoint], base_width: f32) -> Option<Mesh> {
-    let ink = stroke_mesh(tool, points, base_width, DEFAULT_TOLERANCE);
+fn ink_mesh(ink: &Ink<'_>, points: &[StrokePoint], end: StrokeEnd) -> Option<Mesh> {
+    let ink = ink.mesh(points, end, DEFAULT_TOLERANCE);
     if ink.is_empty() {
         return None;
     }
@@ -381,6 +380,7 @@ fn apply_wet_ink(
                 tool,
                 color,
                 base_width,
+                ..
             } => {
                 let Some(layer) = scenes.scenes.get(&sketch).map(|s| s.layer) else {
                     continue; // sketch not on screen yet; CRDT commit will cover it
@@ -407,7 +407,7 @@ fn apply_wet_ink(
                 stroke,
                 seq,
                 sent_ms,
-                points,
+                ..
             } => {
                 latency.samples_ms.push(now_ms() as f64 - sent_ms as f64);
                 let Some(wet) = scenes.wet.get_mut(&stroke) else {
@@ -417,25 +417,15 @@ fn apply_wet_ink(
                     continue;
                 }
                 wet.last_seq = seq;
-                wet.points.extend(points);
-                let flat: Vec<StrokePoint> = wet
-                    .points
-                    .iter()
-                    .map(|p| StrokePoint {
-                        x: p.x,
-                        y: p.y,
-                        force: p.force,
-                        t_ms: 0,
-                        tilt: p.nib.map(|angle| Tilt {
-                            azimuth: angle,
-                            altitude: 0.0,
-                            roll: 0.0,
-                        }),
-                        size: p.width.map(|w| PointSize { w, h: w }),
-                    })
-                    .collect();
-                let Some(mesh) = ink_mesh(wet.tool, &flat, wet.base_width.max(WET_WIDTH_FALLBACK))
-                else {
+                match msg.decode_points() {
+                    Ok(points) => wet.points.extend(points),
+                    Err(err) => {
+                        tracing::warn!(%err, "undecodable wet-ink points");
+                        continue;
+                    }
+                }
+                let ink = Ink::preset(wet.tool, wet.color, wet.base_width);
+                let Some(mesh) = ink_mesh(&ink, &wet.points, StrokeEnd::Live) else {
                     continue; // nothing drawable yet
                 };
                 match &wet.mesh {
@@ -459,10 +449,24 @@ fn apply_wet_ink(
                     }
                 }
             }
-            WetInk::End { stroke, sent_ms } => {
+            WetInk::End {
+                stroke, sent_ms, ..
+            } => {
                 latency.samples_ms.push(now_ms() as f64 - sent_ms as f64);
                 if let Some(wet) = scenes.wet.get_mut(&stroke) {
                     wet.expires_ms = Some(now_ms() + WET_TTL_MS);
+                    // The landing tail completes the stroke; redraw it
+                    // finished so the commit lands without a change.
+                    if let Ok(tail) = msg.decode_points() {
+                        wet.points.extend(tail);
+                    }
+                    let ink = Ink::preset(wet.tool, wet.color, wet.base_width);
+                    if let (Some(handle), Some(mesh)) =
+                        (&wet.mesh, ink_mesh(&ink, &wet.points, StrokeEnd::Complete))
+                        && let Err(err) = meshes.insert(handle, mesh)
+                    {
+                        tracing::error!(%err, "wet-ink mesh update failed");
+                    }
                 }
                 report_latency(&mut latency);
             }

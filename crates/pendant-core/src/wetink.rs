@@ -2,39 +2,16 @@
 //! protocol's ephemeral channel. Never persisted, never imported into a doc —
 //! receivers render these provisionally and drop them once the authoritative
 //! stroke lands in the CRDT at pen-up.
+//!
+//! Points travel as the same chunk-coded [`StrokePoint`]s the committed
+//! stroke stores ([`encode_chunks`]), so a receiver folds them through the
+//! same brush and draws exactly what the sender drew; the commit then
+//! replaces the provisional ink without a visible change.
 
 use serde::{Deserialize, Serialize};
 
-use crate::stroke::{Rgba, StrokePoint, Tilt, Tool};
+use crate::stroke::{Rgba, StrokePoint, Tool, decode_chunks, encode_chunks};
 use crate::{Result, SketchId, StrokeId};
-
-/// One live pen sample. No tilt — provisional rendering doesn't need it.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct WetPoint {
-    pub x: f32,
-    pub y: f32,
-    /// Normalised pressure, 0..=1.
-    pub force: f32,
-    /// Rendered line width at this sample, canvas units. `None` → receivers
-    /// fall back to `base_width * force`.
-    pub width: Option<f32>,
-    /// Flat-nib orientation (azimuth + roll, radians) for nib tools.
-    pub nib: Option<f32>,
-}
-
-impl From<StrokePoint> for WetPoint {
-    /// The wet-ink view of a modelled point: its rendered width and nib
-    /// orientation, nothing a receiver does not draw.
-    fn from(p: StrokePoint) -> Self {
-        Self {
-            x: p.x,
-            y: p.y,
-            force: p.force,
-            width: p.size.map(|s| s.w),
-            nib: p.tilt.map(Tilt::nib_angle),
-        }
-    }
-}
 
 /// A wet-ink event. `Begin` → `Points`* → `End`, keyed by the stroke id the
 /// authoritative CRDT stroke will use, so receivers can swap provisional ink
@@ -49,6 +26,9 @@ pub enum WetInk {
         tool: Tool,
         color: Rgba,
         base_width: f32,
+        /// A custom brush's encoded spec ([`crate::BrushSpec::encode`]);
+        /// `None` for the tool's preset.
+        spec: Option<Vec<u8>>,
     },
     Points {
         stroke: StrokeId,
@@ -57,11 +37,16 @@ pub enum WetInk {
         /// Sender's unix-millis clock when the batch was sent. Latency
         /// telemetry only — meaningless across badly skewed clocks.
         sent_ms: u64,
-        points: Vec<WetPoint>,
+        /// [`encode_chunks`] of the points emitted since the last batch;
+        /// `t_ms` counts from the stroke's first point.
+        chunks: Vec<Vec<u8>>,
     },
     End {
         stroke: StrokeId,
         sent_ms: u64,
+        /// The points pen-up added after the last batch (the landing on
+        /// the last raw sample), chunk-coded like `Points`.
+        tail: Vec<Vec<u8>>,
     },
     Cancel {
         stroke: StrokeId,
@@ -76,36 +61,79 @@ impl WetInk {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         Ok(postcard::from_bytes(bytes)?)
     }
+
+    /// A `Points` batch for `points`.
+    pub fn points(
+        stroke: StrokeId,
+        seq: u32,
+        sent_ms: u64,
+        points: &[StrokePoint],
+    ) -> Result<Self> {
+        Ok(Self::Points {
+            stroke,
+            seq,
+            sent_ms,
+            chunks: encode_chunks(points)?,
+        })
+    }
+
+    /// An `End` carrying `tail`.
+    pub fn end(stroke: StrokeId, sent_ms: u64, tail: &[StrokePoint]) -> Result<Self> {
+        Ok(Self::End {
+            stroke,
+            sent_ms,
+            tail: encode_chunks(tail)?,
+        })
+    }
+
+    /// The points a `Points` batch or an `End` tail carries; empty for
+    /// other events.
+    pub fn decode_points(&self) -> Result<Vec<StrokePoint>> {
+        match self {
+            Self::Points { chunks, .. } => decode_chunks(chunks.iter().map(Vec::as_slice)),
+            Self::End { tail, .. } => decode_chunks(tail.iter().map(Vec::as_slice)),
+            Self::Begin { .. } | Self::Cancel { .. } => Ok(Vec::new()),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stroke::Tilt;
 
     #[test]
-    fn roundtrip() {
-        let msg = WetInk::Points {
-            stroke: StrokeId::new(),
-            seq: 7,
-            sent_ms: 1_757_000_000_123,
-            points: vec![
-                WetPoint {
-                    x: 1.5,
-                    y: -2.0,
-                    force: 0.5,
-                    width: Some(3.25),
-                    nib: Some(1.2),
-                },
-                WetPoint {
-                    x: 2.5,
-                    y: -1.0,
-                    force: 0.75,
-                    width: None,
-                    nib: None,
-                },
-            ],
-        };
-        assert_eq!(WetInk::decode(&msg.encode().unwrap()).unwrap(), msg);
+    fn points_roundtrip_through_chunks() {
+        let points: Vec<StrokePoint> = (0..5)
+            .map(|i| StrokePoint {
+                x: 1.5 * i as f32,
+                y: -2.0,
+                force: 0.5,
+                t_ms: i * 8,
+                tilt: Some(Tilt {
+                    azimuth: 1.0,
+                    altitude: 0.5,
+                    roll: 0.1,
+                }),
+                size: None,
+            })
+            .map(StrokePoint::quantized)
+            .collect();
+        let msg = WetInk::points(StrokeId::new(), 7, 1_757_000_000_123, &points).unwrap();
+        let decoded = WetInk::decode(&msg.encode().unwrap()).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(decoded.decode_points().unwrap(), points);
+
+        let end = WetInk::end(StrokeId::new(), 1, &points[..1]).unwrap();
+        assert_eq!(end.decode_points().unwrap(), points[..1]);
+        assert!(
+            WetInk::Cancel {
+                stroke: StrokeId::new()
+            }
+            .decode_points()
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[test]

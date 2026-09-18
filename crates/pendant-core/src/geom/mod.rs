@@ -1,22 +1,26 @@
 //! Stroke geometry: turn stored point runs into render-ready meshes.
 //!
-//! Two stages. [`Stroke::flatten`] evaluates PencilKit-authored uniform cubic
-//! B-spline *control points* into a polyline (polyline-sampled strokes pass
-//! through unchanged). [`stroke_mesh`] then tessellates that polyline into
-//! an [`InkMesh`]: round tools go through lyon's stroker with a per-point
-//! width attribute, round caps and round joins ([`continuous`]); the
-//! flat-nib brush keeps its own orientation-driven ribbon, which lyon has no
-//! notion of ([`nib`]). Every renderer (bevy on the desktop, Metal on iPad,
-//! the SVG exporter) draws the same mesh, so ink looks identical everywhere.
+//! [`Stroke::flatten`] evaluates PencilKit-authored uniform cubic B-spline
+//! *control points* into a polyline (polyline-sampled strokes pass through
+//! unchanged). [`Ink::mesh`] folds that polyline through the brush's
+//! [`TipEvaluator`] and tessellates the tip states into an [`InkMesh`]:
+//! round tips go through lyon's stroker with width and opacity attributes,
+//! round caps and round joins ([`continuous`]); oriented tips (chisel,
+//! nib) get a ribbon with the nib's own rectangle at every point ([`nib`]).
+//! Every renderer (bevy on the desktop, Metal on iPad, the SVG exporter)
+//! draws the same mesh, so ink looks identical everywhere.
 
 mod continuous;
 mod mesh;
 mod nib;
+mod outline;
 
-pub use mesh::{InkMesh, InkVertex};
-pub use nib::nib_ribbon;
+use std::borrow::Cow;
 
-use crate::stroke::{PointKind, Stroke, StrokePoint, Tool};
+pub use mesh::{InkMesh, InkStyle, InkVertex};
+
+use crate::brush::{BrushSpec, StrokeEnd, TipEvaluator, TipState};
+use crate::stroke::{PointKind, Rgba, Stroke, StrokePoint, Tool};
 
 /// Curve samples evaluated per spline segment. 8 keeps a typical pen segment
 /// (a few canvas units long) visually smooth at 1:1 zoom.
@@ -34,6 +38,21 @@ impl Stroke {
             PointKind::PolylineSample => self.points.clone(),
             PointKind::BSplineControl => flatten_bspline(&self.points),
         }
+    }
+
+    /// How this stroke is inked.
+    pub fn ink(&self) -> Ink<'_> {
+        Ink {
+            spec: self.spec(),
+            color: self.color,
+            base_width: self.base_width,
+        }
+    }
+
+    /// This stroke's committed ink.
+    pub fn mesh(&self, tolerance: f32) -> InkMesh {
+        self.ink()
+            .mesh(&self.flatten(), StrokeEnd::Complete, tolerance)
     }
 }
 
@@ -108,56 +127,82 @@ fn eval_segment(w: &[StrokePoint], t: f32) -> StrokePoint {
 
 // ---- tessellation ----
 
-/// Pressure below this still leaves visible ink.
-const MIN_FORCE: f32 = 0.15;
 /// Points closer than this (canvas units) are merged before tessellation.
 pub(crate) const MIN_SEGMENT: f32 = 0.05;
-/// Narrowest ink that still gets a mesh, canvas units (half width).
-pub(crate) const MIN_HALF_WIDTH: f32 = 0.05;
 /// Flattening tolerance for caps and joins at 1:1 zoom, canvas units.
 /// Callers zoomed in by `z` should pass `DEFAULT_TOLERANCE / z`.
 pub const DEFAULT_TOLERANCE: f32 = 0.25;
 
-/// Half the rendered width at `p`: the point's own `size.w` when present
-/// (PencilKit-authored), otherwise `base_width * force`.
-pub(crate) fn half_width(p: &StrokePoint, base_width: f32) -> f32 {
-    match p.size {
-        Some(s) => (s.w / 2.0).max(MIN_HALF_WIDTH),
-        None => (base_width * p.force.clamp(MIN_FORCE, 1.0) / 2.0).max(MIN_HALF_WIDTH),
+/// A brush applied at a colour and size: everything geometry needs besides
+/// the points. Borrow a stroke's custom spec or own a preset.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ink<'a> {
+    pub spec: Cow<'a, BrushSpec>,
+    pub color: Rgba,
+    /// Full ink width in canvas units, the brush "size".
+    pub base_width: f32,
+}
+
+impl Ink<'static> {
+    /// A built-in tool's preset at `color` and `base_width`.
+    pub fn preset(tool: Tool, color: Rgba, base_width: f32) -> Self {
+        Self {
+            spec: Cow::Owned(BrushSpec::preset(tool)),
+            color,
+            base_width,
+        }
     }
 }
 
-/// Tessellate a flattened polyline for `tool`. Round tools get lyon's
-/// variable-width stroker with round caps and joins ([`round_mesh`]); a nib
-/// tool offsets along the nib's own orientation ([`nib_ribbon`]), which is
-/// what makes calligraphic strokes thick across the nib and thin along it.
-/// `tolerance` bounds the flattening error of caps and joins in canvas
-/// units; see [`DEFAULT_TOLERANCE`].
-pub fn stroke_mesh(tool: Tool, points: &[StrokePoint], base_width: f32, tolerance: f32) -> InkMesh {
-    if tool.has_nib() {
-        nib_ribbon(points, base_width)
-    } else {
-        continuous::round_mesh(points, base_width, tolerance)
+impl Ink<'_> {
+    pub fn style(&self) -> InkStyle {
+        InkStyle::of(self.color, &self.spec.tip, &self.spec.paint)
     }
-}
 
-/// Whole-stroke hit test: does a circle of `radius` at (`x`, `y`) touch the
-/// ink of this flattened polyline? Used by the eraser on every platform so
-/// erasing behaves the same everywhere.
-pub fn hits(points: &[StrokePoint], base_width: f32, x: f32, y: f32, radius: f32) -> bool {
-    let pts = dedupe(points);
-    let within = |d2: f32, reach: f32| d2 <= reach * reach;
-    match pts.as_slice() {
-        [] => false,
-        [p] => within(
-            (p.x - x).powi(2) + (p.y - y).powi(2),
-            radius + half_width(p, base_width),
-        ),
-        pts => pts.windows(2).any(|w| {
-            let (a, b) = (&w[0], &w[1]);
-            let reach = radius + half_width(a, base_width).max(half_width(b, base_width));
-            within(segment_distance2([a.x, a.y], [b.x, b.y], [x, y]), reach)
-        }),
+    /// Tessellate a run of input points. `end` says whether the run is
+    /// still being drawn (no end taper yet) or is the whole stroke.
+    /// `tolerance` bounds the flattening error of caps and joins in canvas
+    /// units; see [`DEFAULT_TOLERANCE`].
+    pub fn mesh(&self, points: &[StrokePoint], end: StrokeEnd, tolerance: f32) -> InkMesh {
+        let pts = self.tips(points, end);
+        if self.spec.has_nib() {
+            nib::nib_mesh(&pts, self.style())
+        } else {
+            continuous::round_mesh(&pts, self.style(), tolerance)
+        }
+    }
+
+    /// The finished stroke's outline as one closed polygon, for path
+    /// fillers such as SVG.
+    pub fn outline(&self, points: &[StrokePoint]) -> Vec<[f32; 2]> {
+        outline::outline_polygon(&self.tips(points, StrokeEnd::Complete), self.spec.has_nib())
+    }
+
+    /// Whole-stroke hit test: does a circle of `radius` at (`x`, `y`) touch
+    /// the ink of this polyline? Used by the eraser on every platform so
+    /// erasing behaves the same everywhere.
+    pub fn hits(&self, points: &[StrokePoint], x: f32, y: f32, radius: f32) -> bool {
+        let pts = self.tips(points, StrokeEnd::Complete);
+        let within = |d2: f32, reach: f32| d2 <= reach * reach;
+        match pts.as_slice() {
+            [] => false,
+            [(p, tip)] => within(
+                (p[0] - x).powi(2) + (p[1] - y).powi(2),
+                radius + tip.w / 2.0,
+            ),
+            pts => pts.windows(2).any(|w| {
+                let ((a, ta), (b, tb)) = (&w[0], &w[1]);
+                let reach = radius + ta.w.max(tb.w) / 2.0;
+                within(segment_distance2(*a, *b, [x, y]), reach)
+            }),
+        }
+    }
+
+    /// Deduplicated positions paired with their tip states.
+    fn tips(&self, points: &[StrokePoint], end: StrokeEnd) -> Vec<([f32; 2], TipState)> {
+        let clean = dedupe(points);
+        let states = TipEvaluator::evaluate(&self.spec, self.base_width, &clean, end);
+        clean.iter().map(|p| [p.x, p.y]).zip(states).collect()
     }
 }
 
@@ -190,7 +235,8 @@ pub(crate) fn dedupe(points: &[StrokePoint]) -> Vec<StrokePoint> {
 mod tests {
     use super::*;
     use crate::StrokeId;
-    use crate::stroke::{Rgba, Tool};
+    use crate::brush::{Blend, Overlap};
+    use crate::stroke::{Rgba, Tilt, Tool};
     use proptest::prelude::*;
 
     fn pt(x: f32, y: f32) -> StrokePoint {
@@ -208,10 +254,23 @@ mod tests {
         }
     }
 
+    /// Points spaced in time so speed thinning stays negligible.
+    fn timed(points: &[StrokePoint]) -> Vec<StrokePoint> {
+        points
+            .iter()
+            .enumerate()
+            .map(|(i, p)| StrokePoint {
+                t_ms: u32::try_from(i).unwrap_or(0) * 1000,
+                ..*p
+            })
+            .collect()
+    }
+
     fn stroke(kind: PointKind, points: Vec<StrokePoint>) -> Stroke {
         Stroke {
             id: StrokeId::new(),
             tool: Tool::Pen,
+            brush: None,
             color: Rgba::BLACK,
             base_width: 2.0,
             kind,
@@ -220,8 +279,13 @@ mod tests {
         }
     }
 
-    fn pen(points: &[StrokePoint], base_width: f32) -> InkMesh {
-        stroke_mesh(Tool::Pen, points, base_width, DEFAULT_TOLERANCE)
+    fn ink(tool: Tool, base_width: f32) -> Ink<'static> {
+        Ink::preset(tool, Rgba::BLACK, base_width)
+    }
+
+    /// A monoline mesh: constant width, so geometry tests read cleanly.
+    fn mono(points: &[StrokePoint], base_width: f32) -> InkMesh {
+        ink(Tool::Monoline, base_width).mesh(points, StrokeEnd::Complete, DEFAULT_TOLERANCE)
     }
 
     fn bounds(mesh: &InkMesh) -> ([f32; 2], [f32; 2]) {
@@ -265,7 +329,7 @@ mod tests {
 
     #[test]
     fn line_gets_full_width_and_round_caps() {
-        let mesh = pen(&[fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0)], 2.0);
+        let mesh = mono(&[fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0)], 2.0);
         let (lo, hi) = bounds(&mesh);
         // Ink is 2 wide: y spans ±1 …
         assert!(
@@ -286,29 +350,24 @@ mod tests {
     }
 
     #[test]
-    fn pressure_narrows_the_ink() {
-        let mesh = pen(&[fpt(0.0, 0.0, 0.5), fpt(10.0, 0.0, 0.5)], 4.0);
-        let (lo, hi) = bounds(&mesh);
-        assert!((hi[1] - lo[1] - 2.0).abs() < 1e-3, "{lo:?} {hi:?}");
-    }
-
-    #[test]
-    fn width_varies_along_the_stroke() {
-        let mesh = pen(&[fpt(0.0, 0.0, 0.25), fpt(40.0, 0.0, 1.0)], 4.0);
-        let thin = mesh
-            .positions()
-            .filter(|[x, _]| (0.0..5.0).contains(x))
-            .map(|[_, y]| y.abs())
-            .fold(0.0_f32, f32::max);
-        let thick = mesh
-            .positions()
-            .filter(|[x, _]| (35.0..=40.0).contains(x))
-            .map(|[_, y]| y.abs())
-            .fold(0.0_f32, f32::max);
-        assert!(
-            thin < thick,
-            "thin end {thin} should be narrower than {thick}"
+    fn pen_pressure_narrows_the_ink() {
+        let pen = ink(Tool::Pen, 4.0);
+        let full = pen.mesh(
+            &timed(&[fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0)]),
+            StrokeEnd::Live,
+            DEFAULT_TOLERANCE,
         );
+        let light = pen.mesh(
+            &timed(&[fpt(0.0, 0.0, 0.5), fpt(10.0, 0.0, 0.5)]),
+            StrokeEnd::Live,
+            DEFAULT_TOLERANCE,
+        );
+        let height = |m: &InkMesh| {
+            let (lo, hi) = bounds(m);
+            hi[1] - lo[1]
+        };
+        assert!((height(&full) - 4.0).abs() < 1e-3, "{}", height(&full));
+        assert!((height(&light) - 3.0).abs() < 1e-3, "{}", height(&light));
     }
 
     #[test]
@@ -317,14 +376,18 @@ mod tests {
             size: Some(crate::PointSize { w: 6.0, h: 6.0 }),
             ..fpt(x, 0.0, 0.1)
         };
-        let mesh = pen(&[sized(0.0), sized(10.0)], 2.0);
+        let mesh = ink(Tool::Pen, 2.0).mesh(
+            &[sized(0.0), sized(10.0)],
+            StrokeEnd::Live,
+            DEFAULT_TOLERANCE,
+        );
         let (lo, hi) = bounds(&mesh);
         assert!((hi[1] - lo[1] - 6.0).abs() < 1e-3, "{lo:?} {hi:?}");
     }
 
     #[test]
     fn single_point_renders_as_dot() {
-        let mesh = pen(&[fpt(5.0, 5.0, 1.0)], 2.0);
+        let mesh = mono(&[fpt(5.0, 5.0, 1.0)], 2.0);
         assert!(!mesh.is_empty());
         let (lo, hi) = bounds(&mesh);
         assert!(
@@ -339,8 +402,8 @@ mod tests {
 
     #[test]
     fn coincident_points_collapse_to_a_dot() {
-        let dot = pen(&[fpt(1.0, 1.0, 1.0)], 2.0);
-        let mesh = pen(
+        let dot = mono(&[fpt(1.0, 1.0, 1.0)], 2.0);
+        let mesh = mono(
             &[fpt(1.0, 1.0, 1.0), fpt(1.0, 1.0, 1.0), fpt(1.0, 1.0, 1.0)],
             2.0,
         );
@@ -349,9 +412,9 @@ mod tests {
 
     #[test]
     fn empty_and_non_finite_input_is_empty() {
-        assert!(pen(&[], 2.0).is_empty());
+        assert!(mono(&[], 2.0).is_empty());
         assert!(
-            pen(
+            mono(
                 &[fpt(f32::NAN, 0.0, 1.0), fpt(1.0, f32::INFINITY, 1.0)],
                 2.0
             )
@@ -364,7 +427,7 @@ mod tests {
         // A sharp reversal: butt ribbons fold into a hole here; a round
         // join must leave ink covering the corner.
         let pts = [fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0), fpt(0.0, 0.5, 1.0)];
-        let mesh = pen(&pts, 4.0);
+        let mesh = mono(&pts, 4.0);
         let (_, hi) = bounds(&mesh);
         assert!(
             hi[0] > 11.5,
@@ -375,61 +438,14 @@ mod tests {
     #[test]
     fn finer_tolerance_adds_vertices() {
         let pts = [fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0)];
-        let coarse = stroke_mesh(Tool::Pen, &pts, 8.0, 1.0);
-        let fine = stroke_mesh(Tool::Pen, &pts, 8.0, 0.01);
+        let coarse = ink(Tool::Monoline, 8.0).mesh(&pts, StrokeEnd::Complete, 1.0);
+        let fine = ink(Tool::Monoline, 8.0).mesh(&pts, StrokeEnd::Complete, 0.01);
         assert!(fine.vertices.len() > coarse.vertices.len());
     }
 
     #[test]
-    fn nib_width_follows_orientation() {
-        use crate::stroke::Tilt;
-        let with_nib = |x: f32, angle: f32| StrokePoint {
-            tilt: Some(Tilt {
-                azimuth: angle,
-                altitude: 0.5,
-                roll: 0.0,
-            }),
-            ..fpt(x, 0.0, 1.0)
-        };
-        let half_pi = core::f32::consts::FRAC_PI_2;
-        // Nib across the motion (pointing +y on a horizontal stroke): full width.
-        let across = nib_ribbon(&[with_nib(0.0, half_pi), with_nib(10.0, half_pi)], 8.0);
-        let w = (across.vertices[0].pos[1] - across.vertices[1].pos[1]).abs();
-        assert!((w - 8.0).abs() < 1e-3, "across width {w}");
-        // Nib along the motion: only the thin floor remains.
-        let along = nib_ribbon(&[with_nib(0.0, 0.0), with_nib(10.0, 0.0)], 8.0);
-        let w = (along.vertices[0].pos[1] - along.vertices[1].pos[1]).abs();
-        assert!(
-            (w - 8.0 * nib::NIB_MIN_FRACTION).abs() < 1e-3,
-            "along width {w}"
-        );
-        // Roll turns the nib: azimuth 0 rolled by π/2 is across again.
-        let rolled = |x: f32| StrokePoint {
-            tilt: Some(Tilt {
-                azimuth: 0.0,
-                altitude: 0.5,
-                roll: half_pi,
-            }),
-            ..fpt(x, 0.0, 1.0)
-        };
-        let rolled = nib_ribbon(&[rolled(0.0), rolled(10.0)], 8.0);
-        let w = (rolled.vertices[0].pos[1] - rolled.vertices[1].pos[1]).abs();
-        assert!((w - 8.0).abs() < 1e-3, "rolled width {w}");
-        // The brush tool routes to the nib; round tools ignore it.
-        let nib_pts = [with_nib(0.0, 0.0), with_nib(10.0, 0.0)];
-        assert_eq!(
-            stroke_mesh(Tool::Brush, &nib_pts, 8.0, DEFAULT_TOLERANCE),
-            nib_ribbon(&nib_pts, 8.0)
-        );
-        assert_eq!(
-            stroke_mesh(Tool::Pen, &nib_pts, 8.0, DEFAULT_TOLERANCE),
-            pen(&[fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0)], 8.0)
-        );
-    }
-
-    #[test]
     fn stroke_space_uv_runs_along_and_across() {
-        let mesh = pen(&[fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0)], 2.0);
+        let mesh = mono(&[fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0)], 2.0);
         let u_max = mesh
             .vertices
             .iter()
@@ -465,19 +481,138 @@ mod tests {
     }
 
     #[test]
+    fn pencil_opacity_reaches_the_vertices_and_style_carries_paint() {
+        let pencil = ink(Tool::Pencil, 3.0);
+        let mesh = pencil.mesh(
+            &timed(&[fpt(0.0, 0.0, 0.3), fpt(10.0, 0.0, 0.3)]),
+            StrokeEnd::Live,
+            DEFAULT_TOLERANCE,
+        );
+        assert!(
+            mesh.vertices
+                .iter()
+                .all(|v| v.opacity > 0.0 && v.opacity < 1.0),
+            "pressure 0.3 is translucent"
+        );
+        assert_eq!(mesh.style.opacity, 0.9);
+
+        let marker = ink(Tool::Marker, 6.0);
+        let style = marker.style();
+        assert_eq!(
+            (style.blend, style.overlap),
+            (Blend::Multiply, Overlap::Discard)
+        );
+        assert_eq!(style.color, Rgba::BLACK);
+    }
+
+    #[test]
+    fn nib_width_follows_orientation_and_has_flat_caps() {
+        // Force 0.5 is the fountain pen's nominal pressure: no flex.
+        let with_nib = |x: f32, angle: f32| StrokePoint {
+            tilt: Some(Tilt {
+                azimuth: angle,
+                altitude: 0.5,
+                roll: 0.0,
+            }),
+            ..fpt(x, 0.0, 0.5)
+        };
+        let half_pi = core::f32::consts::FRAC_PI_2;
+        let fountain = ink(Tool::Fountain, 8.0);
+        let height = |m: &InkMesh| {
+            let (lo, hi) = bounds(m);
+            hi[1] - lo[1]
+        };
+        // Nib across the motion (pointing +y on a horizontal stroke): full width.
+        let across = fountain.mesh(
+            &[with_nib(0.0, half_pi), with_nib(10.0, half_pi)],
+            StrokeEnd::Live,
+            DEFAULT_TOLERANCE,
+        );
+        assert!(
+            (height(&across) - 8.0).abs() < 1e-3,
+            "across {}",
+            height(&across)
+        );
+        // Flat caps: the nib rectangle does not extend past the endpoints
+        // beyond its thickness.
+        let (lo, hi) = bounds(&across);
+        assert!(lo[0] >= -0.61 && hi[0] <= 10.61, "{lo:?} {hi:?}");
+        // Nib along the motion: only the nib's own thickness remains across.
+        let along = fountain.mesh(
+            &[with_nib(0.0, 0.0), with_nib(10.0, 0.0)],
+            StrokeEnd::Live,
+            DEFAULT_TOLERANCE,
+        );
+        assert!(
+            (height(&along) - 8.0 * 0.15).abs() < 1e-3,
+            "along {}",
+            height(&along)
+        );
+        // Roll turns the nib: azimuth 0 rolled by π/2 is across again.
+        let rolled = |x: f32| StrokePoint {
+            tilt: Some(Tilt {
+                azimuth: 0.0,
+                altitude: 0.5,
+                roll: half_pi,
+            }),
+            ..fpt(x, 0.0, 0.5)
+        };
+        let rolled = fountain.mesh(
+            &[rolled(0.0), rolled(10.0)],
+            StrokeEnd::Live,
+            DEFAULT_TOLERANCE,
+        );
+        assert!(
+            (height(&rolled) - 8.0).abs() < 1e-3,
+            "rolled {}",
+            height(&rolled)
+        );
+        // Without tilt the preset's fallback angle applies: 45°, so the
+        // stroke is neither full width nor the thin floor.
+        let plain = fountain.mesh(
+            &[fpt(0.0, 0.0, 0.5), fpt(10.0, 0.0, 0.5)],
+            StrokeEnd::Live,
+            DEFAULT_TOLERANCE,
+        );
+        let h = height(&plain);
+        assert!(h > 5.0 && h < 7.0, "fallback nib height {h}");
+    }
+
+    #[test]
+    fn outline_polygon_wraps_the_ink() {
+        let mono_ink = ink(Tool::Monoline, 2.0);
+        let outline = mono_ink.outline(&[fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0)]);
+        assert!(outline.len() > 4);
+        let xs = outline.iter().map(|p| p[0]);
+        let (lo, hi) = xs.fold((f32::MAX, f32::MIN), |(lo, hi), x| (lo.min(x), hi.max(x)));
+        assert!(
+            (lo + 1.0).abs() < 0.05 && (hi - 11.0).abs() < 0.05,
+            "caps reach past the ends: {lo} {hi}"
+        );
+        assert!(outline.iter().all(|p| p[1].abs() <= 1.0 + 1e-3));
+        // A dot is a full circle; an empty stroke has no outline.
+        assert_eq!(mono_ink.outline(&[fpt(0.0, 0.0, 1.0)]).len(), 16);
+        assert!(mono_ink.outline(&[]).is_empty());
+        // A nib outline has four corners at the ends.
+        let nib = ink(Tool::Fountain, 8.0).outline(&[fpt(0.0, 0.0, 0.5), fpt(10.0, 0.0, 0.5)]);
+        assert_eq!(nib.len(), 4);
+    }
+
+    #[test]
     fn hit_test_respects_width_and_radius() {
+        let mono_ink = ink(Tool::Monoline, 2.0);
         let line = [fpt(0.0, 0.0, 1.0), fpt(10.0, 0.0, 1.0)];
         // Ink is 2 wide (half = 1). 0.5 away with no radius: hit.
-        assert!(hits(&line, 2.0, 5.0, 0.5, 0.0));
+        assert!(mono_ink.hits(&line, 5.0, 0.5, 0.0));
         // 3 away: miss with radius 1, hit with radius 2.5.
-        assert!(!hits(&line, 2.0, 5.0, 3.0, 1.0));
-        assert!(hits(&line, 2.0, 5.0, 3.0, 2.5));
+        assert!(!mono_ink.hits(&line, 5.0, 3.0, 1.0));
+        assert!(mono_ink.hits(&line, 5.0, 3.0, 2.5));
         // Beyond the endpoint along the line: distance is to the cap.
-        assert!(!hits(&line, 2.0, 13.0, 0.0, 1.0));
-        assert!(hits(&line, 2.0, 12.5, 0.0, 2.0));
+        assert!(!mono_ink.hits(&line, 13.0, 0.0, 1.0));
+        assert!(mono_ink.hits(&line, 12.5, 0.0, 2.0));
         // A dot.
-        assert!(hits(&[fpt(3.0, 3.0, 1.0)], 2.0, 3.5, 3.0, 0.0));
-        assert!(!hits(&[], 2.0, 0.0, 0.0, 100.0));
+        assert!(mono_ink.hits(&[fpt(3.0, 3.0, 1.0)], 3.5, 3.0, 0.0));
+        assert!(!mono_ink.hits(&[], 0.0, 0.0, 100.0));
     }
 
     fn arb_point() -> impl Strategy<Value = StrokePoint> {
@@ -486,9 +621,11 @@ mod tests {
             -2000.0_f32..2000.0,
             0.0_f32..=1.0,
             proptest::option::of(0.1_f32..40.0),
+            0_u32..10_000,
         )
-            .prop_map(|(x, y, force, w)| StrokePoint {
+            .prop_map(|(x, y, force, w, t_ms)| StrokePoint {
                 size: w.map(|w| crate::PointSize { w, h: w }),
+                t_ms,
                 ..fpt(x, y, force)
             })
     }
@@ -500,8 +637,8 @@ mod tests {
             base in 0.5_f32..40.0,
             tol in 0.01_f32..2.0,
         ) {
-            for tool in [Tool::Pen, Tool::Marker, Tool::Monoline, Tool::Brush] {
-                let mesh = stroke_mesh(tool, &pts, base, tol);
+            for tool in [Tool::Pen, Tool::Pencil, Tool::Marker, Tool::Monoline, Tool::Fountain] {
+                let mesh = ink(tool, base).mesh(&pts, StrokeEnd::Complete, tol);
                 prop_assert_eq!(mesh.indices.len() % 3, 0);
                 prop_assert!(mesh.vertices.iter().all(|v| v.pos.iter().chain(&v.uv).all(|c| c.is_finite()) && (0.0..=1.0).contains(&v.opacity)));
                 prop_assert!(mesh.indices.iter().all(|i| (*i as usize) < mesh.vertices.len()));

@@ -1,63 +1,73 @@
-//! Brush model: turns raw pen samples into stroke points that carry their
-//! rendered width, so every platform draws the same ink from the same
-//! input. One [`BrushModeler`] lives per stroke in progress.
+//! Brush model: turns raw pen samples into the points a stroke stores, and
+//! stored points into ink. One [`BrushModeler`] lives per stroke in
+//! progress.
 //!
-//! Two stages. [`input`] smooths raw samples into the points a stroke
-//! stores ([`EmaModel`]). [`dynamics`] folds those points into tip states,
-//! the width at each point from force, speed and the tapers
-//! ([`TipEvaluator`]). The modeler runs both and hands out points with
-//! their sizes; [`BrushModeler::finish`] flushes the smoothing lag by
-//! landing on the last raw sample exactly and applies the end taper.
-//! [`BrushModeler::predict`] runs the same maths on a scratch copy for the
-//! renderer's predicted-touch tail.
+//! Three stages. [`input`] smooths raw samples into input points
+//! ([`EmaModel`]); those are what a stroke stores and what the wet-ink
+//! wire carries. [`dynamics`] folds input points into tip states, the
+//! width, height, rotation and opacity at each point from force, tilt,
+//! speed and the tapers ([`TipEvaluator`]), driven by a [`BrushSpec`].
+//! Geometry ([`crate::stroke_mesh`]) turns tip states into triangles.
+//! Stages two and three read only stored points, so the live stroke, a
+//! receiver of wet ink and the committed stroke all draw the same ink.
 //!
 //! ```
 //! use pendant_core::{BrushModeler, RawSample, Tool};
 //!
 //! let mut modeler = BrushModeler::new(Tool::Pen, 4.0);
 //! for i in 0..10 {
-//!     let raw = RawSample { x: i as f32 * 3.0, y: 0.0, force: 0.6, t_ms: i as f64 * 8.0, tilt: None };
+//!     let raw = RawSample { x: i as f32 * 3.0, y: 0.0, force: 0.6, t_ms: i as f64 * 8.0, tilt: None, estimate: None };
 //!     modeler.push(raw);
 //! }
 //! let points = modeler.finish();
-//! assert!(points.iter().all(|p| p.size.is_some()));
+//! assert!(points.iter().all(|p| p.size.is_none()), "widths are evaluated at render time");
 //! ```
 
 mod dynamics;
 mod input;
+mod spec;
 
-pub use dynamics::{BrushParams, TipEvaluator, TipState};
-pub use input::{EmaModel, InputParams, RawSample};
+pub(crate) use dynamics::MIN_TIP;
+pub use dynamics::{StrokeEnd, TipEvaluator, TipState};
+pub use input::{EmaModel, Estimate, InputParams, RawSample};
+pub use spec::{
+    Behavior, Blend, BrushId, BrushSpec, Curve, CustomBrush, Orient, Overlap, Paint, Source,
+    Target, Tip,
+};
 
-use crate::stroke::{PointSize, StrokePoint, Tool};
+use crate::stroke::{StrokePoint, Tilt, Tool};
 
-/// Turns one stroke's raw samples into modelled [`StrokePoint`]s. Owns the
+/// Turns one stroke's raw samples into stored [`StrokePoint`]s. Owns the
 /// points emitted so far; renderers draw [`points`](Self::points) plus a
 /// [`predict`](Self::predict) tail every frame and commit
 /// [`finish`](Self::finish) at pen-up.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BrushModeler {
     tool: Tool,
+    spec: BrushSpec,
+    base_width: f32,
     input: EmaModel,
-    tip: TipEvaluator,
-    /// Emitted points with their tip size applied.
     points: Vec<StrokePoint>,
-    states: Vec<TipState>,
+    /// `(estimate id, index into points, revision still pending)` for
+    /// emitted samples the platform may revise.
+    estimates: Vec<(u32, usize, bool)>,
 }
 
 impl BrushModeler {
-    /// A modeler for `tool` with the tool's tuned parameters at `size`.
+    /// A modeler for `tool`'s preset at `size` canvas units wide.
     pub fn new(tool: Tool, size: f32) -> Self {
-        Self::with_params(tool, BrushParams::for_tool(tool, size))
+        Self::for_brush(tool, BrushSpec::preset(tool), size)
     }
 
-    pub fn with_params(tool: Tool, params: BrushParams) -> Self {
+    /// A modeler for any spec; `tool` is what the stroke records.
+    pub fn for_brush(tool: Tool, spec: BrushSpec, size: f32) -> Self {
         Self {
             tool,
-            input: EmaModel::new(params.input()),
-            tip: TipEvaluator::new(params),
+            input: EmaModel::new(spec.input),
+            spec,
+            base_width: size.max(0.0),
             points: Vec::new(),
-            states: Vec::new(),
+            estimates: Vec::new(),
         }
     }
 
@@ -65,11 +75,15 @@ impl BrushModeler {
         self.tool
     }
 
-    pub fn params(&self) -> &BrushParams {
-        self.tip.params()
+    pub fn spec(&self) -> &BrushSpec {
+        &self.spec
     }
 
-    /// Points emitted so far, without the end taper.
+    pub fn base_width(&self) -> f32 {
+        self.base_width
+    }
+
+    /// Points emitted so far.
     pub fn points(&self) -> &[StrokePoint] {
         &self.points
     }
@@ -78,55 +92,58 @@ impl BrushModeler {
     /// from the previous one to be worth emitting.
     pub fn push(&mut self, raw: RawSample) -> Option<StrokePoint> {
         let point = self.input.push(raw)?;
-        let state = self.tip.push(&point);
-        let sized = sized(point, state);
-        self.points.push(sized);
-        self.states.push(state);
-        Some(sized)
+        if let Some(e) = raw.estimate {
+            self.estimates.push((e.id, self.points.len(), e.pending));
+        }
+        self.points.push(point);
+        Some(point)
     }
 
     /// The points `raw` would produce if pushed now, without pushing them.
     /// For Apple's predicted touches: draw as a tail, discard next frame.
     pub fn predict(&self, raw: &[RawSample]) -> Vec<StrokePoint> {
-        let mut tip = self.tip;
-        self.input
-            .predict(raw)
-            .into_iter()
-            .map(|p| sized(p, tip.push(&p)))
+        self.input.predict(raw)
+    }
+
+    /// Revise the force and tilt of the point that the sample with
+    /// estimate `id` produced. `false` when no emitted point came from that
+    /// sample (it was dropped as a near-duplicate, or never pushed).
+    pub fn update(&mut self, id: u32, force: Option<f32>, tilt: Option<Tilt>) -> bool {
+        let Some(entry) = self.estimates.iter_mut().find(|(e, _, _)| *e == id) else {
+            return false;
+        };
+        entry.2 = false;
+        let point = &mut self.points[entry.1];
+        if let Some(force) = force {
+            point.force = force.clamp(0.0, 1.0);
+        }
+        if let Some(tilt) = tilt {
+            point.tilt = Some(tilt);
+        }
+        true
+    }
+
+    /// Estimate ids of emitted points whose revision has not arrived.
+    pub fn pending_estimates(&self) -> Vec<u32> {
+        self.estimates
+            .iter()
+            .filter(|(_, _, pending)| *pending)
+            .map(|(id, _, _)| *id)
             .collect()
     }
 
-    /// The finished stroke: every emitted point, the last raw sample
-    /// landed exactly (streamline always lags the pen), and the end taper.
+    /// The finished stroke: every emitted point plus the last raw sample
+    /// landed exactly (streamline always lags the pen).
     pub fn finish(&self) -> Vec<StrokePoint> {
         let mut points = self.points.clone();
-        let mut states = self.states.clone();
-        if let Some(landing) = self.input.landing() {
-            let mut tip = self.tip;
-            let state = tip.push(&landing);
-            points.push(sized(landing, state));
-            states.push(state);
-        }
-        TipEvaluator::taper_end(self.params(), &mut states);
+        points.extend(self.input.landing());
         points
-            .into_iter()
-            .zip(states)
-            .map(|(p, s)| sized(p, s))
-            .collect()
-    }
-}
-
-fn sized(p: StrokePoint, s: TipState) -> StrokePoint {
-    StrokePoint {
-        size: Some(PointSize { w: s.w, h: s.h }),
-        ..p
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stroke::Tilt;
     use proptest::prelude::*;
 
     fn raw(x: f32, y: f32, force: f32, t_ms: f64) -> RawSample {
@@ -136,6 +153,7 @@ mod tests {
             force,
             t_ms,
             tilt: None,
+            estimate: None,
         }
     }
 
@@ -152,10 +170,6 @@ mod tests {
             m.push(s);
         }
         m.finish()
-    }
-
-    fn widths(points: &[StrokePoint]) -> Vec<f32> {
-        points.iter().map(|p| p.size.map_or(0.0, |s| s.w)).collect()
     }
 
     fn mean_second_difference(points: &[StrokePoint]) -> f32 {
@@ -205,50 +219,6 @@ mod tests {
     }
 
     #[test]
-    fn pen_thins_with_speed() {
-        let slow = run(Tool::Pen, 4.0, &line(30, 1.0, 16.0, 1.0));
-        let fast = run(Tool::Pen, 4.0, &line(30, 6.0, 4.0, 1.0));
-        // Compare mid-stroke, clear of both tapers and the speed EMA warm-up.
-        let mid = |p: &[StrokePoint]| widths(p)[p.len() / 2];
-        assert!(
-            mid(&fast) < mid(&slow),
-            "fast {} slow {}",
-            mid(&fast),
-            mid(&slow)
-        );
-        assert!(mid(&slow) <= 4.0 + 1e-5);
-        assert!(mid(&fast) >= 1.0);
-    }
-
-    #[test]
-    fn pen_thins_with_light_force() {
-        let hard = run(Tool::Pen, 4.0, &line(30, 2.0, 8.0, 1.0));
-        let soft = run(Tool::Pen, 4.0, &line(30, 2.0, 8.0, 0.3));
-        let mid = |p: &[StrokePoint]| widths(p)[p.len() / 2];
-        assert!(mid(&soft) < mid(&hard));
-        assert!(mid(&soft) >= 1.0, "never below the width floor");
-    }
-
-    #[test]
-    fn constant_width_tools_ignore_force_and_speed() {
-        for tool in [Tool::Marker, Tool::Monoline, Tool::Brush] {
-            let varied: Vec<RawSample> = (0..30)
-                .map(|i| {
-                    let force = if i % 3 == 0 { 0.2 } else { 1.0 };
-                    let step = if i % 2 == 0 { 1.0 } else { 9.0 };
-                    raw(i as f32 * step, 0.0, force, 1000.0 + i as f64 * 8.0)
-                })
-                .collect();
-            let points = run(tool, 6.0, &varied);
-            assert!(
-                widths(&points).iter().all(|w| (w - 6.0).abs() < 1e-5),
-                "{tool:?}: {:?}",
-                widths(&points)
-            );
-        }
-    }
-
-    #[test]
     fn predict_never_mutates() {
         let mut m = BrushModeler::new(Tool::Pen, 4.0);
         for s in line(10, 2.0, 8.0, 0.7) {
@@ -268,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn finish_lands_on_last_raw_sample_and_tapers() {
+    fn finish_lands_on_last_raw_sample() {
         let samples = line(30, 2.0, 8.0, 0.8);
         let mut m = BrushModeler::new(Tool::Pen, 4.0);
         for &s in &samples {
@@ -280,44 +250,46 @@ mod tests {
 
         // Streamline lags: the live tail is short of the pen.
         assert!(live[live.len() - 1].x < last_raw.x);
+        assert_eq!(&done[..live.len()], &live[..]);
         let end = done[done.len() - 1];
         assert_eq!((end.x, end.y), (last_raw.x, last_raw.y));
         assert_eq!(end.t_ms, 29 * 8);
-
-        let w = widths(&done);
-        let mid = w[w.len() / 2];
-        assert!(w[w.len() - 1] < mid, "tail should taper: {w:?}");
-        assert!(w[w.len() - 1] >= 1.0, "taper stops at the floor: {w:?}");
-        // Points before the taper zone are untouched.
-        assert_eq!(w[..5], widths(&live)[..5]);
+        assert!(done.iter().all(|p| p.size.is_none()));
     }
 
-    /// The widths a receiver computes from the stored points alone equal
-    /// the widths the sender drew: the fold depends on nothing but the
-    /// points.
     #[test]
-    fn stored_points_reproduce_live_widths() {
+    fn estimates_revise_force_and_tilt_in_place() {
         let mut m = BrushModeler::new(Tool::Pen, 4.0);
-        for s in line(30, 2.0, 8.0, 0.8) {
-            m.push(s);
-        }
-        let inputs: Vec<StrokePoint> = m
-            .points()
-            .iter()
-            .map(|p| StrokePoint { size: None, ..*p })
-            .collect();
-        let refolded = TipEvaluator::evaluate(*m.params(), &inputs);
-        let live = widths(m.points());
-        let again: Vec<f32> = refolded.iter().map(|s| s.w).collect();
-        assert_eq!(live, again);
-    }
+        let estimated = |i: u32, pending: bool| RawSample {
+            estimate: Some(Estimate { id: i, pending }),
+            ..raw(i as f32 * 5.0, 0.0, 0.2, f64::from(i) * 8.0)
+        };
+        m.push(estimated(0, true));
+        m.push(estimated(1, false));
+        // Dropped as a near-duplicate (the smoothed point sits at 2.5, this
+        // moves it 0.05): its estimate never maps to a point, so nothing
+        // waits for it.
+        m.push(RawSample {
+            estimate: Some(Estimate {
+                id: 2,
+                pending: true,
+            }),
+            ..raw(2.6, 0.0, 0.2, 20.0)
+        });
+        assert_eq!(m.pending_estimates(), vec![0]);
 
-    #[test]
-    fn dot_keeps_its_width() {
-        let done = run(Tool::Pen, 4.0, &[raw(10.0, 10.0, 1.0, 5.0)]);
-        assert_eq!(done.len(), 1);
-        assert_eq!(done[0].size, Some(PointSize { w: 4.0, h: 4.0 }));
-        assert_eq!((done[0].x, done[0].y, done[0].t_ms), (10.0, 10.0, 0));
+        let tilt = Tilt {
+            azimuth: 1.0,
+            altitude: 0.4,
+            roll: 0.0,
+        };
+        assert!(m.update(0, Some(0.9), Some(tilt)));
+        assert_eq!(m.points()[0].force, 0.9);
+        assert_eq!(m.points()[0].tilt, Some(tilt));
+        assert!(!m.update(2, Some(1.0), None));
+        assert!(!m.update(7, None, None));
+        assert!(m.pending_estimates().is_empty());
+        assert_eq!(m.points()[1].force, 0.2, "other points untouched");
     }
 
     #[test]
@@ -346,7 +318,7 @@ mod tests {
             altitude: 0.5,
             roll: 0.2,
         };
-        let mut m = BrushModeler::new(Tool::Brush, 8.0);
+        let mut m = BrushModeler::new(Tool::Fountain, 8.0);
         m.push(RawSample {
             tilt: Some(tilt),
             ..raw(0.0, 0.0, 1.0, 0.0)
@@ -362,7 +334,7 @@ mod tests {
     proptest! {
         #[test]
         fn output_is_bounded_and_finite(
-            tool in prop_oneof![Just(Tool::Pen), Just(Tool::Marker), Just(Tool::Monoline), Just(Tool::Brush)],
+            tool in prop_oneof![Just(Tool::Pen), Just(Tool::Pencil), Just(Tool::Marker), Just(Tool::Monoline), Just(Tool::Fountain)],
             size in 0.5_f32..40.0,
             samples in proptest::collection::vec(arb_sample(), 0..64),
         ) {
@@ -372,15 +344,19 @@ mod tests {
             }
             let done = m.finish();
             prop_assert_eq!(done.is_empty(), samples.is_empty());
-            let floor = size * m.params().min_width;
             for p in &done {
                 prop_assert!(p.x.is_finite() && p.y.is_finite());
                 prop_assert!((0.0..=1.0).contains(&p.force));
-                let w = p.size.map_or(0.0, |s| s.w);
-                prop_assert!(w >= floor - 1e-4 && w <= size + 1e-4, "width {w} outside [{floor}, {size}]");
             }
             if let (Some(last), Some(raw)) = (done.last(), samples.last()) {
                 prop_assert_eq!((last.x, last.y), (raw.x, raw.y));
+            }
+            let states = TipEvaluator::evaluate(m.spec(), size, &done, StrokeEnd::Complete);
+            let floor = (size * m.spec().tip.min_size).max(0.05);
+            for s in &states {
+                prop_assert!(s.w.is_finite() && s.h.is_finite() && s.rot.is_finite());
+                prop_assert!(s.w >= floor - 1e-4, "width {} under the floor {floor}", s.w);
+                prop_assert!((0.0..=1.0).contains(&s.opacity));
             }
         }
     }

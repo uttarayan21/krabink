@@ -9,9 +9,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pendant_ffi::{
-    Core, NoteListener, NoteSession, PointKind, Stroke, StrokePoint, Tool, WetPoint,
-};
+use pendant_ffi::{Core, NoteListener, NoteSession, PointKind, Stroke, StrokePoint, Tool};
 
 #[derive(Default)]
 struct Recorder {
@@ -45,7 +43,7 @@ impl NoteListener for Recorder {
         self.wet.lock().unwrap().begins += 1;
         eprintln!("wet begin");
     }
-    fn wet_points(&self, _s: String, sent_ms: u64, p: Vec<WetPoint>) {
+    fn wet_points(&self, _s: String, sent_ms: u64, p: Vec<StrokePoint>) {
         let latency = now_unix_ms() as i64 - sent_ms as i64;
         let mut wet = self.wet.lock().unwrap();
         wet.latencies_ms.push(latency);
@@ -180,6 +178,7 @@ fn main() {
                         .unwrap()
                         .as_millis() as u64,
                 },
+                Vec::new(),
             )
             .expect("finish stroke");
         // Give the network task a moment to flush the update.

@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use pendant_core as pcore;
 
 use crate::types::{
-    Element, Point2, Recognition, Shape, Stroke, StrokePoint, Tilt, Tool, WET_WIDTH_FALLBACK,
-    WetPoint, wet_to_stroke_point,
+    Element, Point2, Recognition, Shape, Stroke, StrokePoint, Tilt, Tool, rgba_from_u32,
+    rgba_to_u32,
 };
 
 /// One raw touch sample, before smoothing.
@@ -17,12 +17,19 @@ use crate::types::{
 pub struct RawSample {
     pub x: f32,
     pub y: f32,
-    /// Normalised pressure, 0..=1. Touches without pressure pass 1.
+    /// Normalised pressure, 0..=1. Touches without pressure pass 0.5.
     pub force: f32,
     /// Milliseconds on any monotonic clock (`UITouch.timestamp * 1000`);
     /// only differences matter.
     pub t_ms: f64,
     pub tilt: Option<Tilt>,
+    /// `UITouch.estimationUpdateIndex` when the platform may still revise
+    /// `force` or `tilt`; patch the revision in with
+    /// [`BrushModeler::update`].
+    pub estimation_id: Option<u32>,
+    /// Whether a revision is expected (`estimatedPropertiesExpectingUpdates`
+    /// non-empty).
+    pub expects_update: bool,
 }
 
 impl From<RawSample> for pcore::RawSample {
@@ -33,14 +40,51 @@ impl From<RawSample> for pcore::RawSample {
             force: s.force,
             t_ms: s.t_ms,
             tilt: s.tilt.map(Into::into),
+            estimate: s.estimation_id.map(|id| pcore::Estimate {
+                id,
+                pending: s.expects_update,
+            }),
         }
     }
 }
 
-/// One live stroke's input pipeline: streamline smoothing, speed and force
-/// width model, tapers. Create at pen-down, `push` every coalesced touch,
-/// draw `points` plus a `predict` tail each frame, commit `finish` at
-/// pen-up. Thread-safe; the touch handler and the render loop may share it.
+/// A brush applied at a size: the tool's preset. Custom brushes join here
+/// with the brush library.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct BrushRef {
+    pub tool: Tool,
+    /// Full ink width in canvas units.
+    pub base_width: f32,
+}
+
+impl BrushRef {
+    fn ink(self, color: u32) -> pcore::Ink<'static> {
+        pcore::Ink::preset(self.tool.into(), rgba_from_u32(color), self.base_width)
+    }
+}
+
+/// Whether a run of points is still being drawn or is the whole stroke;
+/// only a finished stroke gets its end taper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum StrokeEnd {
+    Live,
+    Complete,
+}
+
+impl From<StrokeEnd> for pcore::StrokeEnd {
+    fn from(e: StrokeEnd) -> Self {
+        match e {
+            StrokeEnd::Live => Self::Live,
+            StrokeEnd::Complete => Self::Complete,
+        }
+    }
+}
+
+/// One live stroke's input pipeline: streamline smoothing into the points
+/// the stroke stores. Create at pen-down, `push` every coalesced touch,
+/// draw `points` plus a `predict` tail each frame through [`points_mesh`],
+/// commit `finish` at pen-up. Thread-safe; the touch handler and the
+/// render loop may share it.
 #[derive(uniffi::Object)]
 pub struct BrushModeler {
     inner: Mutex<pcore::BrushModeler>,
@@ -75,7 +119,7 @@ impl BrushModeler {
             .collect()
     }
 
-    /// Every point emitted so far, without the end taper.
+    /// Every point emitted so far.
     pub fn points(&self) -> Vec<StrokePoint> {
         self.lock()
             .points()
@@ -96,39 +140,109 @@ impl BrushModeler {
             .collect()
     }
 
-    /// The finished stroke's points: pen landed on the last raw sample,
-    /// tail tapered. Store these as `PointKind.polylineSample`.
+    /// The finished stroke's points: pen landed on the last raw sample.
+    /// Store these as `PointKind.polylineSample`.
     pub fn finish(&self) -> Vec<StrokePoint> {
         self.lock().finish().into_iter().map(Into::into).collect()
     }
+
+    /// Revise the force and tilt of the point the sample with
+    /// `estimation_id` produced (`touchesEstimatedPropertiesUpdated`).
+    /// `false` when no emitted point came from that sample.
+    pub fn update(&self, estimation_id: u32, force: Option<f32>, tilt: Option<Tilt>) -> bool {
+        self.lock()
+            .update(estimation_id, force, tilt.map(Into::into))
+    }
+
+    /// Estimate ids of emitted points whose revision has not arrived; hold
+    /// the commit briefly while this is non-empty.
+    pub fn pending_estimates(&self) -> Vec<u32> {
+        self.lock().pending_estimates()
+    }
 }
 
-/// The wet-ink view of modelled points: rendered width and nib angle, so
-/// receivers draw exactly what the sender drew.
-#[uniffi::export]
-pub fn wet_points(points: Vec<StrokePoint>) -> Vec<WetPoint> {
-    points
-        .into_iter()
-        .map(|p| pcore::WetPoint::from(pcore::StrokePoint::from(p)).into())
-        .collect()
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum Blend {
+    Normal,
+    /// Ink multiplies what is under it (highlighter).
+    Multiply,
 }
 
-/// An indexed triangle mesh in canvas units (x right, y down).
-/// `positions` is flat `[x0, y0, x1, y1, …]`; `indices` is a triangle list
-/// into it. Upload both as-is to a vertex and index buffer.
-#[derive(Debug, Clone, PartialEq, uniffi::Record)]
-pub struct IndexedMesh {
-    pub positions: Vec<f32>,
-    pub indices: Vec<u32>,
+/// What happens where a stroke covers itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum Overlap {
+    /// Both layers show; translucent ink darkens where it crosses itself.
+    Accumulate,
+    /// Each pixel painted at most once per stroke: draw with the
+    /// write-once depth state.
+    Discard,
 }
 
-impl From<pcore::InkMesh> for IndexedMesh {
-    fn from(m: pcore::InkMesh) -> Self {
+/// Everything a renderer applies per stroke rather than per vertex.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct InkStyle {
+    /// RGBA8 packed big-endian: 0xRRGGBBAA.
+    pub color: u32,
+    /// 0..=1, multiplied into the colour's alpha and every vertex opacity.
+    pub opacity: f32,
+    pub blend: Blend,
+    pub overlap: Overlap,
+    /// Edge feathering, 1 for a hard edge.
+    pub hardness: f32,
+}
+
+impl From<pcore::InkStyle> for InkStyle {
+    fn from(s: pcore::InkStyle) -> Self {
         Self {
-            positions: m.positions().flatten().collect(),
-            indices: m.indices,
+            color: rgba_to_u32(s.color),
+            opacity: s.opacity,
+            blend: match s.blend {
+                pcore::Blend::Normal => Blend::Normal,
+                pcore::Blend::Multiply => Blend::Multiply,
+            },
+            overlap: match s.overlap {
+                pcore::Overlap::Accumulate => Overlap::Accumulate,
+                pcore::Overlap::Discard => Overlap::Discard,
+            },
+            hardness: s.hardness,
         }
     }
+}
+
+/// Floats per vertex in [`InkMesh::vertices`].
+pub const INK_VERTEX_FLOATS: u32 = 5;
+
+/// An indexed triangle mesh in canvas units (x right, y down).
+/// `vertices` is `[x, y, u, v, opacity]` per vertex, interleaved
+/// ([`INK_VERTEX_FLOATS`] floats each): `u` is arc length along the
+/// stroke, `v` the side in -1..=1, `opacity` 0..=1. `indices` is a
+/// triangle list into it. Upload both as-is to a vertex and index buffer;
+/// apply `style` per draw.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct InkMesh {
+    pub vertices: Vec<f32>,
+    pub indices: Vec<u32>,
+    pub style: InkStyle,
+}
+
+impl From<pcore::InkMesh> for InkMesh {
+    fn from(m: pcore::InkMesh) -> Self {
+        Self {
+            vertices: m
+                .vertices
+                .iter()
+                .flat_map(|v| [v.pos[0], v.pos[1], v.uv[0], v.uv[1], v.opacity])
+                .collect(),
+            indices: m.indices,
+            style: m.style.into(),
+        }
+    }
+}
+
+/// Floats per vertex in [`InkMesh::vertices`].
+#[uniffi::export]
+pub fn ink_vertex_floats() -> u32 {
+    INK_VERTEX_FLOATS
 }
 
 /// Cap/join flattening tolerance for 1:1 zoom, canvas units.
@@ -141,66 +255,48 @@ pub fn default_tolerance() -> f32 {
 /// cap/join flattening error in canvas units; pass [`default_tolerance`]
 /// divided by the zoom factor.
 #[uniffi::export]
-pub fn stroke_mesh(stroke: Stroke, tolerance: f32) -> IndexedMesh {
-    let stroke = pcore::Stroke::from(stroke);
-    let flat = stroke.flatten();
-    pcore::stroke_mesh(stroke.tool, &flat, stroke.base_width, tolerance).into()
+pub fn stroke_mesh(stroke: Stroke, tolerance: f32) -> InkMesh {
+    pcore::Stroke::from(stroke).mesh(tolerance).into()
 }
 
-/// Ink for a live run of modelled points (`BrushModeler.points` plus its
-/// `predict` tail), same geometry as [`stroke_mesh`].
+/// Ink for a run of stored points: the live stroke (`BrushModeler.points`
+/// plus its `predict` tail, `StrokeEnd.live`) or a remote wet run
+/// received on the ephemeral channel (`StrokeEnd.live` until its `End`).
+/// Same geometry as [`stroke_mesh`] for the same points, so the committed
+/// stroke lands on top without a visible change.
 #[uniffi::export]
 pub fn points_mesh(
     points: Vec<StrokePoint>,
-    tool: Tool,
-    base_width: f32,
+    brush: BrushRef,
+    color: u32,
+    end: StrokeEnd,
     tolerance: f32,
-) -> IndexedMesh {
+) -> InkMesh {
     let flat: Vec<pcore::StrokePoint> = points.into_iter().map(Into::into).collect();
-    pcore::stroke_mesh(tool.into(), &flat, base_width, tolerance).into()
-}
-
-/// Ink for a remote wet run received on the ephemeral channel, same
-/// geometry as [`stroke_mesh`]: receivers draw exactly what the sender
-/// drew, and the committed stroke lands on top without a visible change.
-#[uniffi::export]
-pub fn wet_mesh(points: Vec<WetPoint>, tool: Tool, base_width: f32, tolerance: f32) -> IndexedMesh {
-    let flat: Vec<pcore::StrokePoint> = points.iter().map(wet_to_stroke_point).collect();
-    pcore::stroke_mesh(
-        tool.into(),
-        &flat,
-        base_width.max(WET_WIDTH_FALLBACK),
-        tolerance,
-    )
-    .into()
+    brush.ink(color).mesh(&flat, end.into(), tolerance).into()
 }
 
 /// Ink for a committed element, stroke or shape, same geometry as
 /// [`stroke_mesh`]; a shape's outline is built here so it never crosses
 /// the FFI.
 #[uniffi::export]
-pub fn element_mesh(element: Element, tolerance: f32) -> IndexedMesh {
+pub fn element_mesh(element: Element, tolerance: f32) -> InkMesh {
     let element = pcore::Element::from(element);
-    pcore::stroke_mesh(
-        element.tool(),
-        &element.outline(),
-        element.base_width(),
-        tolerance,
-    )
-    .into()
+    element
+        .ink()
+        .mesh(&element.outline(), pcore::StrokeEnd::Complete, tolerance)
+        .into()
 }
 
 /// Ink for a shape that is not committed yet (the hold preview), drawn
-/// with the live stroke's tool and width.
+/// with the live stroke's brush and colour.
 #[uniffi::export]
-pub fn shape_outline_mesh(
-    shape: Shape,
-    tool: Tool,
-    base_width: f32,
-    tolerance: f32,
-) -> IndexedMesh {
+pub fn shape_outline_mesh(shape: Shape, brush: BrushRef, color: u32, tolerance: f32) -> InkMesh {
     let outline = pcore::Shape::from(shape).outline();
-    pcore::stroke_mesh(tool.into(), &outline, base_width, tolerance).into()
+    brush
+        .ink(color)
+        .mesh(&outline, pcore::StrokeEnd::Complete, tolerance)
+        .into()
 }
 
 /// Snap a live stroke (`BrushModeler.points` at hold time) to a line,
@@ -243,6 +339,8 @@ mod tests {
                 force: 0.7,
                 t_ms: 100.0 + i as f64 * 8.0,
                 tilt: None,
+                estimation_id: None,
+                expects_update: false,
             })
             .collect()
     }
@@ -259,25 +357,24 @@ mod tests {
             force: 0.7,
             t_ms: 300.0,
             tilt: None,
+            estimation_id: None,
+            expects_update: false,
         }]);
         assert_eq!(tail.len(), 1);
         assert_eq!(m.points(), live, "predict must not push");
 
         let done = m.finish();
-        let wet = wet_points(done.clone());
-        assert_eq!(wet.len(), done.len());
-        assert!(wet.iter().all(|w| w.width.is_some()));
-
-        let mesh = points_mesh(done.clone(), Tool::Pen, 4.0, 0.25);
-        assert_eq!(
-            wet_mesh(wet, Tool::Pen, 4.0, 0.25),
-            mesh,
-            "receivers draw the sender's ink"
-        );
+        let brush = BrushRef {
+            tool: Tool::Pen,
+            base_width: 4.0,
+        };
+        let mesh = points_mesh(done.clone(), brush, 0xff, StrokeEnd::Complete, 0.25);
         assert!(mesh.indices.len() >= 3 && mesh.indices.len().is_multiple_of(3));
-        assert!(mesh.positions.len().is_multiple_of(2));
-        let vertices = u32::try_from(mesh.positions.len() / 2).unwrap();
+        let stride = usize::try_from(INK_VERTEX_FLOATS).unwrap();
+        assert!(mesh.vertices.len().is_multiple_of(stride));
+        let vertices = u32::try_from(mesh.vertices.len() / stride).unwrap();
         assert!(mesh.indices.iter().all(|&i| i < vertices));
+        assert_eq!(mesh.style.color, 0xff);
 
         let committed = stroke_mesh(
             Stroke {
@@ -286,12 +383,14 @@ mod tests {
                 color: 0xff,
                 base_width: 4.0,
                 kind: PointKind::PolylineSample,
-                points: done,
+                points: done.clone(),
                 created_ms: 0,
             },
             0.25,
         );
         assert_eq!(committed, mesh, "live and committed ink are the same mesh");
+        let live_end = points_mesh(done, brush, 0xff, StrokeEnd::Live, 0.25);
+        assert_ne!(live_end, mesh, "only the finished stroke tapers");
     }
 
     #[test]
@@ -321,6 +420,8 @@ mod tests {
                 force: 0.6,
                 t_ms: i as f64 * 8.0,
                 tilt: None,
+                estimation_id: None,
+                expects_update: false,
             })
             .collect();
         let m = BrushModeler::new(Tool::Pen, 4.0);
@@ -332,7 +433,11 @@ mod tests {
         assert!((size.x - 120.0).abs() < 6.0 && (size.y - 80.0).abs() < 6.0);
         assert!(rec.confidence > 0.0);
 
-        let preview = shape_outline_mesh(rec.shape, Tool::Pen, 4.0, 0.25);
+        let brush = BrushRef {
+            tool: Tool::Pen,
+            base_width: 4.0,
+        };
+        let preview = shape_outline_mesh(rec.shape, brush, 0xff, 0.25);
         let committed = element_mesh(
             Element::Shape(crate::types::ShapeElement {
                 id: pcore::ElementId::new().to_string(),

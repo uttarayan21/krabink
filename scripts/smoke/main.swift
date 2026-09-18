@@ -17,15 +17,21 @@ func createAndEdit(dir: String) throws -> (note: String, sketch: String, stroke:
     // Model raw touches the way the iPad canvas will: push, predict, finish.
     let modeler = BrushModeler(tool: .pen, size: 3.0)
     let live = modeler.push(samples: (0..<16).map {
-        RawSample(x: Float($0) * 3, y: Float($0), force: 0.5, tMs: 1000 + Double($0) * 8, tilt: nil)
+        RawSample(x: Float($0) * 3, y: Float($0), force: 0.5, tMs: 1000 + Double($0) * 8, tilt: nil,
+                  estimationId: nil, expectsUpdate: false)
     })
-    guard !live.isEmpty, live.allSatisfy({ $0.size != nil }) else { fatalError("modeler emitted no ink") }
-    let tail = modeler.predict(samples: [RawSample(x: 60, y: 20, force: 0.5, tMs: 1200, tilt: nil)])
+    guard !live.isEmpty, live.allSatisfy({ $0.size == nil }) else { fatalError("modeler emitted no ink") }
+    let tail = modeler.predict(samples: [RawSample(x: 60, y: 20, force: 0.5, tMs: 1200, tilt: nil,
+                                                   estimationId: nil, expectsUpdate: false)])
     guard modeler.points() == live, tail.count == 1 else { fatalError("predict mutated the modeler") }
-    try note.appendPoints(stroke: strokeId, seq: 1, points: wetPoints(points: live))
+    try note.appendPoints(stroke: strokeId, seq: 1, points: live)
     let points = modeler.finish()
-    let mesh = pointsMesh(points: points, tool: .pen, baseWidth: 3.0, tolerance: defaultTolerance())
+    let brush = BrushRef(tool: .pen, baseWidth: 3.0)
+    let mesh = pointsMesh(points: points, brush: brush, color: 0x1E3C_C8FF, end: .complete, tolerance: defaultTolerance())
     guard mesh.indices.count >= 3, mesh.indices.count % 3 == 0 else { fatalError("empty mesh") }
+    guard mesh.vertices.count % Int(inkVertexFloats()) == 0, mesh.style.color == 0x1E3C_C8FF else {
+        fatalError("mesh layout")
+    }
 
     let stroke = Stroke(
         id: strokeId, tool: .pen, color: 0x1E3C_C8FF, baseWidth: 3.0,
@@ -33,7 +39,7 @@ func createAndEdit(dir: String) throws -> (note: String, sketch: String, stroke:
     guard strokeMesh(stroke: stroke, tolerance: defaultTolerance()) == mesh else {
         fatalError("live and committed meshes differ")
     }
-    try note.finishStroke(sketch: sketch, stroke: stroke)
+    try note.finishStroke(sketch: sketch, stroke: stroke, tail: Array(points[live.count...]))
 
     // Shape recognition: a held rough rectangle snaps and commits as a shape.
     let rectModeler = BrushModeler(tool: .pen, size: 3.0)
@@ -45,7 +51,7 @@ func createAndEdit(dir: String) throws -> (note: String, sketch: String, stroke:
             let t = Float(k) / 30
             rectSamples.append(RawSample(
                 x: ax + (bx - ax) * t, y: ay + (by - ay) * t, force: 0.6,
-                tMs: Double(rectSamples.count) * 8, tilt: nil))
+                tMs: Double(rectSamples.count) * 8, tilt: nil, estimationId: nil, expectsUpdate: false))
         }
     }
     _ = rectModeler.push(samples: rectSamples)
@@ -55,7 +61,7 @@ func createAndEdit(dir: String) throws -> (note: String, sketch: String, stroke:
     let shape = ShapeElement(
         id: shapeId, shape: snapped.shape, tool: .pen, color: 0xFF00_00FF, width: 3.0,
         start: nil, end: nil, createdMs: 2)
-    let preview = shapeOutlineMesh(shape: snapped.shape, tool: .pen, baseWidth: 3.0, tolerance: defaultTolerance())
+    let preview = shapeOutlineMesh(shape: snapped.shape, brush: brush, color: 0xFF00_00FF, tolerance: defaultTolerance())
     guard elementMesh(element: .shape(shape), tolerance: defaultTolerance()) == preview else {
         fatalError("shape preview and committed meshes differ")
     }

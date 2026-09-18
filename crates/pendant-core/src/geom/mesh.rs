@@ -1,5 +1,8 @@
 //! The mesh every renderer draws: triangles in canvas space with the
-//! per-vertex attributes a brush shader needs.
+//! per-vertex attributes a brush shader needs, plus the per-stroke style.
+
+use crate::brush::{Blend, Overlap, Tip};
+use crate::stroke::Rgba;
 
 /// One mesh vertex.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -14,16 +17,64 @@ pub struct InkVertex {
     pub opacity: f32,
 }
 
+/// Everything a renderer applies per stroke rather than per vertex.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InkStyle {
+    pub color: Rgba,
+    /// 0..=1, multiplied into `color`'s alpha and every vertex opacity.
+    pub opacity: f32,
+    pub blend: Blend,
+    pub overlap: Overlap,
+    /// Edge feathering, 1 for a hard edge (see [`Tip::hardness`]).
+    pub hardness: f32,
+}
+
+impl InkStyle {
+    /// Opaque black, hard, accumulating: the style of a plain pen.
+    pub const PLAIN: Self = Self {
+        color: Rgba::BLACK,
+        opacity: 1.0,
+        blend: Blend::Normal,
+        overlap: Overlap::Accumulate,
+        hardness: 1.0,
+    };
+
+    pub(crate) fn of(color: Rgba, tip: &Tip, paint: &crate::brush::Paint) -> Self {
+        Self {
+            color,
+            opacity: paint.opacity.clamp(0.0, 1.0),
+            blend: paint.blend,
+            overlap: paint.overlap,
+            hardness: tip.hardness.clamp(0.0, 1.0),
+        }
+    }
+}
+
 /// A stroke tessellated into triangles, in canvas space (x right, y down).
 /// Renderers flip y as their convention requires.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InkMesh {
     pub vertices: Vec<InkVertex>,
     /// Triangle list into `vertices`.
     pub indices: Vec<u32>,
+    pub style: InkStyle,
+}
+
+impl Default for InkMesh {
+    fn default() -> Self {
+        Self::empty(InkStyle::PLAIN)
+    }
 }
 
 impl InkMesh {
+    pub fn empty(style: InkStyle) -> Self {
+        Self {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            style,
+        }
+    }
+
     /// Nothing to draw.
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty()

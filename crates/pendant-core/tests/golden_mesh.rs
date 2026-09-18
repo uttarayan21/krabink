@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use pendant_core::{BrushModeler, DEFAULT_TOLERANCE, InkMesh, RawSample, Tilt, Tool, stroke_mesh};
+use pendant_core::{BrushModeler, DEFAULT_TOLERANCE, Ink, InkMesh, RawSample, Rgba, Tilt, Tool};
 
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/mesh.txt");
 
@@ -36,6 +36,7 @@ fn cases() -> Vec<(&'static str, Tool, f32, Vec<RawSample>)> {
                     force: 0.5 + force_swing * (t * 3.0).cos() * 0.5,
                     t_ms: 1000.0 + f64::from(i) * (4.0 + 8.0 * f64::from(t)),
                     tilt: tilt(t * 3.0),
+                    estimate: None,
                 }
             })
             .collect()
@@ -48,6 +49,7 @@ fn cases() -> Vec<(&'static str, Tool, f32, Vec<RawSample>)> {
                 force: 0.8,
                 t_ms: 500.0 + f64::from(i) * dt,
                 tilt: None,
+                estimate: None,
             })
             .collect()
     };
@@ -66,6 +68,7 @@ fn cases() -> Vec<(&'static str, Tool, f32, Vec<RawSample>)> {
         force: 1.0,
         t_ms: f64::from(u32::try_from(i).unwrap_or(0)) * 8.0,
         tilt: None,
+        estimate: None,
     })
     .collect();
     vec![
@@ -73,9 +76,10 @@ fn cases() -> Vec<(&'static str, Tool, f32, Vec<RawSample>)> {
         ("pen-slow-line", Tool::Pen, 3.0, line(30, 1.0, 16.0)),
         ("pen-dot", Tool::Pen, 5.0, vec![line(1, 0.0, 0.0)[0]]),
         ("pen-hairpin", Tool::Pen, 4.0, hairpin.clone()),
+        ("pencil-s-curve", Tool::Pencil, 3.0, s_curve(0.6)),
         ("marker-s-curve", Tool::Marker, 10.0, s_curve(0.0)),
         ("monoline-line", Tool::Monoline, 2.0, line(30, 3.0, 8.0)),
-        ("brush-nib-s-curve", Tool::Brush, 12.0, s_curve(0.3)),
+        ("fountain-s-curve", Tool::Fountain, 12.0, s_curve(0.3)),
     ]
 }
 
@@ -84,7 +88,11 @@ fn mesh(tool: Tool, size: f32, samples: &[RawSample]) -> InkMesh {
     for &s in samples {
         modeler.push(s);
     }
-    stroke_mesh(tool, &modeler.finish(), size, DEFAULT_TOLERANCE)
+    Ink::preset(tool, Rgba::BLACK, size).mesh(
+        &modeler.finish(),
+        pendant_core::StrokeEnd::Complete,
+        DEFAULT_TOLERANCE,
+    )
 }
 
 /// FNV-1a over every vertex component's bits and every index.

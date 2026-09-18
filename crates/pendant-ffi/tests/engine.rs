@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use pendant_ffi::{
     Core, CoreListener, Element, NoteInfo, NoteListener, Point2, PointKind, Shape, ShapeElement,
-    Stroke, StrokePoint, SyncState, Tool, WetPoint,
+    Stroke, StrokePoint, SyncState, Tool,
 };
 
 fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
@@ -84,7 +84,7 @@ impl NoteListener for RecNote {
             .push(format!("begin:{stroke}:{color:08x}:{width}"));
     }
 
-    fn wet_points(&self, stroke: String, _sent_ms: u64, points: Vec<WetPoint>) {
+    fn wet_points(&self, stroke: String, _sent_ms: u64, points: Vec<StrokePoint>) {
         self.wet
             .lock()
             .unwrap()
@@ -135,6 +135,7 @@ fn local_state_survives_reopen() {
             points: polyline(16),
             created_ms: 1,
         },
+        Vec::new(),
     )
     .unwrap();
     let note_id = note.id();
@@ -226,26 +227,7 @@ fn two_cores_converge_through_relay() {
         .begin_stroke(sketch.clone(), Tool::Pen, 0x1e3cc8ff, 3.0)
         .unwrap();
     note_a
-        .append_points(
-            stroke_id.clone(),
-            1,
-            vec![
-                WetPoint {
-                    x: 0.0,
-                    y: 0.0,
-                    force: 0.5,
-                    width: None,
-                    nib: None,
-                },
-                WetPoint {
-                    x: 3.0,
-                    y: 1.0,
-                    force: 0.6,
-                    width: None,
-                    nib: None,
-                },
-            ],
-        )
+        .append_points(stroke_id.clone(), 1, polyline(2))
         .unwrap();
     note_a
         .finish_stroke(
@@ -259,6 +241,7 @@ fn two_cores_converge_through_relay() {
                 points: polyline(16),
                 created_ms: 2,
             },
+            polyline(1),
         )
         .unwrap();
 
