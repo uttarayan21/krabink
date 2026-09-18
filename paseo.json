@@ -2,6 +2,9 @@
   "scripts": {
     "deploy-ipad": {
       "command": "scripts/deploy-ipad.sh"
+    },
+    "build-desktop": {
+      "command": "cargo build -p pendant"
     }
   }
 }
