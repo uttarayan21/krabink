@@ -247,7 +247,16 @@ fn editor_ui(
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(title).heading().color(theme::TEXT));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    theme::status_dot(ui, theme::SUCCESS, "live sync");
+                    let all_up = view
+                        .links
+                        .iter()
+                        .all(|l| l.status == crate::sync::SyncStatus::Connected);
+                    let (color, label) = if all_up {
+                        (theme::SUCCESS, "live sync")
+                    } else {
+                        (theme::WARN, "sync connecting…")
+                    };
+                    theme::status_dot(ui, color, label);
                 });
             });
             ui.add_space(12.0);
@@ -282,13 +291,20 @@ fn editor_ui(
                                     payload,
                                 });
                                 match docs.refresh_meta(id) {
-                                    Ok(Some(ws_payload)) => {
-                                        commits.write(LocalCommit {
-                                            doc: DocKey::WORKSPACE,
-                                            payload: ws_payload,
-                                        });
+                                    Ok(meta) => {
+                                        if let Some(payload) = meta.note {
+                                            commits.write(LocalCommit {
+                                                doc: DocKey::from(id),
+                                                payload,
+                                            });
+                                        }
+                                        if let Some(payload) = meta.workspace {
+                                            commits.write(LocalCommit {
+                                                doc: DocKey::WORKSPACE,
+                                                payload,
+                                            });
+                                        }
                                     }
-                                    Ok(None) => {}
                                     Err(err) => tracing::error!(%err, "meta refresh failed"),
                                 }
                             }

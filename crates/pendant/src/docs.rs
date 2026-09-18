@@ -12,6 +12,13 @@ use pendant_core::{
 /// Compact a doc when its stored update log grows past this.
 const COMPACT_AFTER_UPDATES: u64 = 500;
 
+/// Sync payloads produced by [`Docs::refresh_meta`], one per doc touched.
+#[derive(Default)]
+pub struct MetaRefresh {
+    pub note: Option<Vec<u8>>,
+    pub workspace: Option<Vec<u8>>,
+}
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -131,11 +138,12 @@ impl Docs {
         Ok(payload)
     }
 
-    /// Keep the workspace registry's title/updated fresh for `id`.
-    /// Returns a payload when something changed.
-    pub fn refresh_meta(&mut self, id: NoteId) -> pendant_core::Result<Option<Vec<u8>>> {
+    /// Keep the note's own title and the workspace registry's title/updated
+    /// fresh for `id`. Returns the payloads that changed, one per doc.
+    pub fn refresh_meta(&mut self, id: NoteId) -> pendant_core::Result<MetaRefresh> {
+        let mut out = MetaRefresh::default();
         let Some(note) = self.open.get(&id) else {
-            return Ok(None);
+            return Ok(out);
         };
         let title = note
             .text()
@@ -151,11 +159,20 @@ impl Docs {
         } else {
             title
         };
-        note.set_title(&title)?;
+        // The title is an op on the note doc. It must be exported and
+        // persisted like any edit: every later text op depends on it, so a
+        // peer that never received it can apply nothing that follows.
+        if note.title().as_deref() != Some(title.as_str()) {
+            let before = note.version();
+            note.set_title(&title)?;
+            let payload = note.export_updates_since(&before)?;
+            self.persist(DocKey::from(id), &payload)?;
+            out.note = Some(payload);
+        }
 
         let current = self.workspace.notes().into_iter().find(|n| n.id == id);
         if current.as_ref().is_some_and(|n| n.title == title) {
-            return Ok(None);
+            return Ok(out);
         }
         let before = self.workspace.version();
         self.workspace.upsert(&NoteMeta {
@@ -166,7 +183,8 @@ impl Docs {
         })?;
         let payload = self.workspace.export_updates_since(&before)?;
         self.persist(DocKey::WORKSPACE, &payload)?;
-        Ok(Some(payload))
+        out.workspace = Some(payload);
+        Ok(out)
     }
 
     pub fn version_of(&self, key: DocKey) -> Vec<u8> {

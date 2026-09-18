@@ -509,6 +509,9 @@ final class InkRenderer: NSObject, MTKViewDelegate {
 
     /// The clear colour for a UIKit background: the framebuffer is sRGB,
     /// Metal takes clear values in linear light.
+    ///
+    /// Pass [`UIColor.paper`] for sketches so both devices draw on the
+    /// same colour.
     static func clearColor(for color: UIColor, trait: UITraitCollection) -> MTLClearColor {
         var r: CGFloat = 0
         var g: CGFloat = 0
@@ -904,4 +907,12 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         else { return nil }
         return UIImage(cgImage: image, scale: pixelScale, orientation: .up)
     }
+}
+
+extension UIColor {
+    /// Sketch paper, `#1D2029`: the desktop's card surface (`theme::PAPER`
+    /// in crates/pendant/src/theme.rs). Both platforms clear the canvas to
+    /// this so ink reads alike everywhere; it is dark, so the highlighter
+    /// screens rather than multiplies.
+    static let paper = UIColor(red: 0x1D / 255.0, green: 0x20 / 255.0, blue: 0x29 / 255.0, alpha: 1)
 }

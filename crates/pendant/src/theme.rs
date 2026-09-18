@@ -32,6 +32,25 @@ pub const SUCCESS: Color32 = Color32::from_rgb(0x4a, 0xde, 0x80);
 pub const WARN: Color32 = Color32::from_rgb(0xfb, 0xbf, 0x24);
 pub const DANGER: Color32 = Color32::from_rgb(0xf8, 0x71, 0x71);
 
+/// Sketch paper: what a sketch's render target clears to, so ink sits
+/// inline on the preview card with no visible frame. The iPad pins its
+/// canvas to the same value (`UIColor.paper` in InkRenderer.swift); keep
+/// them equal so a sketch reads alike on both devices.
+pub const PAPER: Color32 = SURFACE;
+/// Dark paper flips the highlighter from multiply to screen (as on the
+/// iPad), so it lightens over what is under it instead of vanishing.
+pub const PAPER_IS_DARK: bool = true;
+
+/// [`PAPER`] as a bevy colour for a camera's clear colour.
+pub fn paper_color() -> Color {
+    Color::srgb_u8(PAPER.r(), PAPER.g(), PAPER.b())
+}
+
+/// [`PAPER`] as opaque sRGB bytes for a freshly allocated render target.
+pub const fn paper_bytes() -> [u8; 4] {
+    [PAPER.r(), PAPER.g(), PAPER.b(), 255]
+}
+
 /// Corner radius shared by cards, buttons, and inputs.
 pub const RADIUS: u8 = 8;
 /// Corner radius for floating windows.

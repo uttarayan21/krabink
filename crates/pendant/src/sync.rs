@@ -49,6 +49,12 @@ pub enum LinkKind {
     Remote,
 }
 
+/// After a fatal session error the link is torn down and reopened this
+/// much later: a fresh handshake re-subscribes and backfills, which is
+/// the recovery for a bad import; the pause keeps a repeating failure
+/// from spinning.
+const REOPEN_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// One relay connection: socket task on the runtime, session on this side.
 struct Link {
     kind: LinkKind,
@@ -57,6 +63,8 @@ struct Link {
     inbound: mpsc::UnboundedReceiver<TransportEvent>,
     outbound: mpsc::UnboundedSender<Vec<u8>>,
     session: Option<ClientSession>,
+    /// Set by a fatal session error; the link is reopened once due.
+    reopen_at: Option<std::time::Instant>,
 }
 
 impl Link {
@@ -76,7 +84,14 @@ impl Link {
             inbound: in_rx,
             outbound: out_tx,
             session: None,
+            reopen_at: None,
         }
+    }
+
+    /// Replace the socket task with a fresh one (the old task ends when its
+    /// channels drop, closing the socket) and start over from the handshake.
+    fn reopen(&mut self, runtime: &tokio::runtime::Handle) {
+        *self = Link::open(runtime, self.kind, self.server.clone(), self.token.clone());
     }
 
     fn send(&self, frame: Vec<u8>) {
@@ -261,6 +276,7 @@ impl Plugin for SyncPlugin {
 }
 
 fn drive_sync(
+    runtime: Res<crate::Runtime>,
     mut transport: ResMut<SyncTransport>,
     mut docs: ResMut<Docs>,
     mut editor: ResMut<EditorState>,
@@ -269,6 +285,18 @@ fn drive_sync(
     mut wet: MessageWriter<WetInkFrame>,
 ) {
     let device = transport.device;
+
+    // 0. Links whose session died fatally come back after a pause.
+    let now = std::time::Instant::now();
+    for link in &mut transport.links {
+        if link.reopen_at.is_some_and(|at| at <= now) {
+            tracing::info!(
+                server = link.server,
+                "reopening sync link after fatal error"
+            );
+            link.reopen(runtime.0.handle());
+        }
+    }
 
     // 1. Local commits out, on every link.
     for commit in commits.read() {
@@ -401,8 +429,9 @@ fn apply_effects(
                 wet.write(WetInkFrame { doc, payload });
             }
             ClientEffect::Fatal(err) => {
-                tracing::error!(%err, server = link.server, "sync session failed");
+                tracing::error!(%err, server = link.server, "sync session failed; reopening link shortly");
                 link.session = None;
+                link.reopen_at = Some(std::time::Instant::now() + REOPEN_AFTER);
             }
         }
     }

@@ -126,7 +126,7 @@ struct SketchPreview: UIViewRepresentable {
             let rendered = elements.isEmpty
                 ? nil
                 : renderer?.renderThumbnail(
-                    elements: elements, maxSide: maxSide, background: .systemBackground, trait: trait)
+                    elements: elements, maxSide: maxSide, background: .paper, trait: trait)
             let image = rendered.map(framed) ?? placeholder(size: CGSize(width: maxSide, height: 120))
             thumbCache[id] = (elements.count, image)
             return image
@@ -158,7 +158,7 @@ struct SketchPreview: UIViewRepresentable {
             let size = CGSize(
                 width: image.size.width + inset * 2, height: image.size.height + inset * 2)
             return UIGraphicsImageRenderer(size: size).image { ctx in
-                UIColor.systemBackground.setFill()
+                UIColor.paper.setFill()
                 ctx.fill(CGRect(origin: .zero, size: size))
                 UIColor.separator.setStroke()
                 let border = UIBezierPath(

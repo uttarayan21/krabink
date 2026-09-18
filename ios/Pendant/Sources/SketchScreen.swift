@@ -963,7 +963,7 @@ final class SketchCanvasView: UIView, UIScrollViewDelegate {
     }
 
     private func applyBackground() {
-        metal.clearColor = InkRenderer.clearColor(for: .systemBackground, trait: traitCollection)
+        metal.clearColor = InkRenderer.clearColor(for: .paper, trait: traitCollection)
         renderer.darkPaper = InkRenderer.isDark(metal.clearColor)
         renderer.needsDisplay()
     }
