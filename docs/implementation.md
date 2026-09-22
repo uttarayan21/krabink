@@ -204,9 +204,13 @@ Bevy app with egui UI. Modules:
   `--relay-listen`, `--follow-latest`). Subcommands: `completions`, `pair <uri>`,
   `replay` (headless 120 Hz latency rig).
 - `docs.rs`: workspace registry and open notes over the shared store.
-- `relay.rs`: `EmbeddedRelay` serving the server router on `0.0.0.0:8722`
-  (ephemeral port if taken), advertised over mDNS with the device id in
-  TXT.
+- `relay.rs`: `EmbeddedRelay` serving the server router on `0.0.0.0` at an
+  ephemeral port (new each launch; `--relay-listen` pins one, falling back
+  to ephemeral if taken), advertised over mDNS with the device id in TXT.
+  8722 is reserved for the dedicated `pendant-server`.
+- `discovery.rs`: desktop-side `_pendant._tcp` browser (mdns-sd) for a
+  joined desktop's `relay_id`; repoints the direct link and persists the
+  new url when that desktop shows up at another address/port.
 - `sync.rs`: one tokio task per relay link owning its WebSocket with
   backoff; the Bevy side drives one `ClientSession` per link each frame and
   bridges updates between links. Link 0 is the embedded relay, link 1 the

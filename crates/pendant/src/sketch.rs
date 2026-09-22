@@ -415,7 +415,7 @@ fn new_target(
             depth_or_array_layers: 1,
         },
         bevy::render::render_resource::TextureDimension::D2,
-        &[255, 255, 255, 255],
+        &crate::theme::paper_bytes(),
         bevy::render::render_resource::TextureFormat::Bgra8UnormSrgb,
         RenderAssetUsages::default(),
     );
@@ -434,7 +434,7 @@ fn new_target(
         .spawn((
             Camera2d,
             Camera {
-                clear_color: ClearColorConfig::Custom(Color::WHITE),
+                clear_color: ClearColorConfig::Custom(crate::theme::paper_color()),
                 order: -1,
                 ..default()
             },

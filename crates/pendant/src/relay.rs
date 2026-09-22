@@ -1,10 +1,17 @@
 //! Embedded sync relay: every desktop instance serves `pendant-server`'s
 //! router in-process so an iPad can pair straight to the desktop with no
 //! dedicated relay. The relay is reachable on every interface (LAN,
-//! Tailscale, …) and advertised over mDNS as `_pendant._tcp` with the
-//! desktop's device id in TXT, so clients on the same network find it even
-//! after its address changed. A dedicated relay (if configured) is the
-//! fallback path; the desktop bridges between the two in [`crate::sync`].
+//! Tailscale, …) on a fresh ephemeral port each launch, and advertised
+//! over mDNS as `_pendant._tcp` with the desktop's device id in TXT, so
+//! clients on the same network find it even after its address (or port)
+//! changed. A dedicated relay (if configured) is the fallback path; the
+//! desktop bridges between the two in [`crate::sync`].
+//!
+//! The ephemeral port keeps the app-native relay apart from a dedicated
+//! `pendant-server` on its fixed 8722: macOS lets a wildcard bind share a
+//! port with a loopback-specific listener (tokio sets `SO_REUSEADDR`), and
+//! then routes loopback connections to the more specific socket, so a
+//! desktop pinned to 8722 would talk to the wrong relay and get 401s.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -18,8 +25,9 @@ use tokio::net::TcpListener;
 
 use crate::errors::{Error, Result, ResultExt};
 
-/// Default relay port, shared with `pendant-server`.
-pub const DEFAULT_LISTEN: &str = "0.0.0.0:8722";
+/// Default listen address: every interface, ephemeral port. The dedicated
+/// `pendant-server` owns 8722; the app never competes for it.
+pub const DEFAULT_LISTEN: &str = "0.0.0.0:0";
 
 /// DNS-SD service type clients browse for.
 pub const SERVICE_TYPE: &str = "_pendant._tcp.local.";
@@ -43,9 +51,9 @@ pub struct EmbeddedRelay {
 }
 
 impl EmbeddedRelay {
-    /// Bind and serve. Falls back to an ephemeral port when `listen` is
-    /// taken so a second instance (or a local `pendant-server`) never
-    /// blocks startup.
+    /// Bind and serve. `listen` is normally port 0 (ephemeral); when a
+    /// port was pinned via `--relay-listen` and is taken, falls back to an
+    /// ephemeral one so startup never blocks.
     pub fn start(
         runtime: &tokio::runtime::Handle,
         listen: SocketAddr,
@@ -187,7 +195,8 @@ fn is_virtual(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
-fn rank(ip: &Ipv4Addr) -> u8 {
+/// Lower is better; shared with discovery so both sides prefer the same path.
+pub(crate) fn rank(ip: &Ipv4Addr) -> u8 {
     let [a, b, ..] = ip.octets();
     if ip.is_private() {
         0

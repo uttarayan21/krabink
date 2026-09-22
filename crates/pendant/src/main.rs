@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod discovery;
 mod docs;
 mod errors;
 mod ink_assets;
@@ -10,6 +11,7 @@ mod replay;
 mod settings;
 mod sketch;
 mod sync;
+mod theme;
 mod ui;
 
 use bevy::prelude::*;
@@ -121,30 +123,47 @@ fn run_app(args: cli::Cli) -> Result<()> {
         relay_id: Some(config.device.to_string()),
     };
 
-    App::new()
-        .insert_resource(ClearColor(Color::srgb(0.09, 0.09, 0.11)))
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "pendant".into(),
-                ..default()
-            }),
+    // A joined desktop's coordinates, if the persisted pairing named one.
+    let paired = config
+        .relay_id
+        .clone()
+        .zip(config.server.clone())
+        .map(|(relay_id, server)| discovery::PairedDesktop {
+            relay_id,
+            server,
+            token: config.token.clone(),
+            fallback: config.fallback.clone(),
+        });
+
+    let mut app = App::new();
+    if let Some(paired) = paired {
+        app.insert_resource(paired);
+    }
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            title: "pendant".into(),
             ..default()
-        }))
-        .add_plugins(bevy_egui::EguiPlugin::default())
-        .add_plugins((
-            SyncPlugin,
-            EditorUiPlugin,
-            crate::sketch::SketchPlugin,
-            settings::SettingsPlugin,
-        ))
-        .insert_resource(docs)
-        .insert_resource(Runtime(runtime))
-        .insert_resource(relay)
-        .insert_resource(transport)
-        .insert_resource(settings::Settings::new(pair))
-        .insert_resource(crate::ui::FollowLatest(args.follow_latest))
-        .add_systems(Startup, setup)
-        .run();
+        }),
+        ..default()
+    }))
+    .add_plugins(bevy_egui::EguiPlugin::default())
+    .add_plugins((
+        SyncPlugin,
+        theme::ThemePlugin,
+        EditorUiPlugin,
+        crate::sketch::SketchPlugin,
+        settings::SettingsPlugin,
+        discovery::DiscoveryPlugin,
+    ))
+    .insert_resource(docs)
+    .insert_resource(Runtime(runtime))
+    .insert_resource(relay)
+    .insert_resource(transport)
+    .insert_resource(settings::Settings::new(pair))
+    .insert_resource(discovery::RelayFinder::new(config.device))
+    .insert_resource(crate::ui::FollowLatest(args.follow_latest))
+    .add_systems(Startup, setup)
+    .run();
     Ok(())
 }
 

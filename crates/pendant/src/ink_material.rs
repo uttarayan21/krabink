@@ -209,7 +209,23 @@ impl InkCombo {
     }
 
     fn blend_state(self) -> BlendState {
-        if self.multiply {
+        if self.multiply && crate::theme::PAPER_IS_DARK {
+            // Screen: out = src * (1 - dst) + dst, the highlighter on dark
+            // paper (mirrors `psoScreen` in InkRenderer.swift). Multiply
+            // would only darken, and darkening dark paper shows nothing.
+            BlendState {
+                color: BlendComponent {
+                    src_factor: BlendFactor::OneMinusDst,
+                    dst_factor: BlendFactor::One,
+                    operation: BlendOperation::Add,
+                },
+                alpha: BlendComponent {
+                    src_factor: BlendFactor::One,
+                    dst_factor: BlendFactor::OneMinusSrcAlpha,
+                    operation: BlendOperation::Add,
+                },
+            }
+        } else if self.multiply {
             // out = dst * src + dst * (1 - a): multiply, straight through
             // where the ink is transparent. Colour is premultiplied.
             BlendState {

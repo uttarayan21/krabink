@@ -15,8 +15,11 @@ pub struct Cli {
     /// Bearer token for the dedicated relay. Overrides config.toml.
     #[clap(long)]
     pub token: Option<String>,
-    /// Address the embedded relay listens on. Falls back to an ephemeral
-    /// port when taken.
+    /// Address the embedded relay listens on. Port 0 (the default) picks
+    /// a free port each launch so the app never collides with a dedicated
+    /// pendant-server on 8722; paired devices re-find it over mDNS. Pin a
+    /// port only for firewall rules or scripted clients (falls back to an
+    /// ephemeral port when taken).
     #[clap(long, default_value = crate::relay::DEFAULT_LISTEN)]
     pub relay_listen: std::net::SocketAddr,
     /// Auto-open the most recently updated note whenever the library
