@@ -292,7 +292,11 @@ Bonjour usage strings, file sharing for recordings).
   Rust network thread and hop to the main actor. `-spike 1` and
   `-brushLab 1` replace the main UI.
 - `MarkdownTextView.swift`: UITextView with a two-way CRDT binding.
-  `SketchPreview.swift`: read-only preview with tappable sketch thumbnails.
+  `MarkdownRenderer.swift`: Foundation cmark-gfm parse (`AttributedString`,
+  `.full`) turned into TextKit styling — headings, bullets/numbers with
+  hanging indents, task boxes, quotes, code blocks, tab-stop tables, rules,
+  links; images resolved by a caller callback. `SketchPreview.swift`:
+  read-only preview on top of it with tappable sketch thumbnails.
 - `SettingsScreen.swift`, `PairScreen.swift`, `ScanScreen.swift`,
   `RelayDiscovery.swift`: sync state, device registry, pairing QR out and in
   (VisionKit), Bonjour lookup of the desktop relay.
@@ -348,7 +352,8 @@ Launch arguments read from `UserDefaults`: `serverURL`, `altURLs`,
 UI tests (`UITests/`): `SketchUITests` (create and draw, remote stroke and
 erase, marker self-overlap luminance, estimate settling, hold-to-shape,
 embed preview tap, reopen keeps strokes, sidebar title, delete, bulk delete),
-`SyncUITests`, `PairUITests`, `SpikeUITests`, `DeviceSpikeUITests`.
+`PreviewUITests` (markdown structure renders, offline), `SyncUITests`,
+`PairUITests`, `SpikeUITests`, `DeviceSpikeUITests`.
 
 ## 8. The shared rendering contract
 

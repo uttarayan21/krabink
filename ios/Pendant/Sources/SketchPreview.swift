@@ -1,8 +1,9 @@
-// iM5: read-only markdown preview that renders inline sketch embeds as
+// iM5: read-only markdown preview. Markdown is rendered by MarkdownRenderer
+// (headings, lists, quotes, code, tables…); inline sketch embeds become
 // tappable thumbnails. The editable source view (MarkdownTextView) keeps a
 // 1:1 view↔CRDT text mapping, so attachments live only here in preview.
 //
-// Each `![alt](pendant://sketch/<id>)` token becomes an NSTextAttachment
+// Each `![alt](pendant://sketch/<id>)` image becomes an NSTextAttachment
 // rendered from the sketch's committed elements; tapping it opens the canvas.
 
 import MetalKit
@@ -11,9 +12,16 @@ import SwiftUI
 import UIKit
 
 private let sketchURIPrefix = "pendant://sketch/"
-/// Matches a markdown image whose URI is a sketch embed; group 1 = sketch id.
-private let embedRegex = try! NSRegularExpression(
-    pattern: #"!\[[^\]]*\]\(pendant://sketch/([0-9A-Za-z]+)\)"#)
+/// cmark drops an image whose alt text is empty; give sketch embeds one.
+private let emptyAltRegex = try! NSRegularExpression(
+    pattern: #"!\[\]\((pendant://sketch/[0-9A-Za-z]+)\)"#)
+
+/// The sketch id an image URL points at, if it is an embed.
+private func sketchId(_ url: URL) -> String? {
+    let s = url.absoluteString
+    guard s.hasPrefix(sketchURIPrefix) else { return nil }
+    return String(s.dropFirst(sketchURIPrefix.count))
+}
 
 struct SketchPreview: UIViewRepresentable {
     let model: NoteModel
@@ -80,39 +88,21 @@ struct SketchPreview: UIViewRepresentable {
         private func buildAttributed(
             _ source: String, model: NoteModel
         ) -> (NSAttributedString, [(NSRange, String)]) {
-            let out = NSMutableAttributedString()
             let ns = source as NSString
-            var links: [(NSRange, String)] = []
-            var cursor = 0
-            let matches = embedRegex.matches(
-                in: source, range: NSRange(location: 0, length: ns.length))
-            for match in matches {
-                if match.range.location > cursor {
-                    out.append(plainText(ns.substring(
-                        with: NSRange(location: cursor, length: match.range.location - cursor))))
-                }
-                let id = ns.substring(with: match.range(at: 1))
+            let fixed = emptyAltRegex.stringByReplacingMatches(
+                in: source, range: NSRange(location: 0, length: ns.length),
+                withTemplate: "![sketch]($1)")
+            let renderer = MarkdownRenderer { [self] url, _ in
+                guard let id = sketchId(url) else { return nil }
                 let attachment = NSTextAttachment()
                 attachment.image = thumbnail(id: id, model: model)
-                let attachStr = NSMutableAttributedString(attachment: attachment)
-                let attachRange = NSRange(location: out.length, length: attachStr.length)
-                out.append(attachStr)
-                links.append((attachRange, id))
-                cursor = match.range.location + match.range.length
+                return attachment
             }
-            if cursor < ns.length {
-                out.append(plainText(ns.substring(from: cursor)))
+            let output = renderer.render(fixed)
+            let links = output.images.compactMap { image in
+                sketchId(image.url).map { (image.range, $0) }
             }
-            return (out, links)
-        }
-
-        private func plainText(_ s: String) -> NSAttributedString {
-            NSAttributedString(
-                string: s,
-                attributes: [
-                    .font: UIFont.systemFont(ofSize: 16),
-                    .foregroundColor: UIColor.themeText,
-                ])
+            return (output.text, links)
         }
 
         /// Render committed elements to a bounded thumbnail through the
