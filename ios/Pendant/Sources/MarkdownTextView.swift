@@ -20,6 +20,11 @@ struct MarkdownTextView: UIViewRepresentable {
     func makeUIView(context: Context) -> UITextView {
         let view = UITextView()
         view.font = .monospacedSystemFont(ofSize: 16, weight: .regular)
+        view.backgroundColor = .themeSurface
+        view.textColor = .themeText
+        view.tintColor = .themeAccent
+        view.keyboardAppearance = .dark
+        view.textContainerInset = UIEdgeInsets(top: 16, left: 14, bottom: 16, right: 14)
         view.autocapitalizationType = .none
         view.autocorrectionType = .no
         view.smartQuotesType = .no

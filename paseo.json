@@ -3,8 +3,14 @@
     "run-ipad": {
       "command": "scripts/deploy-ipad.sh"
     },
+    "check-ipad": {
+      "command": "scripts/check-ipad.sh"
+    },
+    "build-ios-core": {
+      "command": "scripts/build-ios-core.sh"
+    },
     "run-desktop": {
-      "command": "cargo run -r -p pendant"
+      "command": "scripts/run-desktop.sh"
     }
   }
 }

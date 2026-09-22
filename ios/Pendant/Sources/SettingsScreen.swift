@@ -17,44 +17,61 @@ struct SettingsScreen: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("sync") {
-                    LabeledContent("state", value: model.syncState)
-                    LabeledContent(
-                        "server",
-                        value: UserDefaults.standard.string(forKey: "serverURL") ?? "not set")
-                    if let alt = model.pairInfo?.alt, !alt.isEmpty {
-                        LabeledContent("also", value: alt.joined(separator: "\n"))
+                Section {
+                    LabeledContent("state") {
+                        HStack(spacing: 6) {
+                            StatusDot(color: SyncTone(model.syncState).color)
+                            Text(model.syncState)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
                     }
-                    LabeledContent("found nearby", value: model.discoveredURL ?? "no")
-                    LabeledContent(
+                    row(
+                        "server",
+                        UserDefaults.standard.string(forKey: "serverURL") ?? "not set")
+                    if let alt = model.pairInfo?.alt, !alt.isEmpty {
+                        row("also", alt.joined(separator: "\n"))
+                    }
+                    row("found nearby", model.discoveredURL ?? "no")
+                    row(
                         "fallback relay",
-                        value: UserDefaults.standard.string(forKey: "fallbackURL") ?? "none")
+                        UserDefaults.standard.string(forKey: "fallbackURL") ?? "none")
+                } header: {
+                    Caption("Sync")
                 }
 
-                Section("this device") {
-                    LabeledContent("name", value: UIDevice.current.name)
-                    LabeledContent("id", value: shortId(model.core.deviceId()))
-                        .font(.body.monospaced())
+                Section {
+                    row("name", UIDevice.current.name)
+                    row("id", shortId(model.core.deviceId()), mono: true)
+                } header: {
+                    Caption("This device")
                 }
 
-                Section("paired devices") {
+                Section {
                     if devices.isEmpty {
                         Text("no devices in this workspace yet")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(Theme.muted)
                     }
                     ForEach(devices, id: \.id) { device in
-                        HStack {
-                            VStack(alignment: .leading) {
+                        HStack(spacing: 12) {
+                            Image(systemName: icon(for: device.platform))
+                                .foregroundStyle(Theme.accent)
+                                .frame(width: 22)
+                            VStack(alignment: .leading, spacing: 2) {
                                 Text(device.name)
+                                    .foregroundStyle(Theme.text)
                                 Text("\(device.platform) · \(seen(device.lastSeenMs))")
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(Theme.muted)
                             }
                             Spacer()
                             if device.id == model.core.deviceId() {
                                 Text("this device")
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(Theme.muted)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 3)
+                                    .background(Capsule().fill(Theme.surfaceRaised))
                             }
                         }
                         .swipeActions(edge: .trailing) {
@@ -65,21 +82,25 @@ struct SettingsScreen: View {
                             }
                         }
                     }
+                } header: {
+                    Caption("Paired devices")
+                } footer: {
                     if devices.count > 1 {
                         Text("swipe a device to remove it; it re-appears if it reconnects")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(Theme.muted)
                     }
                 }
 
                 if let uri = model.pairURI {
-                    Section("pair a new device") {
+                    Section {
                         PairScreen(uri: uri)
                             .frame(maxWidth: .infinity)
+                    } header: {
+                        Caption("Pair a new device")
                     }
                 }
 
-                Section("join another workspace") {
+                Section {
                     Button {
                         showScanner = true
                     } label: {
@@ -91,7 +112,7 @@ struct SettingsScreen: View {
                         .textInputAutocapitalization(.never)
                         .font(.body.monospaced())
                         .accessibilityIdentifier("joinURI")
-                    Button("join") {
+                    Button {
                         if model.adoptPair(uri: joinURI) {
                             joinFailed = false
                             joinURI = ""
@@ -99,17 +120,27 @@ struct SettingsScreen: View {
                         } else {
                             joinFailed = true
                         }
+                    } label: {
+                        Text("join")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
                     }
+                    .buttonStyle(.borderedProminent)
                     .disabled(joinURI.isEmpty)
                     .accessibilityIdentifier("joinWorkspace")
                     if joinFailed {
                         Text("not a valid pairing URI")
                             .font(.caption)
-                            .foregroundStyle(.red)
+                            .foregroundStyle(Theme.danger)
                     }
+                } header: {
+                    Caption("Join another workspace")
                 }
             }
+            .scrollContentBackground(.hidden)
+            .background(Theme.bg)
             .navigationTitle("settings")
+            .toolbarBackground(Theme.bg, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("done") { dismiss() }
@@ -143,12 +174,31 @@ struct SettingsScreen: View {
                 }
             }
         }
+        .preferredColorScheme(.dark)
+        .tint(Theme.accent)
+    }
+
+    private func row(_ label: String, _ value: String, mono: Bool = false) -> some View {
+        LabeledContent(label) {
+            Text(value)
+                .font(mono ? .body.monospaced() : .body)
+                .foregroundStyle(Theme.muted)
+                .multilineTextAlignment(.trailing)
+                .textSelection(.enabled)
+        }
+    }
+
+    private func icon(for platform: String) -> String {
+        switch platform.lowercased() {
+        case "ios", "ipados", "ipad": "ipad"
+        case "macos", "linux", "windows", "desktop": "desktopcomputer"
+        default: "circle.hexagongrid"
+        }
     }
 
     private func refresh() {
         devices = model.devices()
     }
-
 
     private func shortId(_ id: String) -> String {
         String(id.prefix(8))

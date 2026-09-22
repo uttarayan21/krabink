@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Swift smoke test: build the host cdylib, generate Swift bindings, compile
-# scripts/smoke/main.swift against them and run it. macOS only (M6 gate).
+# scripts/smoke/main.swift against them and run it. Needs swiftc, so on
+# Linux it runs on the Mac build machine through scripts/on-mac.sh (M6 gate).
 set -euo pipefail
 
 if [[ "$(uname)" != "Darwin" ]]; then
-  echo "error: the Swift smoke test needs macOS (swiftc)" >&2
-  exit 1
+  exec "$(dirname "$0")/on-mac.sh" "$(basename "$0")" "$@"
 fi
 
 root=$(git rev-parse --show-toplevel)

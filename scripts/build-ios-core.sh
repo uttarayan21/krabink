@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Build the PendantCore XCFramework + generated Swift bindings for the iOS app.
-# macOS only (needs xcodebuild); run from anywhere inside the repo, ideally in
-# `nix develop` so the rust toolchain has the iOS targets.
+# Needs xcodebuild, so on Linux it runs on the Mac build machine through
+# scripts/on-mac.sh. Run from anywhere inside the repo; the rust toolchain
+# there needs the aarch64-apple-ios{,-sim} targets (rustup or `nix develop`).
 set -euo pipefail
 
 if [[ "$(uname)" != "Darwin" ]]; then
-  echo "error: iOS builds need macOS (xcodebuild)" >&2
-  exit 1
+  exec "$(dirname "$0")/on-mac.sh" "$(basename "$0")" "$@"
 fi
 
 root=$(git rev-parse --show-toplevel)

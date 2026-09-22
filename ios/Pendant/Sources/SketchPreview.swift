@@ -26,8 +26,11 @@ struct SketchPreview: UIViewRepresentable {
         view.isEditable = false
         view.isSelectable = true
         view.font = .systemFont(ofSize: 16)
+        view.backgroundColor = .themeSurface
+        view.textColor = .themeText
+        view.tintColor = .themeAccent
         view.accessibilityIdentifier = "preview"
-        view.textContainerInset = UIEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
+        view.textContainerInset = UIEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         let tap = UITapGestureRecognizer(
             target: context.coordinator, action: #selector(Coordinator.handleTap(_:)))
         view.addGestureRecognizer(tap)
@@ -108,7 +111,7 @@ struct SketchPreview: UIViewRepresentable {
                 string: s,
                 attributes: [
                     .font: UIFont.systemFont(ofSize: 16),
-                    .foregroundColor: UIColor.label,
+                    .foregroundColor: UIColor.themeText,
                 ])
         }
 
@@ -133,18 +136,19 @@ struct SketchPreview: UIViewRepresentable {
         }
 
         private func placeholder(size: CGSize) -> UIImage {
-            UIGraphicsImageRenderer(size: size).image { ctx in
-                UIColor.secondarySystemBackground.setFill()
-                ctx.fill(CGRect(origin: .zero, size: size))
-                UIColor.separator.setStroke()
-                let border = UIBezierPath(
+            UIGraphicsImageRenderer(size: size).image { _ in
+                let bg = UIBezierPath(
                     roundedRect: CGRect(origin: .zero, size: size).insetBy(dx: 1, dy: 1),
-                    cornerRadius: 8)
-                border.stroke()
+                    cornerRadius: Theme.radius)
+                UIColor.themeBg.setFill()
+                bg.fill()
+                UIColor.themeBorder.setStroke()
+                bg.lineWidth = 1
+                bg.stroke()
                 let label = "tap to sketch" as NSString
                 let attrs: [NSAttributedString.Key: Any] = [
                     .font: UIFont.systemFont(ofSize: 14),
-                    .foregroundColor: UIColor.secondaryLabel,
+                    .foregroundColor: UIColor.themeMuted,
                 ]
                 let ts = label.size(withAttributes: attrs)
                 label.draw(
@@ -157,14 +161,17 @@ struct SketchPreview: UIViewRepresentable {
             let inset: CGFloat = 6
             let size = CGSize(
                 width: image.size.width + inset * 2, height: image.size.height + inset * 2)
-            return UIGraphicsImageRenderer(size: size).image { ctx in
-                UIColor.paper.setFill()
-                ctx.fill(CGRect(origin: .zero, size: size))
-                UIColor.separator.setStroke()
-                let border = UIBezierPath(
+            // Paper-coloured tile with the card hairline, so the sketch
+            // sits inline on the preview like on the desktop.
+            return UIGraphicsImageRenderer(size: size).image { _ in
+                let tile = UIBezierPath(
                     roundedRect: CGRect(origin: .zero, size: size).insetBy(dx: 1, dy: 1),
-                    cornerRadius: 8)
-                border.stroke()
+                    cornerRadius: Theme.radius)
+                UIColor.paper.setFill()
+                tile.fill()
+                UIColor.themeBorder.setStroke()
+                tile.lineWidth = 1
+                tile.stroke()
                 image.draw(at: CGPoint(x: inset, y: inset))
             }
         }

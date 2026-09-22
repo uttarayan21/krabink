@@ -995,32 +995,61 @@ struct SketchScreen: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            HStack(spacing: 12) {
+                LogoMark(size: 22)
+                // Live counters: what the UI tests and on-device checks read.
                 Text("strokes=\(model.strokeCount) shapes=\(model.shapeCount) wetSent=\(model.wetSent) wetRecv=\(model.wetRecv) est=\(model.estUpdated) custom=\(model.customCount)")
-                    .font(.system(size: 13, design: .monospaced))
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(Theme.muted)
+                    .lineLimit(1)
                     .accessibilityIdentifier("sketchStatus")
                 Spacer()
                 if #unavailable(iOS 18.0) {
                     if let active = model.activeCustomBrush {
                         Text(BrushLibrary.shared.brush(id: active)?.name ?? active)
                             .font(.caption)
+                            .foregroundStyle(Theme.text)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 3)
-                            .background(Capsule().fill(Color.accentColor.opacity(0.2)))
+                            .background(Capsule().fill(Theme.accentSoft))
                             .accessibilityIdentifier("activeBrush")
                     }
-                    Button("brushes") { showBrushes = true }
-                        .accessibilityIdentifier("brushes")
-                        .sheet(isPresented: $showBrushes) { BrushSheet(model: model) }
+                    Button {
+                        showBrushes = true
+                    } label: {
+                        Label("brushes", systemImage: "paintbrush.pointed")
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("brushes")
+                    .sheet(isPresented: $showBrushes) { BrushSheet(model: model) }
                 }
-                Button("erase last") { model.eraseLast() }
-                    .accessibilityIdentifier("eraseLast")
-                Button("done") { done() }
-                    .accessibilityIdentifier("sketchDone")
+                Button {
+                    model.eraseLast()
+                } label: {
+                    Label("erase last", systemImage: "arrow.uturn.backward")
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("eraseLast")
+                Button {
+                    done()
+                } label: {
+                    Label("done", systemImage: "checkmark")
+                        .font(.subheadline.weight(.semibold))
+                }
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("sketchDone")
             }
-            .padding(8)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(Theme.sidebar)
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(Theme.border).frame(height: 1)
+            }
             SketchCanvas(model: model)
         }
+        .background(Theme.bg)
+        .preferredColorScheme(.dark)
+        .tint(Theme.accent)
     }
 }
 
