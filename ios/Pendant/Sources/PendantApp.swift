@@ -22,6 +22,10 @@ struct PendantApp: App {
                         // Scanned pairing QR / deep link: adopt server+token.
                         _ = model.adoptPair(uri: url.absoluteString)
                     }
+                    // Dark-only, like the desktop: the sketch paper is
+                    // pinned dark on both, so the chrome around it is too.
+                    .preferredColorScheme(.dark)
+                    .tint(Theme.accent)
             }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -54,10 +58,28 @@ struct ContentView: View {
 
     var body: some View {
         NavigationSplitView {
-            List(selection: $selection) {
+            sidebar
+        } detail: {
+            detail
+        }
+    }
+
+    // MARK: sidebar
+
+    private var sidebar: some View {
+        List(selection: $selection) {
+            if model.notes.isEmpty {
+                emptyLibrary
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+            }
+            Section {
                 ForEach(model.notes, id: \.id) { note in
-                    Text(note.title.isEmpty ? "untitled" : note.title)
+                    NoteRow(note: note, selected: selection.contains(note.id))
                         .tag(note.id)
+                        .listRowBackground(rowBackground(selected: selection.contains(note.id)))
+                        .listRowSeparator(.hidden)
+                        .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 2, trailing: 12))
                         .swipeActions {
                             Button("delete", role: .destructive) {
                                 selection.remove(note.id)
@@ -66,139 +88,194 @@ struct ContentView: View {
                             .accessibilityIdentifier("deleteNote")
                         }
                 }
-            }
-            .environment(\.editMode, $editMode)
-            .navigationTitle("pendant")
-            .toolbar {
-                if editMode.isEditing {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("done") {
-                            withAnimation {
-                                selection.removeAll()
-                                editMode = .inactive
-                            }
-                        }
-                        .accessibilityIdentifier("doneSelecting")
+            } header: {
+                if !model.notes.isEmpty {
+                    HStack {
+                        Caption("Notes")
+                        Spacer()
+                        Text("\(model.notes.count)")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(Theme.muted)
                     }
-                    ToolbarItem(placement: .primaryAction) {
-                        Button("delete (\(selection.count))", role: .destructive) {
-                            confirmBulkDelete = true
-                        }
-                        .disabled(selection.isEmpty)
-                        .accessibilityIdentifier("bulkDelete")
-                    }
-                } else {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button {
-                            withAnimation {
-                                selection.removeAll()
-                                editMode = .active
-                            }
-                        } label: {
-                            Image(systemName: "checkmark.circle")
-                        }
-                        .accessibilityIdentifier("selectNotes")
-                    }
-                    ToolbarItem(placement: .primaryAction) {
-                        Button {
-                            if let id = model.createNote() { selection = [id] }
-                        } label: {
-                            Image(systemName: "square.and.pencil")
-                        }
-                        .accessibilityIdentifier("newNote")
-                    }
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button {
-                            showSettings = true
-                        } label: {
-                            Image(systemName: "gearshape")
-                        }
-                        .accessibilityIdentifier("settings")
-                    }
+                    .padding(.horizontal, 4)
+                    .padding(.top, 4)
                 }
-            }
-            .alert(
-                "delete \(selection.count) note\(selection.count == 1 ? "" : "s")?",
-                isPresented: $confirmBulkDelete
-            ) {
-                Button("delete", role: .destructive) {
-                    confirmBulkDeleteFinal = true
-                }
-                Button("cancel", role: .cancel) {}
-            } message: {
-                Text("you will be asked to confirm once more.")
-            }
-            .alert(
-                "really delete \(selection.count) note\(selection.count == 1 ? "" : "s")?",
-                isPresented: $confirmBulkDeleteFinal
-            ) {
-                Button("delete forever", role: .destructive) {
-                    bulkDelete()
-                }
-                Button("cancel", role: .cancel) {}
-            } message: {
-                Text("this cannot be undone.")
-            }
-            .sheet(isPresented: $showSettings) {
-                SettingsScreen(model: model)
-            }
-            .safeAreaInset(edge: .bottom) {
-                Text(model.syncState)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .accessibilityIdentifier("syncState")
-                    .padding(.bottom, 4)
-            }
-        } detail: {
-            if selection.count == 1, let id = selection.first, let note = model.note(for: id) {
-                Group {
-                    if preview {
-                        SketchPreview(model: note) { sketchId in
-                            openSketch = SketchRef(id: sketchId)
-                        }
-                    } else {
-                        MarkdownTextView(model: note)
-                    }
-                }
-                .ignoresSafeArea(.keyboard, edges: .bottom)
-                .toolbar {
-                    ToolbarItem(placement: .primaryAction) {
-                        Button {
-                            preview.toggle()
-                        } label: {
-                            Image(systemName: preview ? "pencil" : "eye")
-                        }
-                        .accessibilityIdentifier("previewToggle")
-                    }
-                    ToolbarItem(placement: .primaryAction) {
-                        Menu("sketches") {
-                            ForEach(Array(note.sketchIds.enumerated()), id: \.element) {
-                                index, sketchId in
-                                Button("sketch \(index)") {
-                                    openSketch = SketchRef(id: sketchId)
-                                }
-                                .accessibilityIdentifier("sketch-\(index)")
-                            }
-                            Button("new sketch") {
-                                if let sketchId = note.createSketch() {
-                                    openSketch = SketchRef(id: sketchId)
-                                }
-                            }
-                            .accessibilityIdentifier("newSketch")
-                        }
-                        .accessibilityIdentifier("sketchMenu")
-                    }
-                }
-                .fullScreenCover(item: $openSketch) { ref in
-                    SketchScreen(model: note.sketch(for: ref.id)) {
-                        openSketch = nil
-                    }
-                }
-            } else {
-                Text("select or create a note")
-                    .foregroundStyle(.secondary)
             }
         }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .background(Theme.sidebar)
+        .environment(\.editMode, $editMode)
+        .navigationTitle("Pendant")
+        .toolbarBackground(Theme.sidebar, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
+        .toolbar { sidebarToolbar }
+        .alert(
+            "delete \(selection.count) note\(selection.count == 1 ? "" : "s")?",
+            isPresented: $confirmBulkDelete
+        ) {
+            Button("delete", role: .destructive) {
+                confirmBulkDeleteFinal = true
+            }
+            Button("cancel", role: .cancel) {}
+        } message: {
+            Text("you will be asked to confirm once more.")
+        }
+        .alert(
+            "really delete \(selection.count) note\(selection.count == 1 ? "" : "s")?",
+            isPresented: $confirmBulkDeleteFinal
+        ) {
+            Button("delete forever", role: .destructive) {
+                bulkDelete()
+            }
+            Button("cancel", role: .cancel) {}
+        } message: {
+            Text("this cannot be undone.")
+        }
+        .sheet(isPresented: $showSettings) {
+            SettingsScreen(model: model)
+        }
+        .safeAreaInset(edge: .bottom) {
+            syncFooter
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var sidebarToolbar: some ToolbarContent {
+        if editMode.isEditing {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("done") {
+                    withAnimation {
+                        selection.removeAll()
+                        editMode = .inactive
+                    }
+                }
+                .accessibilityIdentifier("doneSelecting")
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button("delete (\(selection.count))", role: .destructive) {
+                    confirmBulkDelete = true
+                }
+                .disabled(selection.isEmpty)
+                .accessibilityIdentifier("bulkDelete")
+            }
+        } else {
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    withAnimation {
+                        selection.removeAll()
+                        editMode = .active
+                    }
+                } label: {
+                    Image(systemName: "checkmark.circle")
+                }
+                .accessibilityIdentifier("selectNotes")
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    createNote()
+                } label: {
+                    Image(systemName: "square.and.pencil")
+                }
+                .accessibilityIdentifier("newNote")
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    showSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .accessibilityIdentifier("settings")
+            }
+        }
+    }
+
+    private func rowBackground(selected: Bool) -> some View {
+        RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
+            .fill(selected ? Theme.accentSoft : Color.clear)
+            .padding(.horizontal, 8)
+    }
+
+    private var emptyLibrary: some View {
+        VStack(spacing: 14) {
+            LogoMark(size: 48)
+            Text("No notes yet")
+                .font(.headline)
+                .foregroundStyle(Theme.text)
+            Text("Notes sync live with every paired device.")
+                .font(.footnote)
+                .foregroundStyle(Theme.muted)
+                .multilineTextAlignment(.center)
+            Button {
+                createNote()
+            } label: {
+                Label("Create a note", systemImage: "plus")
+                    .font(.subheadline.weight(.semibold))
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 32)
+    }
+
+    /// Full sync status, the text UI tests read (`syncState`).
+    private var syncFooter: some View {
+        let tone = SyncTone(model.syncState)
+        return HStack(spacing: 8) {
+            StatusDot(color: tone.color)
+            Text(model.syncState)
+                .font(.footnote)
+                .foregroundStyle(Theme.muted)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .accessibilityIdentifier("syncState")
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .card(fill: Theme.surface)
+        .padding(.horizontal, 12)
+        .padding(.bottom, 8)
+        .background(Theme.sidebar)
+    }
+
+    // MARK: detail
+
+    @ViewBuilder
+    private var detail: some View {
+        if selection.count == 1, let id = selection.first, let note = model.note(for: id) {
+            NoteDetail(
+                model: model, note: note, preview: $preview, openSketch: $openSketch)
+        } else {
+            emptyDetail
+        }
+    }
+
+    private var emptyDetail: some View {
+        VStack(spacing: 14) {
+            LogoMark(size: 56)
+            Text("select or create a note")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(Theme.text)
+            Text("Pick one from the list, or start fresh.")
+                .font(.footnote)
+                .foregroundStyle(Theme.muted)
+            Button {
+                createNote()
+            } label: {
+                Label("New note", systemImage: "square.and.pencil")
+                    .font(.subheadline.weight(.semibold))
+            }
+            .buttonStyle(.borderedProminent)
+            .padding(.top, 4)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.bg)
+        .toolbarBackground(Theme.bg, for: .navigationBar)
+    }
+
+    private func createNote() {
+        if let id = model.createNote() { selection = [id] }
     }
 
     private func bulkDelete() {
@@ -207,5 +284,127 @@ struct ContentView: View {
         }
         selection.removeAll()
         withAnimation { editMode = .inactive }
+    }
+}
+
+/// One line of the note list: title, when it last changed, an accent bar
+/// when selected.
+private struct NoteRow: View {
+    let note: NoteInfo
+    let selected: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(selected ? Theme.accent : Color.clear)
+                .frame(width: 3, height: 26)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(note.title.isEmpty ? "untitled" : note.title)
+                    .font(.body.weight(selected ? .semibold : .regular))
+                    .foregroundStyle(note.title.isEmpty ? Theme.muted : Theme.text)
+                    .lineLimit(1)
+                Text(updated)
+                    .font(.caption)
+                    .foregroundStyle(Theme.muted)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 6)
+        .padding(.horizontal, 6)
+        .contentShape(Rectangle())
+    }
+
+    private var updated: String {
+        guard note.updatedMs > 0 else { return "new" }
+        let date = Date(timeIntervalSince1970: TimeInterval(note.updatedMs) / 1000)
+        return date.formatted(.relative(presentation: .named))
+    }
+}
+
+/// Editor or preview for the selected note, on a card under a title header
+/// with the live-sync dot, matching the desktop layout.
+private struct NoteDetail: View {
+    let model: AppModel
+    let note: NoteModel
+    @SwiftUI.Binding var preview: Bool
+    @SwiftUI.Binding var openSketch: SketchRef?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            header
+            Group {
+                if preview {
+                    SketchPreview(model: note) { sketchId in
+                        openSketch = SketchRef(id: sketchId)
+                    }
+                } else {
+                    MarkdownTextView(model: note)
+                }
+            }
+            .card()
+            .padding(.horizontal, Theme.pagePadding)
+            .padding(.bottom, Theme.pagePadding)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.bg)
+        .ignoresSafeArea(.keyboard, edges: .bottom)
+        .toolbarBackground(Theme.bg, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    preview.toggle()
+                } label: {
+                    Label(preview ? "Edit" : "Preview", systemImage: preview ? "pencil" : "eye")
+                }
+                .accessibilityIdentifier("previewToggle")
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    ForEach(Array(note.sketchIds.enumerated()), id: \.element) {
+                        index, sketchId in
+                        Button("sketch \(index)") {
+                            openSketch = SketchRef(id: sketchId)
+                        }
+                        .accessibilityIdentifier("sketch-\(index)")
+                    }
+                    Button("new sketch") {
+                        if let sketchId = note.createSketch() {
+                            openSketch = SketchRef(id: sketchId)
+                        }
+                    }
+                    .accessibilityIdentifier("newSketch")
+                } label: {
+                    Label("sketches", systemImage: "scribble.variable")
+                }
+                .accessibilityIdentifier("sketchMenu")
+            }
+        }
+        .fullScreenCover(item: $openSketch) { ref in
+            SketchScreen(model: note.sketch(for: ref.id)) {
+                openSketch = nil
+            }
+        }
+    }
+
+    private var header: some View {
+        let tone = SyncTone(model.syncState)
+        let title = model.notes.first { $0.id == note.id }?.title ?? ""
+        return HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(title.isEmpty ? "untitled" : title)
+                .font(.title2.weight(.semibold))
+                .foregroundStyle(title.isEmpty ? Theme.muted : Theme.text)
+                .lineLimit(1)
+            Spacer()
+            HStack(spacing: 6) {
+                StatusDot(color: tone.color)
+                Text(tone.short)
+                    .font(.caption)
+                    .foregroundStyle(Theme.muted)
+            }
+            Caption(preview ? "preview" : "markdown")
+        }
+        .padding(.horizontal, Theme.pagePadding + 4)
+        .padding(.top, 8)
     }
 }

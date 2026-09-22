@@ -372,12 +372,23 @@ nix flake check                              # clippy, fmt, toml-fmt, audit, den
 cargo run -p pendant                         # desktop with embedded relay
 cargo run -p pendant-server -- --listen 127.0.0.1:8722 --db relay.redb --token demo
 
-scripts/build-ios-core.sh                    # macOS: xcframework + Pendant.swift
-scripts/swift-smoke.sh                       # macOS: bindings smoke
-cd ios/Pendant && nix run nixpkgs#xcodegen   # regenerate Pendant.xcodeproj
+scripts/build-ios-core.sh                    # xcframework + Pendant.swift
+scripts/swift-smoke.sh                       # bindings smoke
+scripts/check-ipad.sh                        # simulator compile, no signing
+scripts/deploy-ipad.sh                       # device build + install + launch (paseo: run-ipad)
+scripts/gen-xcodeproj.sh                     # regenerate Pendant.xcodeproj from project.yml
 xcodebuild -project Pendant.xcodeproj -scheme Pendant -destination 'platform=iOS Simulator,id=<udid>' build-for-testing
 PENDANT_TEST_SERVER=ws://127.0.0.1:8722/ws PENDANT_TEST_TOKEN=demo xcodebuild test-without-building ... -only-testing:PendantUITests/SketchUITests
 ```
+
+The iOS scripts need Xcode. Run on Linux, each one hands itself to the Mac
+build machine through `scripts/on-mac.sh`: the worktree is mirrored with
+rsync to `~/Porject/pendant-<worktree>` on `shiro` (one folder per
+worktree, `PENDANT_MAC_HOST` / `PENDANT_MAC_DIR` override) and the script
+runs there over ssh. Build artefacts stay on the Mac between runs. Device
+signing over ssh needs the keychains unlocked (`~/.keychain-pw` on the Mac,
+handled by `deploy-ipad.sh`) and a signed-in Xcode account for
+`-allowProvisioningUpdates`.
 
 Golden meshes pin ink geometry; the brush and shape corpora replay real
 iPad recordings; the marker UI test samples screenshot pixels. On-device

@@ -10,26 +10,33 @@ struct PairScreen: View {
 
     var body: some View {
         VStack(spacing: 16) {
-            Text("pair a device")
-                .font(.headline)
             if let image = qrImage(for: uri) {
+                // QR on a white tile: the app is dark, and scanners want
+                // dark modules on a light ground.
                 Image(uiImage: image)
                     .interpolation(.none)
                     .resizable()
                     .scaledToFit()
-                    .frame(maxWidth: 280)
+                    .frame(maxWidth: 240)
+                    .padding(14)
+                    .background(Color.white)
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.radius, style: .continuous))
+                    .shadow(color: .black.opacity(0.4), radius: 10, y: 4)
                     .accessibilityIdentifier("pairQR")
             }
             Text("scan with the other device's camera,\nor run: pendant pair '<uri>'")
                 .font(.footnote)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Theme.muted)
                 .multilineTextAlignment(.center)
             Text(uri)
                 .font(.caption.monospaced())
+                .foregroundStyle(Theme.muted)
+                .lineLimit(2)
+                .truncationMode(.middle)
                 .textSelection(.enabled)
                 .padding(.horizontal)
         }
-        .padding()
+        .padding(.vertical, 8)
     }
 
     private func qrImage(for uri: String) -> UIImage? {

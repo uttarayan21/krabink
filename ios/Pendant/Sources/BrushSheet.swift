@@ -18,24 +18,31 @@ struct BrushSheet: View {
                     model.pick(custom: brush)
                     dismiss()
                 } label: {
-                    HStack {
-                        Image(uiImage: BrushIcon.image(brush: brush, color: .label, width: 8))
+                    HStack(spacing: 12) {
+                        Image(uiImage: BrushIcon.image(brush: brush, color: .themeText, width: 8))
                             .resizable()
                             .scaledToFit()
                             .frame(width: 32, height: 48)
                         Text(brush.name)
+                            .foregroundStyle(Theme.text)
                         Spacer()
                         if model.activeCustomBrush == brush.id {
                             Image(systemName: "checkmark")
+                                .foregroundStyle(Theme.accent)
                         }
                     }
                 }
+                .listRowBackground(Theme.surface)
                 .accessibilityIdentifier("brush-\(brush.id)")
             }
+            .scrollContentBackground(.hidden)
+            .background(Theme.bg)
             .navigationTitle("Brushes")
             .toolbar {
                 Button("Done") { dismiss() }
             }
         }
+        .preferredColorScheme(.dark)
+        .tint(Theme.accent)
     }
 }
