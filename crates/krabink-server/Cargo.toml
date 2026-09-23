@@ -1,0 +1,26 @@
+[package]
+name = "krabink-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Krabink cloud server: iroh relay with workspace-token auth plus an always-on replica node"
+
+[dependencies]
+krabink-core.workspace = true
+krabink-local.workspace = true
+iroh.workspace = true
+iroh-relay = { workspace = true, features = ["server"] }
+rustls.workspace = true
+rustls-pki-types.workspace = true
+clap.workspace = true
+error-stack.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+krabink-local = { workspace = true, features = ["test-utils"] }

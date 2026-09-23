@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the PendantCore XCFramework + generated Swift bindings for the iOS app.
+# Build the KrabinkCore XCFramework + generated Swift bindings for the iOS app.
 # Needs xcodebuild, so on Linux it runs on the Mac build machine through
 # scripts/on-mac.sh. Run from anywhere inside the repo; the rust toolchain
 # there needs the aarch64-apple-ios{,-sim} targets (rustup or `nix develop`).
@@ -11,7 +11,7 @@ fi
 
 root=$(git rev-parse --show-toplevel)
 cd "$root"
-out="$root/ios/PendantCore"
+out="$root/ios/KrabinkCore"
 gen="$root/target/uniffi-ios"
 profile=release
 
@@ -32,29 +32,29 @@ for target in "${targets[@]}"; do
   # staticlib only: no link step, so the (macOS-targeting) nix cc-wrapper and
   # its libiconv never get involved. The cdylib crate-type would try to link
   # a per-target dylib nobody needs on iOS.
-  cargo rustc -p pendant-ffi --release --features ism --target "$target" --crate-type staticlib
+  cargo rustc -p krabink-ffi --release --features ism --target "$target" --crate-type staticlib
 done
 
 # Library-mode bindgen off one static lib (the metadata is target-independent).
 rm -rf "$gen"
 mkdir -p "$gen"
-cargo run -q -p pendant-ffi --features bindgen --bin uniffi-bindgen -- \
-  generate --library "target/${targets[0]}/$profile/libpendant_ffi.a" \
+cargo run -q -p krabink-ffi --features bindgen --bin uniffi-bindgen -- \
+  generate --library "target/${targets[0]}/$profile/libkrabink_ffi.a" \
   --language swift --out-dir "$gen"
 
 # XCFramework wants a headers dir with a `module.modulemap`.
 headers="$gen/include"
 mkdir -p "$headers"
-cp "$gen/pendantFFI.h" "$headers/"
-cp "$gen/pendantFFI.modulemap" "$headers/module.modulemap"
+cp "$gen/krabinkFFI.h" "$headers/"
+cp "$gen/krabinkFFI.modulemap" "$headers/module.modulemap"
 
-rm -rf "$out/PendantCoreFFI.xcframework"
+rm -rf "$out/KrabinkCoreFFI.xcframework"
 xcodebuild -create-xcframework \
-  -library "target/aarch64-apple-ios/$profile/libpendant_ffi.a" -headers "$headers" \
-  -library "target/aarch64-apple-ios-sim/$profile/libpendant_ffi.a" -headers "$headers" \
-  -output "$out/PendantCoreFFI.xcframework"
+  -library "target/aarch64-apple-ios/$profile/libkrabink_ffi.a" -headers "$headers" \
+  -library "target/aarch64-apple-ios-sim/$profile/libkrabink_ffi.a" -headers "$headers" \
+  -output "$out/KrabinkCoreFFI.xcframework"
 
-mkdir -p "$out/Sources/PendantCore"
-cp "$gen/pendant.swift" "$out/Sources/PendantCore/Pendant.swift"
+mkdir -p "$out/Sources/KrabinkCore"
+cp "$gen/krabink.swift" "$out/Sources/KrabinkCore/Krabink.swift"
 
-echo "PendantCore ready: $out"
+echo "KrabinkCore ready: $out"

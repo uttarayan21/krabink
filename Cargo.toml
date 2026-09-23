@@ -37,9 +37,9 @@ proptest = "1"
 tempfile = "3"
 uniffi = "0.32"
 lyon_tessellation = "1.0"
-pendant-core = { path = "crates/pendant-core" }
-pendant-server = { path = "crates/pendant-server" }
-pendant-local = { path = "crates/pendant-local" }
+krabink-core = { path = "crates/krabink-core" }
+krabink-server = { path = "crates/krabink-server" }
+krabink-local = { path = "crates/krabink-local" }
 iroh = "1.2"
 iroh-relay = "1.2"
 if-addrs = "0.15"

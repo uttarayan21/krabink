@@ -1,4 +1,4 @@
-# Brush engine: stamp/texture brushes for Pendant
+# Brush engine: stamp/texture brushes for Krabink
 
 Status: P0–P4 implemented (notes at the end). P4's decision: the EMA model ships, ISM stays a feature-gated trial.
 
@@ -11,7 +11,7 @@ Ink today is "tool → width → lyon round-join mesh → flat colour". Only the
 - **Tools that matter:** pen, pencil (tilt + grain), marker/highlighter (chisel, translucent), fountain/calligraphy (nib + roll). All four.
 - **Desktop parity:** lockstep. Every phase ships the Metal (iOS) and WGSL (bevy desktop) renderer together; core is the single source of truth.
 
-Guiding rule: **every renderer draws from the same core output**. The live tail, the wet ink another device receives, the committed stroke, the thumbnail and the SVG export all run the same pure fold in `pendant-core`.
+Guiding rule: **every renderer draws from the same core output**. The live tail, the wet ink another device receives, the committed stroke, the thumbnail and the SVG export all run the same pure fold in `krabink-core`.
 
 ## Research digest (what other apps do)
 
@@ -33,12 +33,12 @@ Sources: Google Ink headers (`ink/brush/brush_tip.h`, `brush_behavior.h`, `brush
 
 ## Current pipeline (verified, for reference)
 
-- `crates/pendant-core/src/brush.rs`: `RawSample{x,y,force,t_ms,tilt}`, `BrushParams` per tool (only Pen has thinning 0.5 + end taper), width formula `size·(1+(force−1)·thinning)·(1−thinning·0.5·clamp(speed/speed_ref))·lead_in` floored at `size·min_width`; positional EMA streamline, speed EMA, `min_distance` drop; `State` is `Copy` so `predict()` clones; `finish()` lands on last raw + end taper; `point()` writes `size: Some(PointSize{w,h})` with `h == w`.
-- `crates/pendant-core/src/geom.rs`: `stroke_mesh` → lyon `StrokeTessellator` with variable width attribute, round caps/joins, **position-only** vertices; `nib_ribbon` for `Tool::Brush` (θ = azimuth + roll, no caps, altitude unused). `StrokeMesh{positions, indices}`. `DEFAULT_TOLERANCE = 0.25`.
-- `crates/pendant-core/src/stroke.rs`: `StrokePoint{x,y,force,t_ms,tilt{azimuth,altitude,roll},size}`; `Tool{Pen,Marker,Monoline,Brush}`; `Stroke{id,tool,color,base_width,kind,points,created_ms}`; postcard `ChunkRepr` (+V1 compat). Loro keys (`note.rs`): `id, elem, tool, color, width, kind, created, points`.
+- `crates/krabink-core/src/brush.rs`: `RawSample{x,y,force,t_ms,tilt}`, `BrushParams` per tool (only Pen has thinning 0.5 + end taper), width formula `size·(1+(force−1)·thinning)·(1−thinning·0.5·clamp(speed/speed_ref))·lead_in` floored at `size·min_width`; positional EMA streamline, speed EMA, `min_distance` drop; `State` is `Copy` so `predict()` clones; `finish()` lands on last raw + end taper; `point()` writes `size: Some(PointSize{w,h})` with `h == w`.
+- `crates/krabink-core/src/geom.rs`: `stroke_mesh` → lyon `StrokeTessellator` with variable width attribute, round caps/joins, **position-only** vertices; `nib_ribbon` for `Tool::Brush` (θ = azimuth + roll, no caps, altitude unused). `StrokeMesh{positions, indices}`. `DEFAULT_TOLERANCE = 0.25`.
+- `crates/krabink-core/src/stroke.rs`: `StrokePoint{x,y,force,t_ms,tilt{azimuth,altitude,roll},size}`; `Tool{Pen,Marker,Monoline,Brush}`; `Stroke{id,tool,color,base_width,kind,points,created_ms}`; postcard `ChunkRepr` (+V1 compat). Loro keys (`note.rs`): `id, elem, tool, color, width, kind, created, points`.
 - `wetink.rs`: `WetPoint{x,y,force,width?,nib?}`, `WetInk::Begin{tool,color,base_width}`.
 - iOS `InkRenderer.swift`: `InkVertex{float2 pos, uchar4 colour}`, one pipeline, straight-alpha blend, MSAA 4, all committed strokes in one batched draw, wet/live separate buffers, zoom tolerance buckets. `Shaders.metal`: passthrough. `SketchScreen.swift`: force clamped ≤ 1, tilt (azimuth/altitude/roll) for pencil, coalesced + predicted touches, **no** estimated-property updates.
-- Desktop `crates/pendant/src/sketch.rs`: bevy `Mesh` position-only + `ColorMaterial` per element, no zoom buckets.
+- Desktop `crates/krabink/src/sketch.rs`: bevy `Mesh` position-only + `ColorMaterial` per element, no zoom buckets.
 - FFI `IndexedMesh{positions: Vec<f32>, indices}`.
 
 ## Architecture
@@ -60,7 +60,7 @@ raw samples ─► 1. InputModel (Ema | Ism) ─► StrokePoint[] {x,y,force,t_m
 
 Stages 2 and 3 consume only `StrokePoint`s, never raw samples. Speed is derived from emitted points' `t_ms`. All randomness is `Pcg32(seed = low 32 bits of the stroke ULID, stream = point/dab index)`, so an incremental live build produces the same dabs as the batch and every device draws the same stroke. Determinism contract: bit-exact within one binary; within 1e-4 canvas units across platforms (libm ulps).
 
-## Core design (`crates/pendant-core`)
+## Core design (`crates/krabink-core`)
 
 ### Brush definition
 
@@ -142,13 +142,13 @@ pub enum Modeler { Ema(EmaModel), Ism(IsmModel) }   // Ism behind cargo feature 
 ### Core tests
 
 - `same_inputs_same_bytes` (bit-exact), `live_equals_committed` (point-by-point fold == whole-slice fold, same dabs), translation equivariance (multiples of 1/8), rotation equivariance for round Motion tips, `discard_overlap_polygon_never_darkens`, `SpecRepr` round trip + unknown version tolerated, tolerant `read_stroke` (unknown tool / missing spec / bad bytes), `size_none_for_new_strokes`, dab count bounded / spacing floor / zero-length stroke = one dab, legacy baked-size parity.
-- Golden meshes `tests/golden/*.txt` (FNV hash + vertex count; `PENDANT_UPDATE_GOLDEN=1`); cross-platform compare at 1e-4.
+- Golden meshes `tests/golden/*.txt` (FNV hash + vertex count; `KRABINK_UPDATE_GOLDEN=1`); cross-platform compare at 1e-4.
 - Corpus `tests/corpus/brush/*.txt` (line `x y force t_ms [azimuth altitude roll]`, header `# tool: pencil size: 3`), `tests/brush_corpus.rs` prints jitter / lag / overshoot / point count per model; `examples/replay.rs` writes SVG side-by-sides.
-- `cargo mutants -f crates/pendant-core/src/brush/*.rs -f crates/pendant-core/src/geom/*.rs` per phase.
+- `cargo mutants -f crates/krabink-core/src/brush/*.rs -f crates/krabink-core/src/geom/*.rs` per phase.
 
 ### Core files
 
-`src/brush/{mod,input,dynamics,spec,rng,ism}.rs`, `src/geom/{mod,mesh,continuous,nib,stamps,outline}.rs`, `stroke.rs`, `element.rs`, `note.rs`, `wetink.rs`, `export.rs`, `workspace.rs` (P3), `lib.rs`, `tests/brush_corpus.rs`, `tests/corpus/brush/`, `tests/golden/`, `examples/replay.rs`, `Cargo.toml` (`ism` feature). FFI: `crates/pendant-ffi/src/{brush,types,engine,lib}.rs`.
+`src/brush/{mod,input,dynamics,spec,rng,ism}.rs`, `src/geom/{mod,mesh,continuous,nib,stamps,outline}.rs`, `stroke.rs`, `element.rs`, `note.rs`, `wetink.rs`, `export.rs`, `workspace.rs` (P3), `lib.rs`, `tests/brush_corpus.rs`, `tests/corpus/brush/`, `tests/golden/`, `examples/replay.rs`, `Cargo.toml` (`ism` feature). FFI: `crates/krabink-ffi/src/{brush,types,engine,lib}.rs`.
 
 ## Input, tool UX, wire, migration (iOS + desktop)
 
@@ -211,14 +211,14 @@ FFI: `NoteListener.wetPoints(stroke, sentMs, points: [StrokePoint])`, `NoteSessi
 ### Migration
 
 - Old strokes: `size: Some` → stage 2 override, dynamics skipped. `BSplineControl` flattening unchanged.
-- `Tool::Brush` → `Fountain` (`"brush"` read alias); Swift `.brush` → `.fountain`; `scripts/smoke/main.swift` and `crates/pendant-ffi/tests/engine.rs` follow the new wet/mesh signatures. UI tests reference no tool names (verified).
+- `Tool::Brush` → `Fountain` (`"brush"` read alias); Swift `.brush` → `.fountain`; `scripts/smoke/main.swift` and `crates/krabink-ffi/tests/engine.rs` follow the new wet/mesh signatures. UI tests reference no tool names (verified).
 - `note.rs::read_stroke` tolerant to missing `brush`/`spec`; `add_stroke` writes them only when present. Regenerate the Xcode project (`xcodegen`) when Swift files are added; rebuild the xcframework with every FFI change.
 
 ### Tuning tooling
 
-- Recorder v2 (`-recordStrokes 1`): header `# pendant-stroke v2`, `# tool: pencil size: 3 color: … brush: preset`, `# device: … pencil: pro ios: … force: half-average zoom: …`, `# columns: x y force t_ms azimuth altitude roll est`; rows written after settling; `nan` tilt for non-pencil. Parser generalised into `pendant_core::corpus::parse` (4- or 7/8-column rows), reused by the shape harness, `tests/brush_corpus.rs` and the lab.
-- Desktop lab: `pendant brush-lab --corpus <file|dir> --presets pen,pencil,… --models ema,ism --out target/lab --png --svg --metrics`. Headless bevy (`ScheduleRunnerPlugin` + wgpu `RenderPlugin`), same `SketchScene` camera, `ink_mesh` and material as the app, one cell per (file × preset × model), `Readback::texture` → PNG; metrics (jitter = mean |Δ² pos|, lag = modelled-vs-raw distance at t, overshoot beyond raw end, point count, width variance, wall time) as a table + `metrics.json` with bounds checked in `tests/corpus/brush/metrics.json`.
-- iOS `-brushLab 1` (`PendantApp.swift`, like `-spike 1`): grid of presets drawn by `InkRenderer` from the same canned corpus stroke, EMA/ISM toggle, calibration page, "open canvas with recorder".
+- Recorder v2 (`-recordStrokes 1`): header `# krabink-stroke v2`, `# tool: pencil size: 3 color: … brush: preset`, `# device: … pencil: pro ios: … force: half-average zoom: …`, `# columns: x y force t_ms azimuth altitude roll est`; rows written after settling; `nan` tilt for non-pencil. Parser generalised into `krabink_core::corpus::parse` (4- or 7/8-column rows), reused by the shape harness, `tests/brush_corpus.rs` and the lab.
+- Desktop lab: `krabink brush-lab --corpus <file|dir> --presets pen,pencil,… --models ema,ism --out target/lab --png --svg --metrics`. Headless bevy (`ScheduleRunnerPlugin` + wgpu `RenderPlugin`), same `SketchScene` camera, `ink_mesh` and material as the app, one cell per (file × preset × model), `Readback::texture` → PNG; metrics (jitter = mean |Δ² pos|, lag = modelled-vs-raw distance at t, overshoot beyond raw end, point count, width variance, wall time) as a table + `metrics.json` with bounds checked in `tests/corpus/brush/metrics.json`.
+- iOS `-brushLab 1` (`KrabinkApp.swift`, like `-spike 1`): grid of presets drawn by `InkRenderer` from the same canned corpus stroke, EMA/ISM toggle, calibration page, "open canvas with recorder".
 
 ### Editing / eraser
 
@@ -301,7 +301,7 @@ fragment float4 ink_fragment(V2F in, constant Uniforms& u, constant StrokeStyle*
 }
 ```
 
-`value_noise` = bilinear interpolation of a u32 integer hash (pcg2d) of `floor(p) + seed`: bit-identical across Metal and WGSL. WGSL (`crates/pendant/src/ink.wgsl`, `embedded_asset!`) has the same body; vertex uses `mesh2d_functions::{get_world_from_local, mesh2d_position_local_to_clip, get_tag}`; bindings on the material group: styles storage (0), masks + sampler (1,2), grains + sampler (3,4), `InkParams{zoom}` uniform (5, 16-B padded). `discard` is allowed under `AlphaMode2d::Blend`.
+`value_noise` = bilinear interpolation of a u32 integer hash (pcg2d) of `floor(p) + seed`: bit-identical across Metal and WGSL. WGSL (`crates/krabink/src/ink.wgsl`, `embedded_asset!`) has the same body; vertex uses `mesh2d_functions::{get_world_from_local, mesh2d_position_local_to_clip, get_tag}`; bindings on the material group: styles storage (0), masks + sampler (1,2), grains + sampler (3,4), `InkParams{zoom}` uniform (5, 16-B padded). `discard` is allowed under `AlphaMode2d::Blend`.
 
 ```rust
 #[derive(Asset, AsBindGroup, Clone, TypePath)] #[bind_group_data(InkKey)]
@@ -312,7 +312,7 @@ pub struct InkMaterial {
     #[uniform(5)] pub params: InkParams,
     pub multiply: bool, pub discard: bool,
 }
-impl Material2d for InkMaterial { /* vertex/fragment "embedded://pendant/ink.wgsl", alpha_mode Blend, specialize: vertex buffers (position, Ink_Uv, Ink_Opacity), blend per key, depth write + compare per key */ }
+impl Material2d for InkMaterial { /* vertex/fragment "embedded://krabink/ink.wgsl", alpha_mode Blend, specialize: vertex buffers (position, Ink_Uv, Ink_Opacity), blend per key, depth write + compare per key */ }
 ```
 
 Confirm in P1's first hour that `#[storage(0, read_only)]` accepts `Handle<ShaderStorageBuffer>` on 0.19.1.
@@ -320,7 +320,7 @@ Confirm in P1's first hour that `#[storage(0, read_only)]` accepts `Handle<Shade
 ### Buffers, assets, samplers
 
 - Metal `GPUGeometry` → `{vertices, strokeIndex, indices, styles, runs}` with today's geometric growth/reuse; wet and live own one-entry style buffers. `rebuildBatch()` on `batchDirty` only.
-- `InkAssets`: two `r8Unorm` mipmapped 2D texture arrays, `masks` (256², clamp) and `grains` (512², repeat), from bundled stacked PNGs `ios/Pendant/Resources/ink/{masks,grains}.png` (add `resources:` in `project.yml`) via `MTKTextureLoader` → blit slices → `generateMipmaps`; two samplers `clampMip`, `repeatMip`. `assetId → layer` table shared with core asset ids. bevy: same PNGs via `include_bytes!` → `Image::from_buffer` → `reinterpret_stacked_2d_as_array`, `ImageSampler::Descriptor` (repeat / clamp, linear mips), `usage |= TEXTURE_BINDING`; CPU box-filter mips if the loader does not generate them (shared ~40-line helper).
+- `InkAssets`: two `r8Unorm` mipmapped 2D texture arrays, `masks` (256², clamp) and `grains` (512², repeat), from bundled stacked PNGs `ios/Krabink/Resources/ink/{masks,grains}.png` (add `resources:` in `project.yml`) via `MTKTextureLoader` → blit slices → `generateMipmaps`; two samplers `clampMip`, `repeatMip`. `assetId → layer` table shared with core asset ids. bevy: same PNGs via `include_bytes!` → `Image::from_buffer` → `reinterpret_stacked_2d_as_array`, `ImageSampler::Descriptor` (repeat / clamp, linear mips), `usage |= TEXTURE_BINDING`; CPU box-filter mips if the loader does not generate them (shared ~40-line helper).
 - bevy style storage: `Assets<ShaderStorageBuffer>` per sketch, stable index per element via a free-list in `SketchScene`, rewritten on element diff.
 
 ### Zoom
@@ -337,7 +337,7 @@ CoreGraphics cannot do masks, grain, linear multiply or Discard. New `InkRendere
 
 ### Rendering files
 
-`ios/Pendant/Sources/InkRenderer.swift`, `Shaders.metal`, `SketchScreen.swift` (MTKView formats), `SketchPreview.swift`, new `InkAssets.swift`, `ios/Pendant/Resources/ink/*.png`, `project.yml`; `crates/pendant/src/sketch.rs`, new `ink_material.rs`, `ink.wgsl`; `crates/pendant-ffi/src/brush.rs` (`InkMesh` + `zoom_independent`).
+`ios/Krabink/Sources/InkRenderer.swift`, `Shaders.metal`, `SketchScreen.swift` (MTKView formats), `SketchPreview.swift`, new `InkAssets.swift`, `ios/Krabink/Resources/ink/*.png`, `project.yml`; `crates/krabink/src/sketch.rs`, new `ink_material.rs`, `ink.wgsl`; `crates/krabink-ffi/src/brush.rs` (`InkMesh` + `zoom_independent`).
 
 ## Phases (each ships core + FFI + iOS + desktop together)
 
@@ -347,16 +347,16 @@ CoreGraphics cannot do masks, grain, linear multiply or Discard. New `InkRendere
 | **P1** tip shapes, opacity, marker Discard | `BrushSpec` + presets, `Tool::{Pencil,Fountain}`, `Stroke.brush`, loro `brush`/`spec`, tolerant reader, nib ribbon with thickness + rectangle caps, `InkMesh`/`InkStyle`/`BrushRef` across FFI, `WetInk` v2 (Begin.spec, chunked points, End.tail), `outline_polygon` export, `BrushModeler.update/pending_estimates` | FFI rename + smoke/engine tests, `StrokeCodec` selection + K/A tables, `SketchModel.selection`, picker `toolItems` (iOS 18) + watercolor rule, force normalisation, always-on tilt, estimated properties + settling commit + `locals`, two-stream vertex + style buffer + runs, depth attachment + 2 depth states, Normal/Multiply PSOs, sRGB framebuffer + premultiplied, Metal thumbnails, recorder v2, `-brushLab` skeleton + calibration page | `InkMaterial` + `MeshTag` + storage buffer + `specialize`, `ink_mesh(brush, …)`, wet receiver on chunked points, replay rig | 4–5 core + 5 iOS + 3 desktop ≈ **12** |
 | **P2** pencil | tilt/pressure behaviours, `Grain{Noise, Canvas}` → `InkStyle`, hardness feather, corpus with tilt columns, `hover_dab_mesh`, `corpus.rs` parser, `tests/brush_corpus.rs` | hover recogniser + hover layer, pencil/crayon wiring, device recordings (6–8), settling UI test | Shape SDF mask + integer-hash noise in WGSL, `zoom_independent` | 2 core + 3 iOS + 1.5 desktop ≈ **6.5** |
 | **P3** stamps + custom brushes | `Emit::Stamped` dabs + PCG streams, `Mask::Image`/`GrainSource::Image`, workspace `brushes` + `assets` maps, library CRUD FFI, `LiveInk` delta, "Pencil (grainy)", `builtin:crayon` | `BrushLibrary`, `PKToolPickerCustomItem` + attribute view + icon provider + `UserDefaults`, iOS 17 `BrushSheet` + status pill, asset import (greyscale PNG ≤ 64 KiB, content hash), receiver fallback + re-render on asset arrival, texture arrays + mips + samplers, `GPUGeometry.append/truncate`, stamped thumbnails, round-trip UI test | texture arrays + mips, asset resolver, library sync | 4–5 core + 7 iOS + 2.5 desktop ≈ **14** |
-| **P4** ISM trial | `IsmModel` behind `ism` feature, corpus metrics, decision memo in `docs/plans/brush-engine.md` | `-brushLab` EMA/ISM toggle, ISM tilt mapping, corpus replay on device | `pendant brush-lab` headless CLI (PNG/SVG grid, `metrics.json`), `--dump-sketch` | 2–3 core + 1 iOS + 2 desktop ≈ **5.5** |
+| **P4** ISM trial | `IsmModel` behind `ism` feature, corpus metrics, decision memo in `docs/plans/brush-engine.md` | `-brushLab` EMA/ISM toggle, ISM tilt mapping, corpus replay on device | `krabink brush-lab` headless CLI (PNG/SVG grid, `metrics.json`), `--dump-sketch` | 2–3 core + 1 iOS + 2 desktop ≈ **5.5** |
 
 Total ≈ 40 working days. P0+P1 is the first shippable slice (proper highlighter, chisel, calligraphy caps, no self-darkening, parity fix on iOS colour space).
 
 ## Verification
 
-- **Core:** `cargo test --workspace`, clippy `-D warnings`, fmt, ast-grep rust rules on new files, `cargo mutants -f crates/pendant-core/src/brush/*.rs -f crates/pendant-core/src/geom/*.rs` per phase (install `cargo-mutants`). Golden meshes; corpus metrics bounds; `same_inputs_same_bytes`; `live_equals_committed`; P0 parity within 1e-4.
-- **FFI/Swift:** `cargo test -p pendant-ffi` (relay test with the new wet signatures), `scripts/swift-smoke.sh`, `scripts/build-ios-core.sh`, `xcodegen generate` when Swift files change.
-- **iOS simulator:** existing UI tests unchanged (relay `pendant-server --listen 127.0.0.1:8722 --db … --token demo`, `PENDANT_TEST_SERVER`/`PENDANT_TEST_TOKEN`, arm64 destination per memory) plus `testMarkerSelfOverlapDoesNotDarken` (figure-eight drag, centre-pixel check), `testEstimateUpdateDoesNotDuplicateStroke`, calibration test (log-only until first values are committed), P3 `testCustomBrushStrokeRoundTrips`; screenshots via `xcrun simctl io <udid> screenshot`.
-- **Desktop:** `pendant replay` on the desktop with chunked points; `--dump-sketch <id> <png>`; `scripts/ink-parity.sh` crops an iOS zoom-1 screenshot to the sketch bounds and `compare -metric RMSE` against the desktop PNG, threshold ≤ 1.5 %.
+- **Core:** `cargo test --workspace`, clippy `-D warnings`, fmt, ast-grep rust rules on new files, `cargo mutants -f crates/krabink-core/src/brush/*.rs -f crates/krabink-core/src/geom/*.rs` per phase (install `cargo-mutants`). Golden meshes; corpus metrics bounds; `same_inputs_same_bytes`; `live_equals_committed`; P0 parity within 1e-4.
+- **FFI/Swift:** `cargo test -p krabink-ffi` (relay test with the new wet signatures), `scripts/swift-smoke.sh`, `scripts/build-ios-core.sh`, `xcodegen generate` when Swift files change.
+- **iOS simulator:** existing UI tests unchanged (relay `krabink-server --listen 127.0.0.1:8722 --db … --token demo`, `KRABINK_TEST_SERVER`/`KRABINK_TEST_TOKEN`, arm64 destination per memory) plus `testMarkerSelfOverlapDoesNotDarken` (figure-eight drag, centre-pixel check), `testEstimateUpdateDoesNotDuplicateStroke`, calibration test (log-only until first values are committed), P3 `testCustomBrushStrokeRoundTrips`; screenshots via `xcrun simctl io <udid> screenshot`.
+- **Desktop:** `krabink replay` on the desktop with chunked points; `--dump-sketch <id> <png>`; `scripts/ink-parity.sh` crops an iOS zoom-1 screenshot to the sketch bounds and `compare -metric RMSE` against the desktop PNG, threshold ≤ 1.5 %.
 - **Device checklist per phase** (`devicectl` install + launch with console, per memory): first-frame log extended with tool/K/alpha; `est:` line at commit (late updates > 200 ms → implement `replaceStrokePoints` fallback); recorder v2 header; highlighter over pen shows multiply, self-crossing not darker; chisel/nib rotate with barrel roll live; hover dab on Pencil Pro; picker state survives relaunch; pinch-zoom on a page of stamped strokes does not re-tessellate.
 
 ## Risks and calls
@@ -371,7 +371,7 @@ Total ≈ 40 working days. P0+P1 is the first shippable slice (proper highlighte
 
 ### iOS / desktop files
 
-`ios/Pendant/Sources/SketchScreen.swift` (RawSample, recogniser phases, settling, selection, recorder v2, picker), `StrokeCodec.swift` (selection + tables), `InkRenderer.swift` (locals, hover layer, `InkMesh`), `AppModel.swift` (listener signatures, library), `SketchPreview.swift` (stamped thumbnails), `PendantApp.swift` (`-brushLab`); new `BrushLibrary.swift`, `BrushSheet.swift`, `BrushAttributesView.swift`, `BrushLabScreen.swift`, `AssetImport.swift`, `UITests/BrushLabUITests.swift`. Core/FFI/desktop: `wetink.rs`, `brush/*` (update/pending estimates), new `corpus.rs`, `tests/brush_corpus.rs`, `pendant-ffi/src/{brush,types,engine}.rs`, `pendant-ffi/tests/engine.rs`, `scripts/smoke/main.swift`, `crates/pendant/src/{sketch,cli,main,replay}.rs`, new `lab.rs`.
+`ios/Krabink/Sources/SketchScreen.swift` (RawSample, recogniser phases, settling, selection, recorder v2, picker), `StrokeCodec.swift` (selection + tables), `InkRenderer.swift` (locals, hover layer, `InkMesh`), `AppModel.swift` (listener signatures, library), `SketchPreview.swift` (stamped thumbnails), `KrabinkApp.swift` (`-brushLab`); new `BrushLibrary.swift`, `BrushSheet.swift`, `BrushAttributesView.swift`, `BrushLabScreen.swift`, `AssetImport.swift`, `UITests/BrushLabUITests.swift`. Core/FFI/desktop: `wetink.rs`, `brush/*` (update/pending estimates), new `corpus.rs`, `tests/brush_corpus.rs`, `krabink-ffi/src/{brush,types,engine}.rs`, `krabink-ffi/tests/engine.rs`, `scripts/smoke/main.swift`, `crates/krabink/src/{sketch,cli,main,replay}.rs`, new `lab.rs`.
 
 ## Implementation notes
 
@@ -379,7 +379,7 @@ Total ≈ 40 working days. P0+P1 is the first shippable slice (proper highlighte
 
 `brush.rs`/`geom.rs` split into `brush/{input,dynamics,spec}` and
 `geom/{mesh,continuous,nib,outline}` with a golden-mesh test
-(`tests/golden_mesh.rs`, `PENDANT_UPDATE_GOLDEN=1` to regenerate) pinning
+(`tests/golden_mesh.rs`, `KRABINK_UPDATE_GOLDEN=1` to regenerate) pinning
 the output.
 
 ### P1 (done, core `9394204`, iOS `b2fa99d`, desktop follows)
@@ -448,7 +448,7 @@ Core/FFI:
 - `Ink::hover_dab(x, y, tilt, tolerance)` / FFI `hover_dab_mesh`: the
   one-point mesh at force 0.5, a dot for round tips, the nib rectangle for
   oriented ones.
-- `pendant_core::corpus::parse` reads v1 (4 columns) and v2 (7/8 columns,
+- `krabink_core::corpus::parse` reads v1 (4 columns) and v2 (7/8 columns,
   `nan` tilt, `est` flag) recordings; the shape corpus uses it.
   `tests/corpus/brush/` holds fifteen iPad recordings with tilt and roll
   (six fountain, six pencil at size 45 with altitude 0.75–1.03 rad, one
@@ -639,7 +639,7 @@ Core:
   jitter, lag = distance to the raw sample nearest in time, deviation =
   distance to the raw polyline, overshoot, width range, vertices, µs) and
   `corpus::model_points`; `tests/brush_corpus.rs` measures every model the
-  build has and `PENDANT_METRICS_JSON=path` dumps the rows.
+  build has and `KRABINK_METRICS_JSON=path` dumps the rows.
 
 FFI/iOS/desktop:
 
@@ -652,7 +652,7 @@ FFI/iOS/desktop:
   copied into the app as `brush/`) through every model, raw path in grey
   under each, metrics line above; `-labPage 0|1|2` and `-labModel ema|ism`
   preselect. `testBrushLabReplaysCorpus` asserts both models report.
-- `pendant brush-lab --corpus <file|dir> [--presets self,pen,…,builtin:x]
+- `krabink brush-lab --corpus <file|dir> [--presets self,pen,…,builtin:x]
   [--models ema,ism] [--out dir] [--svg] [--metrics]` (desktop feature
   `ism` for the ISM row): one SVG grid per recording via
   `elements_to_svg` (columns presets, rows models, raw path under each) and
@@ -660,7 +660,7 @@ FFI/iOS/desktop:
   `--dump-sketch`; the SVG comes from the same outline code the export
   uses, which was enough to judge the models.
 
-Decision memo (fifteen iPad recordings, debug build, `PENDANT_METRICS_JSON`):
+Decision memo (fifteen iPad recordings, debug build, `KRABINK_METRICS_JSON`):
 
 | tool / stroke | model | points | jitter | lag | deviation | µs |
 |---|---|---|---|---|---|---|

@@ -1,4 +1,4 @@
-// Swift smoke test for the pendant-ffi bindings (run via swift-smoke.sh).
+// Swift smoke test for the krabink-ffi bindings (run via swift-smoke.sh).
 // Exercises the full local surface: create note, edit text, commit a stroke,
 // then reopen the store in a fresh Core and verify everything persisted.
 
@@ -139,6 +139,6 @@ func verifyPersisted(dir: String, ids: (note: String, sketch: String, stroke: St
 }
 
 let dir = FileManager.default.temporaryDirectory
-    .appendingPathComponent("pendant-smoke-\(UUID().uuidString)").path
+    .appendingPathComponent("krabink-smoke-\(UUID().uuidString)").path
 let ids = try createAndEdit(dir: dir)
 try verifyPersisted(dir: dir, ids: ids)

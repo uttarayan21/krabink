@@ -5161,6 +5161,104 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
+name = "krabink"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "bevy_egui",
+ "clap",
+ "clap_complete",
+ "directories",
+ "egui_commonmark",
+ "error-stack",
+ "gethostname 0.5.0",
+ "image",
+ "iroh",
+ "krabink-core",
+ "krabink-local",
+ "qrcode",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
+name = "krabink-core"
+version = "0.1.0"
+dependencies = [
+ "ink-stroke-modeler-rs",
+ "loro",
+ "lyon_tessellation",
+ "postcard",
+ "proptest",
+ "redb",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
+name = "krabink-ffi"
+version = "0.1.0"
+dependencies = [
+ "iroh",
+ "krabink-core",
+ "krabink-local",
+ "krabink-server",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "ulid",
+ "uniffi",
+]
+
+[[package]]
+name = "krabink-local"
+version = "0.1.0"
+dependencies = [
+ "error-stack",
+ "futures",
+ "hex",
+ "if-addrs",
+ "iroh",
+ "krabink-core",
+ "krabink-local",
+ "mdns-sd",
+ "postcard",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "krabink-server"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "error-stack",
+ "iroh",
+ "iroh-relay",
+ "krabink-core",
+ "krabink-local",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ktx2"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6798,104 +6896,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6305423e0e7738146434843d1694d621cce767262b2a86910beab705e4493d9"
 dependencies = [
  "base64ct",
-]
-
-[[package]]
-name = "pendant"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "bevy_egui",
- "clap",
- "clap_complete",
- "directories",
- "egui_commonmark",
- "error-stack",
- "gethostname 0.5.0",
- "image",
- "iroh",
- "pendant-core",
- "pendant-local",
- "qrcode",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "toml 0.9.12+spec-1.1.0",
- "tracing",
- "ulid",
-]
-
-[[package]]
-name = "pendant-core"
-version = "0.1.0"
-dependencies = [
- "ink-stroke-modeler-rs",
- "loro",
- "lyon_tessellation",
- "postcard",
- "proptest",
- "redb",
- "serde",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "ulid",
-]
-
-[[package]]
-name = "pendant-ffi"
-version = "0.1.0"
-dependencies = [
- "iroh",
- "pendant-core",
- "pendant-local",
- "pendant-server",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "ulid",
- "uniffi",
-]
-
-[[package]]
-name = "pendant-local"
-version = "0.1.0"
-dependencies = [
- "error-stack",
- "futures",
- "hex",
- "if-addrs",
- "iroh",
- "mdns-sd",
- "pendant-core",
- "pendant-local",
- "postcard",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "pendant-server"
-version = "0.1.0"
-dependencies = [
- "clap",
- "error-stack",
- "iroh",
- "iroh-relay",
- "pendant-core",
- "pendant-local",
- "rustls",
- "rustls-pki-types",
- "serde",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml 0.9.12+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

@@ -26,7 +26,7 @@ export RUST_LOG=${RUST_LOG:-info,loro_internal=warn,wgpu=error,naga=warn}
 
 # The toolchain's linker (`cc`) and Bevy's system libs come from the flake
 # devShell; paseo's env has neither, so enter the shell when needed.
-run=(cargo run -r -p pendant -- "$@")
+run=(cargo run -r -p krabink -- "$@")
 if ! command -v cc >/dev/null 2>&1; then
   if command -v direnv >/dev/null 2>&1; then
     run=(direnv exec . "${run[@]}")
