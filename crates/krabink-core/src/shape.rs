@@ -189,13 +189,16 @@ impl Shape {
     }
 }
 
-/// A pen point this close to a rectangle corner, as a fraction of the
-/// shorter side, pins both of the corner's sides.
+/// A pen point at a rectangle corner pins both of the corner's sides; the
+/// second side's pull fades to nothing this far from the corner, as a
+/// fraction of the shorter side.
 const CORNER_REACH: f32 = 0.08;
-/// Pen points closer than this fraction of the shape's shorter dimension
-/// (a loop's start and hold, typically) anchor as one point at their
+/// Ellipse pen points closer than this fraction of the shorter radius (a
+/// loop's start and hold, typically) anchor as one point at their
 /// midpoint: two points at slightly different radii cannot both lie on
-/// the outline without a large move.
+/// the outline without a large move. A rectangle takes both as they are:
+/// each pulls its own side, and pulls fade near corners, so there is no
+/// cut-off for a stroke's overshoot to fall either side of.
 const NEAR_PENS: f32 = 0.15;
 /// The largest shift anchoring may apply, as a fraction of the shape's
 /// size; beyond it the fit and the pen disagree and the fit stands.
@@ -205,8 +208,9 @@ impl Shape {
     /// The shape moved the least that makes its outline pass through
     /// where the pen landed and where it is held. A line simply runs
     /// between them and an arrow's tail sits on whichever it was drawn
-    /// from; a rectangle moves the side (or corner) each point is nearest
-    /// to; an ellipse keeps its size and angle and shifts its center. The
+    /// from; a rectangle moves the side each point is nearest to, and the
+    /// adjoining side as well the closer the point is to a corner; an
+    /// ellipse keeps its size and angle and shifts its center. The
     /// shape is returned unchanged when that would need a large move.
     fn anchored(self, pen_down: P, pen_now: P) -> Self {
         match self {
@@ -226,8 +230,7 @@ impl Shape {
                 center,
                 size,
                 angle,
-            } => anchor_rect(center, size, angle, &pen_points(pen_down, pen_now, size))
-                .unwrap_or(self),
+            } => anchor_rect(center, size, angle, &[pen_down, pen_now]).unwrap_or(self),
             Self::Ellipse {
                 center,
                 radii,
@@ -362,20 +365,26 @@ fn anchor_rect(center: P, size: P, angle: f32, pens: &[P]) -> Option<Shape> {
         if nearest_x.min(nearest_y) > limit {
             return None;
         }
-        let corner = nearest_x <= reach && nearest_y <= reach;
-        if corner || nearest_x <= nearest_y {
-            if to_x[0] <= to_x[1] {
-                lo[0] = q[0];
-            } else {
-                hi[0] = q[0];
-            }
+        // The nearer side always meets the pen. The other side follows
+        // too when the pen is at a corner, fading out over `reach` so a
+        // pen-down a hair either side of it gives nearly the same rect
+        // (a hard cut-off let one resampled corner flip a whole side).
+        let fade = |d: f32| (1.0 - d / reach).clamp(0.0, 1.0);
+        let (weight_x, weight_y) = if nearest_x <= nearest_y {
+            (1.0, fade(nearest_y))
+        } else {
+            (fade(nearest_x), 1.0)
+        };
+        let pull = |side: &mut f32, target: f32, weight: f32| *side += weight * (target - *side);
+        if to_x[0] <= to_x[1] {
+            pull(&mut lo[0], q[0], weight_x);
+        } else {
+            pull(&mut hi[0], q[0], weight_x);
         }
-        if corner || nearest_y < nearest_x {
-            if to_y[0] <= to_y[1] {
-                lo[1] = q[1];
-            } else {
-                hi[1] = q[1];
-            }
+        if to_y[0] <= to_y[1] {
+            pull(&mut lo[1], q[1], weight_y);
+        } else {
+            pull(&mut hi[1], q[1], weight_y);
         }
     }
     let size = sub(hi, lo);
@@ -1216,7 +1225,7 @@ fn fit_rect(
         angle = 0.0;
     }
     let frame: Vec<P> = v.iter().map(|p| rotate(*p, -angle)).collect();
-    let (lo, hi) = bbox(&frame)?;
+    let (lo, hi) = side_extents(ring, corners, &frame, angle).or_else(|| bbox(&frame))?;
     let mut size = sub(hi, lo);
     let center = rotate(mid(lo, hi), angle);
     if (size[0] - size[1]).abs() <= params.square_tolerance * size[0].max(size[1]) {
@@ -1249,6 +1258,40 @@ fn fit_rect(
     ))
 }
 
+/// A rectangle's extents in its own frame (rotated by `-angle`) from the
+/// ring points along each side: where each side's run lies, on average,
+/// across the side. Corner samples alone would do, but a corner picked a
+/// sample or two along a side moves that sample (and a tilted, axis-snapped
+/// rectangle's corners span more than its sides do), while a side's mean
+/// barely moves. `None` unless the sides split two by two across the frame.
+fn side_extents(ring: &[P], corners: &[usize], frame: &[P], angle: f32) -> Option<(P, P)> {
+    let n = ring.len();
+    let m = corners.len();
+    let (mut xs, mut ys) = (Vec::new(), Vec::new());
+    for i in 0..m {
+        let (from, to) = (*corners.get(i)?, *corners.get((i + 1) % m)?);
+        let steps = (to + n - from) % n;
+        // Interior samples only: the corners themselves round off.
+        let run: Vec<P> = (2..steps.saturating_sub(1))
+            .map(|k| rotate(cyclic(ring, from + k), -angle))
+            .collect();
+        if run.len() < 2 {
+            return None;
+        }
+        let sum = run.iter().fold([0.0, 0.0], |acc, p| add(acc, *p));
+        let mean = scale(sum, 1.0 / to_f32(run.len()));
+        let side = sub(*frame.get((i + 1) % m)?, *frame.get(i)?);
+        if side[0].abs() >= side[1].abs() {
+            ys.push(mean[1]);
+        } else {
+            xs.push(mean[0]);
+        }
+    }
+    let [x0, x1] = <[f32; 2]>::try_from(xs).ok()?;
+    let [y0, y1] = <[f32; 2]>::try_from(ys).ok()?;
+    Some(([x0.min(x1), y0.min(y1)], [x0.max(x1), y0.max(y1)]))
+}
+
 /// Ellipse from the ring's principal frame and extents.
 fn fit_ellipse(
     ring: &[P],
@@ -1258,7 +1301,7 @@ fn fit_ellipse(
 ) -> Option<(Shape, f32)> {
     // Up to two corners may be the tips of a pointed ellipse; the radial
     // fit and the straight-run test below tell those from a D or a lens.
-    if corners.len() > 2 {
+    if corner_clusters(corners, ring.len(), 2 * params.straw_window) > 2 {
         return None;
     }
     let (mean, mut angle) = pca(ring)?;
@@ -1304,6 +1347,24 @@ fn fit_ellipse(
         },
         worst,
     ))
+}
+
+/// How many distinct turns `corners` (ascending indices into a ring of
+/// `n`) mark, taking any within `span` samples of each other as one: the
+/// straw test resolves no finer, and a seam on a pointed tip can yield a
+/// pair a few samples apart.
+fn corner_clusters(corners: &[usize], n: usize, span: usize) -> usize {
+    let m = corners.len();
+    if m < 2 {
+        return m;
+    }
+    let far = (0..m)
+        .filter(|&i| {
+            let (a, b) = (corners[i], corners[(i + 1) % m]);
+            (b + n - a) % n > span
+        })
+        .count();
+    far.max(1)
 }
 
 /// Signed total turn around a ring, ±2π for a simple loop.

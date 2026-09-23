@@ -18,7 +18,7 @@ pub use brush::{
     StrokeEnd, StrokeMetrics, builtin_assets, builtin_brushes, ism_available, measure_recording,
     parse_recording,
 };
-pub use engine::{Core, CoreListener, NoteListener, NoteSession, KrabinkError};
+pub use engine::{Core, CoreListener, KrabinkError, NoteListener, NoteSession};
 pub use types::{
     Binding, BrushInfo, DeviceInfo, Element, NoteInfo, PairInfo, PeerInfo, PeerKind, Point2,
     PointKind, Recognition, Route, Shape, ShapeElement, Stroke, StrokePoint, SyncState, Tilt, Tool,
