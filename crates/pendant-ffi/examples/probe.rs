@@ -75,6 +75,9 @@ struct Args {
     add_stroke: bool,
     wet_watch: Option<Duration>,
     timeout: Duration,
+    /// Print the device registry as it changes, then exit; no note needed.
+    devices: bool,
+    register: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -86,6 +89,8 @@ fn parse_args() -> Args {
         add_stroke: false,
         wet_watch: None,
         timeout: Duration::from_secs(15),
+        devices: false,
+        register: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -98,6 +103,8 @@ fn parse_args() -> Args {
             "--add-stroke" => args.add_stroke = true,
             "--wet-watch" => args.wet_watch = Some(Duration::from_secs(value().parse().unwrap())),
             "--timeout-secs" => args.timeout = Duration::from_secs(value().parse().unwrap()),
+            "--devices" => args.devices = true,
+            "--register" => args.register = Some(value()),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -124,6 +131,32 @@ fn main() {
     let core = Core::new(dir.path().to_str().unwrap().into()).expect("core");
     let pair = parse_pair_uri(args.pair.clone()).expect("--pair is not a pendant://pair URI");
     core.set_pairing(pair).expect("pairing");
+
+    if args.devices {
+        if let Some(name) = &args.register {
+            core.register_device(name.clone(), "probe".into())
+                .expect("register");
+        }
+        wait_for("connection", args.timeout, || {
+            matches!(core.sync_state(), pendant_ffi::SyncState::Connected { .. }).then_some(())
+        });
+        println!("connected: {:?}", core.sync_state());
+        let deadline = Instant::now() + args.timeout;
+        let mut seen = Vec::new();
+        while Instant::now() < deadline {
+            let now: Vec<String> = core
+                .list_devices()
+                .into_iter()
+                .map(|d| format!("{} {:?} {}", d.id, d.name, d.platform))
+                .collect();
+            if now != seen {
+                seen = now;
+                println!("devices ({}): {seen:#?}", seen.len());
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        return;
+    }
 
     let newest = wait_for("a note in the workspace", args.timeout, || {
         core.list_notes().into_iter().next()

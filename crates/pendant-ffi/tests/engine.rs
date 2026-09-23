@@ -258,6 +258,28 @@ fn bad_ids_are_rejected() {
 
 /// Two cores on one machine, no relay: B scans A's QR (with a loopback
 /// address for the test) and connects straight to it.
+/// The device registry must flow both ways, including a row written
+/// before the connection is up (the app registers right after pairing).
+#[test]
+fn device_rows_converge_both_ways() {
+    let dir = tempfile::tempdir().unwrap();
+    let core_a = Core::new(dir.path().join("a").to_str().unwrap().into()).unwrap();
+    let core_b = Core::new(dir.path().join("b").to_str().unwrap().into()).unwrap();
+    // Registered straight after construction, before the in-process link
+    // has even finished its handshake, like the iPad's init -> adoptPair.
+    core_b.register_device("pad".into(), "ipad".into()).unwrap();
+    core_a.register_device("desk".into(), "linux".into()).unwrap();
+
+    let mut pair = core_a.pair_info();
+    pair.addrs = vec![format!("127.0.0.1:{}", core_a.bound_port().unwrap())];
+    core_b.set_pairing(pair).unwrap();
+    wait_for("B connects to A", || connected(&core_b.sync_state()));
+
+    let has = |core: &Core, id: &str| core.list_devices().iter().any(|d| d.id == id);
+    wait_for("B lists A", || has(&core_b, &core_a.device_id()));
+    wait_for("A lists B", || has(&core_a, &core_b.device_id()));
+}
+
 #[test]
 fn two_cores_converge_direct() {
     let dir = tempfile::tempdir().unwrap();

@@ -65,7 +65,11 @@
 
         src = let
           filterBySuffix = path: exts: lib.any (ext: lib.hasSuffix ext path) exts;
-          sourceFilters = path: type: (craneLib.filterCargoSources path type) || filterBySuffix path [".c" ".h" ".hpp" ".cpp" ".cc"];
+          # Beyond Rust sources: C shims, the brush textures pendant-core
+          # embeds with include_bytes!, the desktop WGSL shader, and the
+          # stroke corpora / golden meshes / proptest regressions the tests
+          # read from disk.
+          sourceFilters = path: type: (craneLib.filterCargoSources path type) || filterBySuffix path [".c" ".h" ".hpp" ".cpp" ".cc" ".png" ".wgsl" ".txt"];
         in
           lib.cleanSourceWith {
             filter = sourceFilters;

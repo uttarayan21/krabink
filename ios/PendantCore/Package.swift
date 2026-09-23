@@ -11,7 +11,13 @@ let package = Package(
         .library(name: "PendantCore", targets: ["PendantCore"])
     ],
     targets: [
-        .target(name: "PendantCore", dependencies: ["PendantCoreFFI"]),
+        // iroh (netdev, n0-dns-resolver) reads interfaces and DNS through
+        // SystemConfiguration; a static lib cannot pull the framework in itself.
+        .target(
+            name: "PendantCore",
+            dependencies: ["PendantCoreFFI"],
+            linkerSettings: [.linkedFramework("SystemConfiguration")]
+        ),
         .binaryTarget(name: "PendantCoreFFI", path: "PendantCoreFFI.xcframework"),
     ]
 )
