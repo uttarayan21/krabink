@@ -40,7 +40,7 @@ core: shape.rs (recognizer, Shape::outline) · element.rs (Element, ShapeElement
 render: Element::outline() → stroke_mesh (unchanged) → InkRenderer batch / bevy Mesh2d / SVG
 ```
 
-## Phase A: recognizer in core (`crates/pendant-core/src/shape.rs`, new)
+## Phase A: recognizer in core (`crates/krabink-core/src/shape.rs`, new)
 
 Reuse: `geom.rs::dedupe` (make `pub(crate)`), lift the point-to-segment
 distance from `geom.rs::hits` into `pub(crate) fn segment_distance2`,
@@ -139,16 +139,16 @@ Tests (in `shape.rs` `mod tests` + one integration test):
 - proptest: never panics; confidence in 0..=1; outline finite with the
   variant's length; rect/ellipse outline inside input bbox inflated 10%;
   translation/scale equivariance; determinism.
-- Corpus: `crates/pendant-core/tests/corpus/shapes/<name>.txt`, header
+- Corpus: `crates/krabink-core/tests/corpus/shapes/<name>.txt`, header
   `# expect: rect|ellipse|line|arrow|none`, `# tool: pen size: 4`, then `x y
   force t_ms` raw samples; `tests/shape_corpus.rs` replays each through
   `BrushModeler` and asserts the variant. Recorder: `-recordStrokes 1` launch
   arg makes `SketchModel.penMoved` append raw samples to a file in
   Documents (visible in Files); files are named and copied in by hand.
-- `cargo mutants -p pendant-core -f crates/pendant-core/src/shape.rs` after
+- `cargo mutants -p krabink-core -f crates/krabink-core/src/shape.rs` after
   tests (install cargo-mutants first; not present on this machine).
 
-## Phase B: element model + storage (`crates/pendant-core`)
+## Phase B: element model + storage (`crates/krabink-core`)
 
 - `ids.rs`: `ulid_id!(ElementId)`; `pub type StrokeId = ElementId` (one id
   space; wet-ink `stroke:` fields keep working for shapes).
@@ -176,12 +176,12 @@ Tests (in `shape.rs` `mod tests` + one integration test):
   stroke/shape/stroke keeps order on a replica; `elem: "hologram"` entry is
   skipped; `convergence.rs` gains `Op::AddShape` and asserts `elements()`.
 
-Load-bearing coupling: `crates/pendant-ffi/src/net.rs` `sketch_counts`
+Load-bearing coupling: `crates/krabink-ffi/src/net.rs` `sketch_counts`
 (~l.551) uses `strokes().len()` to decide whether to fire `strokes_changed`;
 switch it to `elements().len()` in the same commit or remote shapes never
 notify the iPad.
 
-## Phase C: FFI (`crates/pendant-ffi`)
+## Phase C: FFI (`crates/krabink-ffi`)
 
 - `types.rs`: `Point2 {x,y}` Record; `Shape` uniffi Enum with named fields
   (precedent: `SyncState::Connected { url }`); `Binding`, `ShapeElement`
@@ -209,7 +209,7 @@ notify the iPad.
   (`scripts/build-ios-core.sh`), extend `scripts/smoke/main.swift` with a
   recognize + finishShape round trip.
 
-## Phase D: iPad hold-to-snap (`ios/Pendant/Sources`)
+## Phase D: iPad hold-to-snap (`ios/Krabink/Sources`)
 
 - `SketchScreen.swift` `SketchModel`:
   - `LiveStroke` gains `snap: Recognition?` and `holdTask: Task?`.
@@ -239,7 +239,7 @@ notify the iPad.
   thenHoldForDuration:)`), assert the status label shows `shapes=1`
   (add a shape count to the status line next to `strokes=`).
 
-## Phase E: desktop (`crates/pendant/src/sketch.rs`)
+## Phase E: desktop (`crates/krabink/src/sketch.rs`)
 
 `note.strokes` → `note.elements`; bounds fold and `ink_mesh` over
 `el.outline()`; scene map keyed by `ElementId`. Wet replacement by id
@@ -270,14 +270,14 @@ notification.
 
 ## Verification
 
-- Core: `cargo test -p pendant-core` (unit + proptest + corpus), `cargo
+- Core: `cargo test -p krabink-core` (unit + proptest + corpus), `cargo
   clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
   `ast-grep scan -c "$(realpath ~/.claude/skills/rust/sgconfig.yml)"` on new
-  files, `cargo mutants -f crates/pendant-core/src/shape.rs`.
-- FFI: `cargo test -p pendant-ffi` (new shape sync test),
+  files, `cargo mutants -f crates/krabink-core/src/shape.rs`.
+- FFI: `cargo test -p krabink-ffi` (new shape sync test),
   `scripts/swift-smoke.sh`, `scripts/build-ios-core.sh`.
 - iPad simulator: `xcodegen generate`, build, run `SketchUITests` (new
-  rectangle-snap test + existing ones) against a local `pendant-server
+  rectangle-snap test + existing ones) against a local `krabink-server
   --token demo`.
 - Device: build with `DEVELOPMENT_TEAM=YD2FVR5QH2 -allowProvisioningUpdates`,
   `devicectl install/launch --console`; draw rect/ellipse/line/arrow, hold,
@@ -288,7 +288,7 @@ notification.
 
 ## Done
 
-- **A** `crates/pendant-core/src/shape.rs`: pipeline as designed. Two
+- **A** `crates/krabink-core/src/shape.rs`: pipeline as designed. Two
   deviations found by the synthetic tests: the hold-trim radius is
   `max(3 pt, 4 % of diag)` because the app judges stillness in screen points,
   so at low zoom a hold spans more canvas; and closure with overshoot uses

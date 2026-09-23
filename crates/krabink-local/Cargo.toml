@@ -1,0 +1,31 @@
+[package]
+name = "krabink-local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Krabink sync node: iroh endpoint, local doc store, peer mesh"
+
+[features]
+# Desktop-only LAN discovery (advertise + browse `_krabink._udp`).
+mdns = ["dep:mdns-sd", "dep:if-addrs"]
+# In-process test harness (an app over the local link); for integration tests.
+test-utils = ["dep:tempfile"]
+
+[dependencies]
+krabink-core.workspace = true
+iroh.workspace = true
+tokio.workspace = true
+postcard.workspace = true
+error-stack.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+hex.workspace = true
+futures.workspace = true
+mdns-sd = { workspace = true, optional = true }
+if-addrs = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+krabink-local = { path = ".", features = ["test-utils"] }
+iroh = { workspace = true, features = ["test-utils"] }

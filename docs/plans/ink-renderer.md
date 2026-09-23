@@ -16,7 +16,7 @@ model → own GPU renderer, wet and dry ink identical.
 ## Target architecture
 
 ```
-                 ┌───────────── pendant-core ─────────────┐
+                 ┌───────────── krabink-core ─────────────┐
 touches ──►  brush::Modeler  ──►  StrokePoint[]  ──►  tess::mesh  ──► Vec<Vertex>
  (UIKit /        smoothing,        (PolylineSample,      lyon variable
   bevy)          width model       existing schema)      width, round
@@ -34,7 +34,7 @@ triangles" step is per platform.
 
 ### Phase 0: core tessellation on lyon (Rust only, no UI change)
 
-Files: `crates/pendant-core/src/geom.rs` (split into `geom/flatten.rs`,
+Files: `crates/krabink-core/src/geom.rs` (split into `geom/flatten.rs`,
 `geom/tess.rs`), `Cargo.toml` workspace deps.
 
 1. Add `lyon_tessellation = "1.0"` + `lyon_path` (workspace dep). No `std`
@@ -93,7 +93,7 @@ Done (commit after `40278b2`). Decisions taken while implementing:
 
 ### Phase 1: brush model in core (input pipeline)
 
-Files: new `crates/pendant-core/src/brush.rs`, `wetink.rs`, FFI `types.rs`.
+Files: new `crates/krabink-core/src/brush.rs`, `wetink.rs`, FFI `types.rs`.
 
 1. `brush::Params` per `Tool`: `size`, `thinning` (speed → width), `smoothing`
    (streamline EMA factor), `taper_start/end`, `min_force`. Constants live in
@@ -157,7 +157,7 @@ Done (commit after `aa209b0`). Decisions taken while implementing:
 
 ### Phase 2: iPad – own canvas view (the big one)
 
-Files: `ios/Pendant/Sources/SketchScreen.swift` (rewrite), new
+Files: `ios/Krabink/Sources/SketchScreen.swift` (rewrite), new
 `InkRenderer.swift` (Metal), new `Shaders.metal`, `StrokeCodec.swift` (shrink),
 `project.yml` (add `.metal` to sources, it is picked up automatically by
 XcodeGen when under `Sources`).
@@ -265,7 +265,7 @@ Done (commit after `2ec5786`). Decisions taken while implementing:
 
 ### Phase 3: desktop parity
 
-Files: `crates/pendant/src/sketch.rs`.
+Files: `crates/krabink/src/sketch.rs`.
 
 1. `ribbon_mesh` → `stroke_mesh` (Phase 0 rename), tolerance from the
    sketch's render scale.

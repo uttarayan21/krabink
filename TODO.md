@@ -1,4 +1,4 @@
-# pendant — TODO
+# krabink — TODO
 
 All milestones M0–M6 (desktop/server/FFI) and iM0–iM5 (iPad) are committed.
 This file tracks the remaining backlog and the known debt logged during each
@@ -11,7 +11,7 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
       (`WetInk::Pointer`); still open: desktop mouse → iPad, who's editing
       text, per-device names on the pointer.
 - [ ] Shallow-snapshot GC (compact old CRDT history, bound store growth).
-- [ ] `pendant export` CLI (markdown + SVG assets bundle to disk).
+- [ ] `krabink export` CLI (markdown + SVG assets bundle to disk).
 - [ ] Config UI (relay URL / token) instead of launch args + UserDefaults.
 - [ ] Publish `{endpoint_id, relay}` in `DeviceMeta` so nodes dial every
       workspace device without pairwise QRs (today: scanner dials QR owner,
@@ -22,7 +22,7 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
 
 ### Sync / transport
 - [ ] Second redb on every device: the node mirrors docs in `node.redb`
-      next to the app's own store (`pendant.redb`). Accepted for now (idle
+      next to the app's own store (`krabink.redb`). Accepted for now (idle
       unload 300 s, compaction every 1000 updates); later make the FFI
       `State` and desktop `Docs` implement `DocProvider` directly.
 - [ ] Peer `Fatal` (bad token) is sticky until `set_peers` / `resume`; no
@@ -52,7 +52,7 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
 
 ### Core
 - [ ] `shape::tests::clean_shapes_are_recognised_equivariantly` fails on the
-      case proptest saved in `crates/pendant-core/proptest-regressions/shape.txt`
+      case proptest saved in `crates/krabink-core/proptest-regressions/shape.txt`
       (found 2026-09-22 while running the suite; `shape.rs` unchanged). A
       wide, shallow arc keeps its kind after scale + translate but its
       bounds drift ~10 units past the tolerance (`shape.rs:2388`).

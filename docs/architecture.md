@@ -1,9 +1,9 @@
-# Pendant sync architecture
+# Krabink sync architecture
 
 How desktops, iPads and the cloud relay fit together. Source of truth:
-`crates/pendant-local/src/{node,hub,outbound,inbound,serve,framing,mdns}.rs`,
-`crates/pendant-server/src/{relay,replica}.rs`, `crates/pendant/src/{node,sync}.rs`,
-`crates/pendant-ffi/src/{engine,net}.rs`, `crates/pendant-core/src/{sync,pair}.rs`.
+`crates/krabink-local/src/{node,hub,outbound,inbound,serve,framing,mdns}.rs`,
+`crates/krabink-server/src/{relay,replica}.rs`, `crates/krabink/src/{node,sync}.rs`,
+`crates/krabink-ffi/src/{engine,net}.rs`, `crates/krabink-core/src/{sync,pair}.rs`.
 For the whole stack and where each piece lives, see `docs/implementation.md`.
 
 ## 1. Topology: every device is a node, one relay in the cloud
@@ -12,30 +12,30 @@ For the whole stack and where each piece lives, see `docs/implementation.md`.
 flowchart TB
     subgraph LAN_A["Home LAN (NAT / nftables)"]
         direction TB
-        subgraph DA["Desktop A (pendant, Bevy)"]
+        subgraph DA["Desktop A (krabink, Bevy)"]
             direction LR
-            DA_app["Docs\nLoro CRDT + pendant.redb"]
-            DA_node["pendant-local Node\niroh Endpoint (node_key)\nHub: node.redb + peers + tokens"]
+            DA_app["Docs\nLoro CRDT + krabink.redb"]
+            DA_node["krabink-local Node\niroh Endpoint (node_key)\nHub: node.redb + peers + tokens"]
             DA_app <-- "LocalLink (channels)" --> DA_node
         end
-        subgraph IA["iPad A (Swift + pendant-ffi)"]
+        subgraph IA["iPad A (Swift + krabink-ffi)"]
             IA_app["Core / NoteSession"]
-            IA_node["pendant-local Node"]
+            IA_node["krabink-local Node"]
             IA_app <-- LocalLink --> IA_node
         end
         IA_node == "QUIC, direct (hole-punched or LAN)" ==> DA_node
     end
 
     subgraph WAN["Cloud host (static ip)"]
-        subgraph SRV["pendant-server (one binary)"]
+        subgraph SRV["krabink-server (one binary)"]
             RELAY["iroh relay\nhttps://relay.example.org\nTokenAccess: workspace tokens"]
             REPL["replica Node (Role::Replica)\nreplica.redb, pinned UDP port\nnever dials"]
         end
     end
 
     subgraph LAN_B["Office LAN"]
-        subgraph DB["Desktop B (pendant)"]
-            DB_node["pendant-local Node"]
+        subgraph DB["Desktop B (krabink)"]
+            DB_node["krabink-local Node"]
         end
         IB_node["iPad B Node"]
         IB_node ==> DB_node
@@ -53,7 +53,7 @@ flowchart TB
 
 Rules the diagram encodes:
 
-- **Every device runs one `pendant_local::Node`.** It owns an iroh
+- **Every device runs one `krabink_local::Node`.** It owns an iroh
   `Endpoint` (persisted `SecretKey` in `<data_dir>/node_key`; the
   `EndpointId` is the public key), a local mirror of every doc
   (`ServerDocs` over `node.redb`, separate from the app's own store) and a
@@ -67,14 +67,14 @@ Rules the diagram encodes:
   `ClientSession` over an in-process `LocalLink` (two unbounded channels).
   The node serves that link with the same `ServerSession` loop it uses for
   QUIC peers, so app code never sees a socket and never bridges anything.
-- **`pendant-server` is the relay plus a headless replica.** The relay is
+- **`krabink-server` is the relay plus a headless replica.** The relay is
   `iroh_relay::server::Server` gated by `TokenAccess` (the workspace
   tokens). The replica is an ordinary node with `Role::Replica`: it accepts
   every device with a valid token, mirrors every doc, never dials, has no
   local link and no mDNS, and pins its UDP port so its direct address
   survives restarts. It is what makes two LANs converge while one side is
   offline. Both live in one process; `--dev` runs plain HTTP on
-  `127.0.0.1:3340` and prints a ready `pendant://pair?…` URI.
+  `127.0.0.1:3340` and prints a ready `krabink://pair?…` URI.
 - **Who dials whom.** The device that scans a QR dials the QR's owner;
   everyone dials the replica when the pairing names one; the replica dials
   nobody. A node skips dialling a peer it already holds an inbound
@@ -88,20 +88,20 @@ Rules the diagram encodes:
   too (`RuntimeConfig::pair_token` decides which one its QR carries).
 - **Relay-less LAN still works.** Without a reachable relay iroh cannot
   learn a peer's addresses, so both platforms fall back to mDNS
-  (`_pendant._udp`, TXT `id=<EndpointId>`): the desktop advertises and
-  browses with `mdns-sd` (`pendant_local::mdns`), the iPad browses with
+  (`_krabink._udp`, TXT `id=<EndpointId>`): the desktop advertises and
+  browses with `mdns-sd` (`krabink_local::mdns`), the iPad browses with
   `NWBrowser` and resolves with a UDP `NWConnection` (`PeerDiscovery.swift`).
   A hit becomes `Node::add_addr_hint`, used on the next dial. With a relay
   up, iroh finds the LAN path by itself and mDNS is redundant.
 
 ## 2. Wire
 
-- ALPN `pendant/sync/1`, one QUIC connection per peer pair.
+- ALPN `krabink/sync/1`, one QUIC connection per peer pair.
 - The dialer opens two bidirectional streams ("lanes") and writes a
   one-byte tag on each: lane 0 docs (`Hello`, `Subscribe`, `Update`,
   catch-up), lane 1 ephemeral wet ink. After the tag both directions carry
   `u32` big-endian length-prefixed frames, each frame being exactly the
-  `[PROTO_VERSION][postcard]` bytes `pendant-core`'s `ClientMsg` /
+  `[PROTO_VERSION][postcard]` bytes `krabink-core`'s `ClientMsg` /
   `ServerMsg` encode. `MAX_FRAME` is 64 MiB; oversize disconnects.
 - Wet ink gets its own stream so a `Begin -> Points -> End` sequence stays
   ordered and reliable (QUIC datagrams are neither and are MTU-bound) but
@@ -117,7 +117,7 @@ sequenceDiagram
     participant P as iPad (ScanScreen)
     participant R as Relay + replica
     D->>D: PairInfo { node: <EndpointId>, token, relay?, addrs: direct_addrs(endpoint), replica? }
-    D->>D: render QR of pendant://pair?node=…&token=…[&relay=…][&addr=…]*[&replica=…]
+    D->>D: render QR of krabink://pair?node=…&token=…[&relay=…][&addr=…]*[&replica=…]
     P->>D: scan QR (camera)
     P->>P: parse_pair_uri, persist pairURI (UserDefaults)
     P->>P: Core::set_pairing: add_token, set_relay (rebind if changed), set_peers([desktop, replica?])
@@ -128,7 +128,7 @@ sequenceDiagram
     Note over D,P: both device rows now appear in the WorkspaceDoc device registry
 ```
 
-A second desktop joins with `pendant pair <uri>`, which writes `relay`,
+A second desktop joins with `krabink pair <uri>`, which writes `relay`,
 `token`, `replica` and a `[[peers]]` entry to `config.toml`; the next launch
 dials them. The in-app "join" paste box does the same live
 (`settings.rs::apply_adopted`). The QR of a joined device keeps pointing at
@@ -207,14 +207,14 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    subgraph core["pendant-core (sans-io)"]
+    subgraph core["krabink-core (sans-io)"]
         CS["ClientSession\nHello / Subscribe / Update / Ephemeral"]
         SS["ServerSession\nBroadcast (if changed) / Disconnect"]
         WS["WorkspaceDoc\nnotes + device registry"]
-        PAIR["pair.rs\nPairInfo v2 <-> pendant://pair URI"]
+        PAIR["pair.rs\nPairInfo v2 <-> krabink://pair URI"]
         INK["brush/ + geom/ + shape.rs + corpus.rs\nBrushSpec presets + builtins, BrushModeler,\nInkMesh + InkStyle (grain, stamps, hover dab);\nshape recognizer; element.rs"]
     end
-    subgraph local["pendant-local (every device)"]
+    subgraph local["krabink-local (every device)"]
         NODE["node.rs: Endpoint, relay health,\nsuspend / resume / network_changed"]
         HUB["hub.rs: ServerDocs (node.redb),\npeer registry, tokens, fan-out"]
         SERVE["serve.rs + inbound.rs: ServerSession per peer"]
@@ -225,12 +225,12 @@ flowchart LR
         SERVE --> SS
         OUT --> CS
     end
-    subgraph server["pendant-server (bin)"]
+    subgraph server["krabink-server (bin)"]
         RELAY["relay.rs: iroh_relay Server + TokenAccess"]
         REPL["replica.rs: Node with Role::Replica"]
         REPL --> NODE
     end
-    subgraph desktop["pendant (desktop bin)"]
+    subgraph desktop["krabink (desktop bin)"]
         BEVY["Bevy app: ui, sketch, docs, settings"]
         SYNC["sync.rs: one ClientSession over LocalLink,\ndriven per frame"]
         DNODE["node.rs: SyncNode resource + mDNS hints"]
@@ -240,7 +240,7 @@ flowchart LR
     end
     subgraph ios["iPad"]
         SWIFT["SwiftUI: AppModel, Settings, Scan, PeerDiscovery\nSketch: PenGestureRecognizer + Metal InkRenderer"]
-        FFI["pendant-ffi (UniFFI)\nengine.rs Core owns the Node\nnet.rs: session over LocalLink + sync-state aggregator\nbrush.rs BrushModeler + meshes"]
+        FFI["krabink-ffi (UniFFI)\nengine.rs Core owns the Node\nnet.rs: session over LocalLink + sync-state aggregator\nbrush.rs BrushModeler + meshes"]
         SWIFT --> FFI --> LINK
         FFI --> NODE
         FFI --> INK
@@ -308,8 +308,8 @@ contact = "mailto:ops@example.org"
 prod = true
 [replica]
 enable = true
-db = "/var/lib/pendant/replica.redb"
-key = "/var/lib/pendant/replica.key"
+db = "/var/lib/krabink/replica.redb"
+key = "/var/lib/krabink/replica.key"
 udp_port = 7843
 ```
 

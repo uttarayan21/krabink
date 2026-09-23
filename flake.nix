@@ -27,7 +27,7 @@
     # githubActions matrix below needs it to tell the canonical checks apart
     # from their unprefixed aliases. The root manifest is a virtual workspace,
     # so the name comes from the desktop crate.
-    cargoToml = builtins.fromTOML (builtins.readFile ./crates/pendant/Cargo.toml);
+    cargoToml = builtins.fromTOML (builtins.readFile ./crates/krabink/Cargo.toml);
     name = cargoToml.package.name;
   in
     flake-utils.lib.eachSystem [
@@ -44,7 +44,7 @@
         };
         inherit (pkgs) lib;
 
-        # iOS cross targets for pendant-ffi staticlib builds (Mac only).
+        # iOS cross targets for krabink-ffi staticlib builds (Mac only).
         iosTargets = lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
           "aarch64-apple-ios"
           "aarch64-apple-ios-sim"
@@ -65,7 +65,7 @@
 
         src = let
           filterBySuffix = path: exts: lib.any (ext: lib.hasSuffix ext path) exts;
-          # Beyond Rust sources: C shims, the brush textures pendant-core
+          # Beyond Rust sources: C shims, the brush textures krabink-core
           # embeds with include_bytes!, the desktop WGSL shader, and the
           # stroke corpora / golden meshes / proptest regressions the tests
           # read from disk.
@@ -162,12 +162,12 @@
           server = craneLib.buildPackage (commonArgs
             // {inherit cargoArtifacts;}
             // {
-              pname = "pendant-server";
-              cargoExtraArgs = "-p pendant-server";
+              pname = "krabink-server";
+              cargoExtraArgs = "-p krabink-server";
             });
         in {
           "${name}" = pkg;
-          pendant-server = server;
+          krabink-server = server;
           default = pkg;
         };
 

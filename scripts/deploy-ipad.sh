@@ -3,9 +3,9 @@
 # Wired up as the "run-ipad" script in paseo.json; also fine to run by hand.
 # On Linux the whole thing runs on the Mac build machine (scripts/on-mac.sh).
 #
-#   PENDANT_IPAD_ID   devicectl device UDID (default: first connected iPad,
+#   KRABINK_IPAD_ID   devicectl device UDID (default: first connected iPad,
 #                     else the known iPad Pro 11 M4)
-#   PENDANT_TEAM      DEVELOPMENT_TEAM for automatic signing
+#   KRABINK_TEAM      DEVELOPMENT_TEAM for automatic signing
 set -euo pipefail
 
 if [[ "$(uname)" != "Darwin" ]]; then
@@ -15,12 +15,12 @@ fi
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 
-team=${PENDANT_TEAM:-YD2FVR5QH2}
-bundle=dev.darksailor.pendant
-app_dir=ios/Pendant
+team=${KRABINK_TEAM:-YD2FVR5QH2}
+bundle=dev.darksailor.krabink
+app_dir=ios/Krabink
 derived="$app_dir/build-device"
 
-device=${PENDANT_IPAD_ID:-}
+device=${KRABINK_IPAD_ID:-}
 if [[ -z "$device" ]]; then
   device=$(xcrun devicectl list devices 2>/dev/null \
     | awk '/iPad/ && /connected/ { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9A-F-]{36}$/) { print $i; exit } }')
@@ -29,8 +29,8 @@ device=${device:-E894963B-F801-5AFA-B709-3F61603301BA}
 echo "==> target device $device"
 
 # Rust core -> XCFramework + Swift bindings (gitignored, so fresh worktrees need it).
-if [[ ! -d ios/PendantCore/PendantCoreFFI.xcframework ]]; then
-  echo "==> building PendantCore xcframework"
+if [[ ! -d ios/KrabinkCore/KrabinkCoreFFI.xcframework ]]; then
+  echo "==> building KrabinkCore xcframework"
   scripts/build-ios-core.sh
 fi
 
@@ -53,8 +53,8 @@ fi
 
 echo "==> building for device"
 xcodebuild \
-  -project "$app_dir/Pendant.xcodeproj" \
-  -scheme Pendant \
+  -project "$app_dir/Krabink.xcodeproj" \
+  -scheme Krabink \
   -configuration Debug \
   -destination "platform=iOS,id=$device" \
   -destination-timeout 180 \
@@ -64,7 +64,7 @@ xcodebuild \
   CODE_SIGN_STYLE=Automatic \
   build
 
-app="$derived/Build/Products/Debug-iphoneos/Pendant.app"
+app="$derived/Build/Products/Debug-iphoneos/Krabink.app"
 [[ -d "$app" ]] || { echo "error: $app not found after build" >&2; exit 1; }
 
 # devicectl is flaky right after a reconnect (NWError 60, launch 10002/4000);

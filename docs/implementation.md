@@ -1,4 +1,4 @@
-# Pendant: stack and implementation
+# Krabink: stack and implementation
 
 State of the tree on branch `research-brush-strokes` at `34e7ab5`
 (2026-09-18). This is the map: what the stack is, where each piece lives,
@@ -12,29 +12,29 @@ rather than repeating them.
 | Layer | Technology | Where |
 |---|---|---|
 | Language, toolchain | Rust, edition 2024, workspace resolver 3; nix flake (crane) for CI, dev shells and packages | `Cargo.toml`, `flake.nix` |
-| Document model | Loro 1.13 CRDT wrapped so no Loro type escapes; postcard for wire and chunk encoding; ULID ids | `crates/pendant-core/src/{note,workspace,sync_doc,ids,stroke}.rs` |
-| Persistence | redb 4 (`snapshots` + `updates` tables keyed by `DocKey(u128)`) | `crates/pendant-core/src/store.rs` |
-| Sync protocol | sans-io state machines, one version byte + postcard frame; QUIC lanes or in-process channels underneath | `crates/pendant-core/src/sync.rs` |
-| Ink | `BrushSpec` presets, EMA input model, tip evaluator, lyon 1.0 stroker and a convex-hull nib sweeper, one `InkMesh` type | `crates/pendant-core/src/{brush,geom}/` |
-| Shapes | deterministic draw-and-hold recogniser (ShortStraw corners, PCA fits) | `crates/pendant-core/src/shape.rs` |
-| Sync node | iroh 1.2 `Endpoint` (hole punching, relay fallback), redb mirror of every doc, hub fan-out, mDNS (`_pendant._udp`, feature `mdns`) | `crates/pendant-local` |
-| Cloud | iroh relay (`iroh-relay` server, workspace-token access control) + headless replica node in one binary | `crates/pendant-server` |
-| Desktop | Bevy 0.19.1 (`wayland`), bevy_egui 0.42, egui_commonmark 0.25, custom `Material2d` + WGSL; runs a `pendant-local` node in-process | `crates/pendant` |
-| iPad bridge | UniFFI 0.32 proc-macro bindings, staticlib per iOS target, XCFramework + generated `Pendant.swift` in a local SPM package | `crates/pendant-ffi`, `ios/PendantCore` |
-| iPad app | SwiftUI + UIKit, iOS 17 deployment target, Metal renderer (4x MSAA, sRGB, depth), PencilKit only as the tool picker, VisionKit QR scanner, Bonjour discovery; XcodeGen project | `ios/Pendant` |
+| Document model | Loro 1.13 CRDT wrapped so no Loro type escapes; postcard for wire and chunk encoding; ULID ids | `crates/krabink-core/src/{note,workspace,sync_doc,ids,stroke}.rs` |
+| Persistence | redb 4 (`snapshots` + `updates` tables keyed by `DocKey(u128)`) | `crates/krabink-core/src/store.rs` |
+| Sync protocol | sans-io state machines, one version byte + postcard frame; QUIC lanes or in-process channels underneath | `crates/krabink-core/src/sync.rs` |
+| Ink | `BrushSpec` presets, EMA input model, tip evaluator, lyon 1.0 stroker and a convex-hull nib sweeper, one `InkMesh` type | `crates/krabink-core/src/{brush,geom}/` |
+| Shapes | deterministic draw-and-hold recogniser (ShortStraw corners, PCA fits) | `crates/krabink-core/src/shape.rs` |
+| Sync node | iroh 1.2 `Endpoint` (hole punching, relay fallback), redb mirror of every doc, hub fan-out, mDNS (`_krabink._udp`, feature `mdns`) | `crates/krabink-local` |
+| Cloud | iroh relay (`iroh-relay` server, workspace-token access control) + headless replica node in one binary | `crates/krabink-server` |
+| Desktop | Bevy 0.19.1 (`wayland`), bevy_egui 0.42, egui_commonmark 0.25, custom `Material2d` + WGSL; runs a `krabink-local` node in-process | `crates/krabink` |
+| iPad bridge | UniFFI 0.32 proc-macro bindings, staticlib per iOS target, XCFramework + generated `Krabink.swift` in a local SPM package | `crates/krabink-ffi`, `ios/KrabinkCore` |
+| iPad app | SwiftUI + UIKit, iOS 17 deployment target, Metal renderer (4x MSAA, sRGB, depth), PencilKit only as the tool picker, VisionKit QR scanner, Bonjour discovery; XcodeGen project | `ios/Krabink` |
 
 ## 2. Repository layout
 
 ```
 Cargo.toml              virtual workspace: crates/*
 flake.nix               crane checks (clippy, fmt, toml-fmt, audit, deny, nextest, llvm-cov, docs), packages, dev shells
-crates/pendant-core     platform-free core (no async, no UI); ~8.4k lines
-crates/pendant-local    sync node library (iroh endpoint, hub, lanes, mDNS); compiles for iOS
-crates/pendant-server   `pendant-server` binary: iroh relay + replica node
-crates/pendant          desktop binary (Bevy) running a node, `pair` and `replay` subcommands
-crates/pendant-ffi      UniFFI surface for Swift, `uniffi-bindgen` bin behind the `bindgen` feature
-ios/PendantCore         SPM package: generated XCFramework + Pendant.swift (outputs of scripts/build-ios-core.sh)
-ios/Pendant             XcodeGen spec (project.yml), Sources/, UITests/
+crates/krabink-core     platform-free core (no async, no UI); ~8.4k lines
+crates/krabink-local    sync node library (iroh endpoint, hub, lanes, mDNS); compiles for iOS
+crates/krabink-server   `krabink-server` binary: iroh relay + replica node
+crates/krabink          desktop binary (Bevy) running a node, `pair` and `replay` subcommands
+crates/krabink-ffi      UniFFI surface for Swift, `uniffi-bindgen` bin behind the `bindgen` feature
+ios/KrabinkCore         SPM package: generated XCFramework + Krabink.swift (outputs of scripts/build-ios-core.sh)
+ios/Krabink             XcodeGen spec (project.yml), Sources/, UITests/
 scripts/build-ios-core.sh   cargo rustc for aarch64-apple-ios{,-sim} → bindgen → xcodebuild -create-xcframework
 scripts/swift-smoke.sh      host cdylib + bindgen + scripts/smoke/main.swift, run on macOS
 docs/architecture.md    sync topology, wire, pairing, fan-out, cloud deployment, failure modes
@@ -42,7 +42,7 @@ docs/plans/             ink-renderer (done), shape-recognizer (done), brush-engi
 .github/workflows       build.yaml (nix check matrix + llvm-cov → codecov), docs.yaml (cargo doc check)
 ```
 
-## 3. Core crate (`pendant-core`)
+## 3. Core crate (`krabink-core`)
 
 Compiles unchanged for Linux, macOS and iOS. Everything platform-specific
 sits above it.
@@ -63,9 +63,9 @@ sits above it.
   with `Flush` control and `checkpoint`. Shared by server, desktop and iPad.
 - Ids (`ids.rs`): `NoteId`, `SketchId`, `StrokeId`, `ElementId`, `DeviceId`,
   all ULIDs; `seed()` yields the low 32 bits for stroke-mapped grain.
-- `export.rs`: markdown export rewriting `pendant://sketch/<id>` embeds to
+- `export.rs`: markdown export rewriting `krabink://sketch/<id>` embeds to
   SVG assets rendered from the elements through `geom/outline.rs`.
-- `pair.rs`: `PairInfo` ⇄ `pendant://pair?server=…&token=…[&alt=…][&fallback=…][&relay=…]`.
+- `pair.rs`: `PairInfo` ⇄ `krabink://pair?server=…&token=…[&alt=…][&fallback=…][&relay=…]`.
 
 ### 3.2 Sync protocol (`sync.rs`)
 
@@ -178,7 +178,7 @@ confidence; pen-up commits a `ShapeElement` under the wet stroke's id.
 - `tests/loopback.rs`: client and server sessions wired back to back with
   malformed-frame fuzzing.
 - `tests/golden_mesh.rs`: fixed strokes through the whole pipeline, hashed
-  against `tests/golden/mesh.txt`; regenerate with `PENDANT_UPDATE_GOLDEN=1`.
+  against `tests/golden/mesh.txt`; regenerate with `KRABINK_UPDATE_GOLDEN=1`.
 - `corpus.rs` parses recorder v1 (4 columns) and v2 (7/8 columns with tilt
   and an `est` flag) files. `tests/corpus/shapes/` has seven recordings for
   `tests/shape_corpus.rs`; `tests/corpus/brush/` has fifteen iPad
@@ -186,28 +186,28 @@ confidence; pen-up commits a `ShapeElement` under the wet stroke's id.
   `tests/brush_corpus.rs`, which measures every input model the build has
   (`corpus::StrokeMetrics`: jitter, lag, deviation from the raw path,
   overshoot, width range, vertex count, µs), asserts loose bounds and
-  dumps rows with `PENDANT_METRICS_JSON=path`.
+  dumps rows with `KRABINK_METRICS_JSON=path`.
 - `brush/ism.rs` (feature `ism`): the ink-stroke-modeler input model
   behind `InputModelKind::Ism` / `BrushModeler::with_model`; the P4 trial,
   not what the canvas uses (decision in `docs/plans/brush-engine.md`).
 
-## 4. Sync node (`pendant-local`) and cloud (`pendant-server`)
+## 4. Sync node (`krabink-local`) and cloud (`krabink-server`)
 
-Every device runs one `pendant_local::Node`: an iroh `Endpoint` with a
+Every device runs one `krabink_local::Node`: an iroh `Endpoint` with a
 persisted key (`node_key`), a redb mirror of every doc (`node.redb`,
 `ServerDocs` from `docs.rs`, checkpointed every 30 s, idle docs unloaded)
 and a `Hub` (peer registry, tokens, changed-gated fan-out). Inbound QUIC
 connections and the app's in-process `LocalLink` are served by the same
 `ServerSession` loop (`serve.rs`); outbound peers are driven by one dial
 loop each (`outbound.rs`: backoff, `ClientSession`, route reporting).
-Wire: ALPN `pendant/sync/1`, two lanes per connection (`framing.rs`).
+Wire: ALPN `krabink/sync/1`, two lanes per connection (`framing.rs`).
 `Node` API: `start`, `local_link`, `set_peers`, `set_relay`,
 `add_addr_hint`, `add_token`, `peers` / `watch_peers`, `relay_health`,
 `suspend` / `resume` / `network_changed`, `shutdown`. `mdns.rs` (feature
-`mdns`, desktop only) advertises `_pendant._udp` and turns hits into
+`mdns`, desktop only) advertises `_krabink._udp` and turns hits into
 address hints. `tests/mesh.rs` runs three nodes with the relay disabled.
 
-`pendant-server` is one binary: `relay.rs` spawns an `iroh_relay` server
+`krabink-server` is one binary: `relay.rs` spawns an `iroh_relay` server
 whose `TokenAccess` admits only workspace tokens; `replica.rs` starts a
 `Role::Replica` node behind it (accepts every token holder, never dials,
 pinned UDP port). `config.rs` reads the TOML shown in
@@ -216,19 +216,19 @@ the replica on and prints a pair URI. `tests/relay.rs` runs the real relay
 on an ephemeral port: convergence through the relay, latency, denied
 tokens, replica bridging offline edits.
 
-## 5. Desktop (`pendant`)
+## 5. Desktop (`krabink`)
 
 Bevy app with egui UI. Modules:
 
 - `config.rs`: data dir (store, `node.redb`, `node_key`, device id,
-  per-install `workspace_token`) and `~/.config/pendant/config.toml`
+  per-install `workspace_token`) and `~/.config/krabink/config.toml`
   (`relay`, `token`, `replica`, `[[peers]]`), overridable by `cli.rs` flags
   (`--data-dir`, `--relay`, `--token`, `--follow-latest`). Subcommands:
   `completions`, `pair <uri>` (writes the pairing to config.toml),
   `replay` (headless 120 Hz latency rig dialling a `--pair` URI),
   `brush-lab`.
 - `docs.rs`: workspace registry and open notes over the shared store.
-- `node.rs`: the `pendant-local` node as a Bevy resource (`SyncNode`),
+- `node.rs`: the `krabink-local` node as a Bevy resource (`SyncNode`),
   mDNS advertise/browse feeding `add_addr_hint`, and the QR's direct
   addresses following the endpoint's.
 - `sync.rs`: one `ClientSession` over the node's `LocalLink`, driven once
@@ -239,13 +239,13 @@ Bevy app with egui UI. Modules:
   pairing QR, paste-to-join.
 - `sketch.rs`: each sketch is an off-screen Bevy scene (own render layer and
   camera) rendered into an `Image` and handed to egui through a
-  `pendant://` texture loader. Committed elements are ink meshes at z
+  `krabink://` texture loader. Committed elements are ink meshes at z
   `k/100`; remote wet strokes at `990 + j/100` (900 slots) are dropped when
   the commit lands or on timeout. Peers' pens draw above that at 999.2
   (the tool's hover dab, faint hovering / stronger drawing) and 999.4 (a
   monoline ring in a per-device hue); a pointer dies on `PointerGone` or
   after 1.5 s of silence.
-- `lab.rs`: `pendant brush-lab --corpus <file|dir> --presets … --models
+- `lab.rs`: `krabink brush-lab --corpus <file|dir> --presets … --models
   ema,ism --out dir --svg --metrics`, the tuning bench: SVG grids per
   recording through `elements_to_svg` and `metrics.json` from
   `corpus::StrokeMetrics`; the `ism` feature adds the ISM row.
@@ -266,11 +266,11 @@ Bevy app with egui UI. Modules:
   the materials does not rebuild them). Only the multiply pipeline exists;
   the desktop paper is white.
 
-## 6. iPad bridge (`pendant-ffi`)
+## 6. iPad bridge (`krabink-ffi`)
 
-UniFFI proc macros (`uniffi::setup_scaffolding!("pendant")`), no UDL.
+UniFFI proc macros (`uniffi::setup_scaffolding!("krabink")`), no UDL.
 
-- `engine.rs`: `Core` (store, the in-process `pendant-local` node, note
+- `engine.rs`: `Core` (store, the in-process `krabink-local` node, note
   registry; `create_note`, `open_note`, `set_pairing(PairInfo)`,
   `add_peer_addr`, `connect`, `suspend`, `network_changed`, `node_id`,
   `bound_port`, `peers`, `sync_state`, `pair_info`, device registry) and `NoteSession` (text edits, title,
@@ -302,17 +302,17 @@ UniFFI proc macros (`uniffi::setup_scaffolding!("pendant")`), no UDL.
 
 Build: `scripts/build-ios-core.sh` builds `staticlib` for
 `aarch64-apple-ios` and `aarch64-apple-ios-sim`, runs library-mode bindgen
-off the device archive, assembles `ios/PendantCore/PendantCoreFFI.xcframework`
-and copies `Pendant.swift`. `scripts/swift-smoke.sh` compiles
+off the device archive, assembles `ios/KrabinkCore/KrabinkCoreFFI.xcframework`
+and copies `Krabink.swift`. `scripts/swift-smoke.sh` compiles
 `scripts/smoke/main.swift` against the host cdylib as a fast bindings check.
 
-## 7. iPad app (`ios/Pendant`)
+## 7. iPad app (`ios/Krabink`)
 
-Generated with XcodeGen from `project.yml` (bundle `dev.darksailor.pendant`,
-iOS 17, iPad and iPhone, `pendant://` URL scheme, camera, local network and
+Generated with XcodeGen from `project.yml` (bundle `dev.darksailor.krabink`,
+iOS 17, iPad and iPhone, `krabink://` URL scheme, camera, local network and
 Bonjour usage strings, file sharing for recordings).
 
-- `PendantApp.swift`, `AppModel.swift`: owns the UniFFI `Core`, the note
+- `KrabinkApp.swift`, `AppModel.swift`: owns the UniFFI `Core`, the note
   list and one `NoteModel` per open note. Listener callbacks arrive on the
   Rust network thread and hop to the main actor. `-spike 1` and
   `-brushLab 1` replace the main UI.
@@ -324,7 +324,7 @@ Bonjour usage strings, file sharing for recordings).
   read-only preview on top of it with tappable sketch thumbnails.
 - `SettingsScreen.swift`, `PairScreen.swift`, `ScanScreen.swift`,
   `PeerDiscovery.swift`: peers and routes, device registry, pairing QR out
-  and in (VisionKit), Bonjour lookup (`_pendant._udp`, UDP resolve) of the
+  and in (VisionKit), Bonjour lookup (`_krabink._udp`, UDP resolve) of the
   paired desktop for the relay-less LAN.
 - `SketchScreen.swift`: the canvas. A `UIScrollView` owns finger pan, zoom
   and inertia over an empty content view; the Metal view sits above it
@@ -372,7 +372,7 @@ Bonjour usage strings, file sharing for recordings).
 Launch arguments read from `UserDefaults`: `pairURI`, `spike`, `brushLab`,
 `labPage`, `labModel`, `recordStrokes`, `tool`, `figureEight`,
 `fakeEstimates`, `pencilOnly`, `anyInput`. UI tests take the pairing URI
-from `PENDANT_TEST_PAIR` (what `pendant-server --dev` prints).
+from `KRABINK_TEST_PAIR` (what `krabink-server --dev` prints).
 
 UI tests (`UITests/`): `SketchUITests` (create and draw, remote stroke and
 erase, marker self-overlap luminance, estimate settling, hold-to-shape,
@@ -399,23 +399,23 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace                       # core, local mesh, server relay, ffi round trips
 cargo fmt --all -- --check
 nix flake check                              # clippy, fmt, toml-fmt, audit, deny, nextest, llvm-cov, docs
-cargo run -p pendant                         # desktop node (LAN only without --relay)
-cargo run -p pendant-server -- --dev         # relay + replica on 127.0.0.1:3340, prints a pair URI
-cargo run -p pendant -- --data-dir /tmp/b pair '<uri>'   # second desktop joins
+cargo run -p krabink                         # desktop node (LAN only without --relay)
+cargo run -p krabink-server -- --dev         # relay + replica on 127.0.0.1:3340, prints a pair URI
+cargo run -p krabink -- --data-dir /tmp/b pair '<uri>'   # second desktop joins
 
-scripts/build-ios-core.sh                    # xcframework + Pendant.swift
+scripts/build-ios-core.sh                    # xcframework + Krabink.swift
 scripts/swift-smoke.sh                       # bindings smoke
 scripts/check-ipad.sh                        # simulator compile, no signing
 scripts/deploy-ipad.sh                       # device build + install + launch (paseo: run-ipad)
-scripts/gen-xcodeproj.sh                     # regenerate Pendant.xcodeproj from project.yml
-xcodebuild -project Pendant.xcodeproj -scheme Pendant -destination 'platform=iOS Simulator,id=<udid>' build-for-testing
-PENDANT_TEST_PAIR='pendant://pair?…' xcodebuild test-without-building ... -only-testing:PendantUITests/SketchUITests
+scripts/gen-xcodeproj.sh                     # regenerate Krabink.xcodeproj from project.yml
+xcodebuild -project Krabink.xcodeproj -scheme Krabink -destination 'platform=iOS Simulator,id=<udid>' build-for-testing
+KRABINK_TEST_PAIR='krabink://pair?…' xcodebuild test-without-building ... -only-testing:KrabinkUITests/SketchUITests
 ```
 
 The iOS scripts need Xcode. Run on Linux, each one hands itself to the Mac
 build machine through `scripts/on-mac.sh`: the worktree is mirrored with
-rsync to `~/Porject/pendant-<worktree>` on `shiro` (one folder per
-worktree, `PENDANT_MAC_HOST` / `PENDANT_MAC_DIR` override) and the script
+rsync to `~/Porject/krabink-<worktree>` on `shiro` (one folder per
+worktree, `KRABINK_MAC_HOST` / `KRABINK_MAC_DIR` override) and the script
 runs there over ssh. Build artefacts stay on the Mac between runs. Device
 signing over ssh needs the keychains unlocked (`~/.keychain-pw` on the Mac,
 handled by `deploy-ipad.sh`) and a signed-in Xcode account for

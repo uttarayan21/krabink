@@ -12,17 +12,17 @@ root=$(git rev-parse --show-toplevel)
 cd "$root"
 gen="$root/target/swift-smoke"
 
-cargo build -p pendant-ffi --lib
+cargo build -p krabink-ffi --lib
 rm -rf "$gen"
 mkdir -p "$gen"
-cargo run -q -p pendant-ffi --features bindgen --bin uniffi-bindgen -- \
-  generate --library target/debug/libpendant_ffi.dylib --language swift --out-dir "$gen"
-cp "$gen/pendantFFI.modulemap" "$gen/module.modulemap"
+cargo run -q -p krabink-ffi --features bindgen --bin uniffi-bindgen -- \
+  generate --library target/debug/libkrabink_ffi.dylib --language swift --out-dir "$gen"
+cp "$gen/krabinkFFI.modulemap" "$gen/module.modulemap"
 
 # Clean env: a nix devShell's clang setup breaks Xcode's swiftc
 # ("missing required module 'SwiftShims'").
 env -i HOME="$HOME" PATH=/usr/bin:/bin TERM=dumb \
-  xcrun swiftc -o "$gen/smoke" scripts/smoke/main.swift "$gen/pendant.swift" \
-  -I "$gen" -L target/debug -lpendant_ffi
+  xcrun swiftc -o "$gen/smoke" scripts/smoke/main.swift "$gen/krabink.swift" \
+  -I "$gen" -L target/debug -lkrabink_ffi
 
 DYLD_LIBRARY_PATH=target/debug "$gen/smoke"

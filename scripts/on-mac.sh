@@ -9,11 +9,11 @@
 # this themselves when started on Linux, so `paseo run run-ipad` works from
 # either side.
 #
-#   PENDANT_MAC_HOST  ssh host (default: shiro)
-#   PENDANT_MAC_DIR   remote checkout, relative to the remote $HOME
-#                     (default: Porject/pendant-<worktree dir name>, or
-#                     Porject/pendant when the checkout is named pendant)
-#   PENDANT_IPAD_ID, PENDANT_TEAM, PENDANT_SIM_ID and the PENDANT_* release
+#   KRABINK_MAC_HOST  ssh host (default: shiro)
+#   KRABINK_MAC_DIR   remote checkout, relative to the remote $HOME
+#                     (default: Porject/krabink-<worktree dir name>, or
+#                     Porject/krabink when the checkout is named krabink)
+#   KRABINK_IPAD_ID, KRABINK_TEAM, KRABINK_SIM_ID and the KRABINK_* release
 #                     variables of archive-ios.sh are forwarded to the script
 set -euo pipefail
 
@@ -29,11 +29,11 @@ if [[ ! -x "$root/scripts/$script" ]]; then
   exit 2
 fi
 
-host=${PENDANT_MAC_HOST:-shiro}
+host=${KRABINK_MAC_HOST:-shiro}
 name=$(basename "$root")
-dir=${PENDANT_MAC_DIR:-}
+dir=${KRABINK_MAC_DIR:-}
 if [[ -z "$dir" ]]; then
-  if [[ "$name" == pendant ]]; then dir=Porject/pendant; else dir="Porject/pendant-$name"; fi
+  if [[ "$name" == krabink ]]; then dir=Porject/krabink; else dir="Porject/krabink-$name"; fi
 fi
 
 echo "==> syncing to $host:$dir"
@@ -43,17 +43,17 @@ ssh "$host" "mkdir -p '$dir'"
 # Xcode project and the built xcframework survive between runs.
 rsync -az --delete \
   --exclude .git --exclude target --exclude .direnv --exclude 'result*' \
-  --exclude ios/Pendant/build --exclude 'ios/Pendant/build-*' \
-  --exclude ios/Pendant/Pendant.xcodeproj --exclude ios/Pendant/Info.plist \
-  --exclude ios/PendantCore/PendantCoreFFI.xcframework \
-  --exclude ios/PendantCore/Sources --exclude ios/PendantCore/.build \
+  --exclude ios/Krabink/build --exclude 'ios/Krabink/build-*' \
+  --exclude ios/Krabink/Krabink.xcodeproj --exclude ios/Krabink/Info.plist \
+  --exclude ios/KrabinkCore/KrabinkCoreFFI.xcframework \
+  --exclude ios/KrabinkCore/Sources --exclude ios/KrabinkCore/.build \
   "$root/" "$host:$dir/"
 
 env=""
-for var in PENDANT_IPAD_ID PENDANT_TEAM PENDANT_SIM_ID PENDANT_CONFIGURATION \
-  PENDANT_BUILD_NUMBER PENDANT_MARKETING_VERSION \
-  PENDANT_EXPORT_METHOD PENDANT_EXPORT_DESTINATION \
-  PENDANT_ASC_KEY_PATH PENDANT_ASC_KEY_ID PENDANT_ASC_ISSUER_ID; do
+for var in KRABINK_IPAD_ID KRABINK_TEAM KRABINK_SIM_ID KRABINK_CONFIGURATION \
+  KRABINK_BUILD_NUMBER KRABINK_MARKETING_VERSION \
+  KRABINK_EXPORT_METHOD KRABINK_EXPORT_DESTINATION \
+  KRABINK_ASC_KEY_PATH KRABINK_ASC_KEY_ID KRABINK_ASC_ISSUER_ID; do
   if [[ -n "${!var:-}" ]]; then env+=" $var=$(printf %q "${!var}")"; fi
 done
 args=""

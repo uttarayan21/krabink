@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Render the App Store icon (1024x1024, opaque RGB PNG) for the iPad app.
 
-Mirrors `LogoMark` in ios/Pendant/Sources/Theme.swift: the indigo accent
+Mirrors `LogoMark` in ios/Krabink/Sources/Theme.swift: the indigo accent
 gradient with a white pencil tip. Pure stdlib (zlib + struct) so it runs
 anywhere; the output is committed at
-ios/Pendant/Assets.xcassets/AppIcon.appiconset/AppIcon.png and only needs
+ios/Krabink/Assets.xcassets/AppIcon.appiconset/AppIcon.png and only needs
 regenerating when the mark changes.
 
     python3 scripts/gen-app-icon.py [out.png] [--size 1024]
@@ -148,7 +148,7 @@ def main(argv):
     if out is None:
         out = (
             Path(__file__).resolve().parent.parent
-            / "ios/Pendant/Assets.xcassets/AppIcon.appiconset/AppIcon.png"
+            / "ios/Krabink/Assets.xcassets/AppIcon.appiconset/AppIcon.png"
         )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(png(size, render(size)))

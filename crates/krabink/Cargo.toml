@@ -1,0 +1,41 @@
+[package]
+name = "krabink"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Desktop client for krabink: markdown notes with live-synced sketches"
+
+# The bin links all of bevy; running it as a test harness SIGSEGVs under
+# nextest's --list and it contains no tests - logic lives in krabink-core.
+[[bin]]
+name = "krabink"
+path = "src/main.rs"
+test = false
+
+[features]
+# Dev-only fast linking: `cargo run -p krabink --features dev`.
+# Never enable for release/Nix builds - it links against libbevy_dylib.
+dev = ["bevy/dynamic_linking"]
+# The ink-stroke-modeler input model row in `krabink brush-lab`.
+ism = ["krabink-core/ism"]
+
+[dependencies]
+krabink-core.workspace = true
+krabink-local = { workspace = true, features = ["mdns"] }
+iroh.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+error-stack.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bevy = { version = "0.19", features = ["wayland"] }
+bevy_egui.workspace = true
+egui_commonmark.workspace = true
+directories.workspace = true
+gethostname = "0.5"
+qrcode = { version = "0.14", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+ulid.workspace = true
