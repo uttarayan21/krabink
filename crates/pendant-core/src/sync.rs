@@ -134,14 +134,19 @@ pub struct CatchUp {
 pub trait DocProvider {
     /// Updates the peer at `have` is missing, plus our own version vector.
     fn catch_up(&mut self, doc: DocKey, have: &[u8]) -> Result<CatchUp>;
-    /// Import (and persist) an incoming update.
-    fn import_update(&mut self, doc: DocKey, payload: &[u8]) -> Result<()>;
+    /// Import (and persist) an incoming update. Returns whether it changed
+    /// the doc; duplicates (already seen via another peer) return `false`
+    /// and are not re-broadcast, which keeps a mesh with cycles from
+    /// echoing updates forever.
+    fn import_update(&mut self, doc: DocKey, payload: &[u8]) -> Result<bool>;
     fn list_docs(&mut self) -> Vec<DocKey>;
 }
 
 /// Client-side document access. Implemented over the open local docs.
 pub trait ClientDocs {
-    fn import(&mut self, doc: DocKey, payload: &[u8]) -> Result<()>;
+    /// Import a catch-up or live update. Returns whether it changed the doc
+    /// (see [`DocProvider::import_update`]).
+    fn import(&mut self, doc: DocKey, payload: &[u8]) -> Result<bool>;
     /// Everything the local doc has that the peer at `have` lacks.
     fn updates_since(&mut self, doc: DocKey, have: &[u8]) -> Result<Vec<u8>>;
 }
@@ -280,7 +285,7 @@ impl ClientSession {
                 effects
             }
             ServerMsg::Update { doc, payload, .. } => match docs.import(doc, &payload) {
-                Ok(()) => Vec::new(),
+                Ok(_) => Vec::new(),
                 Err(err) => vec![ClientEffect::Fatal(format!("remote import failed: {err}"))],
             },
             ServerMsg::Ephemeral { doc, payload, from } => {
@@ -394,7 +399,9 @@ impl ServerSession {
                     })];
                 }
                 match docs.import_update(doc, &payload) {
-                    Ok(()) => vec![ServerEffect::Broadcast {
+                    // Already had it (arrived via another peer): nothing to relay.
+                    Ok(false) => Vec::new(),
+                    Ok(true) => vec![ServerEffect::Broadcast {
                         doc,
                         // Relay the raw payload untouched - no re-encode.
                         msg: ServerMsg::Update {

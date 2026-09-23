@@ -1,15 +1,18 @@
 //! Desktop-class Rust peer for cross-device sync checks (used by the iOS UI
-//! test harness). Connects with a fresh store, waits for the newest note,
-//! optionally asserts its text contains a substring and/or appends text.
+//! test harness). Joins a workspace from a pairing URI with a fresh store,
+//! waits for the newest note, optionally asserts its text contains a
+//! substring and/or appends text.
 //!
 //! cargo run -p pendant-ffi --example probe -- \
-//!     --server ws://127.0.0.1:8722/ws --token demo \
+//!     --pair 'pendant://pair?node=…&token=…&relay=…' \
 //!     [--expect SUBSTRING] [--append TEXT] [--timeout-secs 15]
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pendant_ffi::{Core, NoteListener, NoteSession, PointKind, Stroke, StrokePoint, Tool};
+use pendant_ffi::{
+    Core, NoteListener, NoteSession, PointKind, Stroke, StrokePoint, Tool, parse_pair_uri,
+};
 
 #[derive(Default)]
 struct Recorder {
@@ -65,8 +68,7 @@ impl NoteListener for Recorder {
 }
 
 struct Args {
-    server: String,
-    token: String,
+    pair: String,
     expect: Option<String>,
     append: Option<String>,
     expect_strokes: Option<usize>,
@@ -77,8 +79,7 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut args = Args {
-        server: String::new(),
-        token: String::new(),
+        pair: String::new(),
         expect: None,
         append: None,
         expect_strokes: None,
@@ -90,8 +91,7 @@ fn parse_args() -> Args {
     while let Some(flag) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| panic!("{flag} needs a value"));
         match flag.as_str() {
-            "--server" => args.server = value(),
-            "--token" => args.token = value(),
+            "--pair" => args.pair = value(),
             "--expect" => args.expect = Some(value()),
             "--append" => args.append = Some(value()),
             "--expect-strokes" => args.expect_strokes = Some(value().parse().unwrap()),
@@ -101,10 +101,7 @@ fn parse_args() -> Args {
             other => panic!("unknown flag {other}"),
         }
     }
-    assert!(
-        !args.server.is_empty() && !args.token.is_empty(),
-        "--server and --token are required"
-    );
+    assert!(!args.pair.is_empty(), "--pair is required");
     args
 }
 
@@ -125,8 +122,8 @@ fn main() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let core = Core::new(dir.path().to_str().unwrap().into()).expect("core");
-    core.set_sync_server(vec![args.server.clone()], args.token.clone(), None);
-    core.connect().expect("connect");
+    let pair = parse_pair_uri(args.pair.clone()).expect("--pair is not a pendant://pair URI");
+    core.set_pairing(pair).expect("pairing");
 
     let newest = wait_for("a note in the workspace", args.timeout, || {
         core.list_notes().into_iter().next()

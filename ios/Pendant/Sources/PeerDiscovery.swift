@@ -1,27 +1,29 @@
 import Foundation
 import Network
 
-/// Finds the paired desktop's embedded relay on the local network via
-/// Bonjour (`_pendant._tcp`, matched on the `id` TXT record) and resolves
-/// it to a `ws://host:port/ws` URL. Only works where multicast reaches
-/// (same Wi-Fi); over VPN/overlay networks like Tailscale the stored
-/// addresses from the pairing QR do the job instead.
+/// Finds the paired desktop's node on the local network via Bonjour
+/// (`_pendant._udp`, matched on the `id` TXT record) and resolves it to an
+/// `ip:port` the core can hand its node as a direct address hint. Only
+/// matters when the relay is unreachable: with the relay up, the nodes
+/// exchange addresses through it and punch the LAN path themselves.
+/// Multicast does not cross VPN/overlay networks like Tailscale; there the
+/// QR's addresses and the relay do the job.
 @MainActor
-final class RelayDiscovery {
-    static let serviceType = "_pendant._tcp"
+final class PeerDiscovery {
+    static let serviceType = "_pendant._udp"
 
-    let relayId: String
-    /// Direct URL of the matched desktop; nil while not found.
-    private(set) var url: String? {
-        didSet { if url != oldValue { onChange?() } }
+    let nodeId: String
+    /// `ip:port` of the matched desktop; nil while not found.
+    private(set) var addr: String? {
+        didSet { if addr != oldValue, let addr { onFound?(addr) } }
     }
-    var onChange: (() -> Void)?
+    var onFound: ((String) -> Void)?
 
     private var browser: NWBrowser?
     private var resolver: NWConnection?
 
-    init(relayId: String) {
-        self.relayId = relayId
+    init(nodeId: String) {
+        self.nodeId = nodeId
     }
 
     func start() {
@@ -35,7 +37,7 @@ final class RelayDiscovery {
         }
         browser.stateUpdateHandler = { [weak self] state in
             guard case .failed(let error) = state else { return }
-            NSLog("pendant: relay browser failed: \(error); restarting")
+            NSLog("pendant: peer browser failed: \(error); restarting")
             Task { @MainActor [weak self] in
                 self?.stop()
                 self?.start()
@@ -50,35 +52,29 @@ final class RelayDiscovery {
         browser = nil
         resolver?.cancel()
         resolver = nil
-        url = nil
+        addr = nil
     }
 
     private func handle(_ results: Set<NWBrowser.Result>) {
         let match = results.first { result in
             guard case .bonjour(let txt) = result.metadata else { return false }
-            return txt.dictionary["id"] == relayId
+            return txt.dictionary["id"] == nodeId
         }
         guard let match else {
             resolver?.cancel()
             resolver = nil
-            url = nil
+            addr = nil
             return
         }
-        resolve(match.endpoint, path: txtPath(match))
+        resolve(match.endpoint)
     }
 
-    private func txtPath(_ result: NWBrowser.Result) -> String {
-        if case .bonjour(let txt) = result.metadata, let path = txt.dictionary["path"] {
-            return path
-        }
-        return "/ws"
-    }
-
-    /// Bonjour hands back a service endpoint, not an address; a throwaway
-    /// TCP connection resolves it (IPv4 forced so the URL stays simple).
-    private func resolve(_ endpoint: NWEndpoint, path: String) {
+    /// Bonjour hands back a service endpoint, not an address. A UDP
+    /// connection resolves it without any handshake: it is `.ready` as
+    /// soon as the path is known (IPv4 forced so the address stays simple).
+    private func resolve(_ endpoint: NWEndpoint) {
         resolver?.cancel()
-        let params = NWParameters.tcp
+        let params = NWParameters.udp
         if let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
             ip.version = .v4
         }
@@ -98,7 +94,7 @@ final class RelayDiscovery {
                 @unknown default: hostText = "\(host)"
                 }
                 Task { @MainActor [weak self] in
-                    self?.url = "ws://\(hostText):\(port)\(path)"
+                    self?.addr = "\(hostText):\(port)"
                 }
             case .failed, .cancelled:
                 connection.cancel()

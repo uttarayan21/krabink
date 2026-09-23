@@ -1,47 +1,58 @@
-//! Runtime configuration: data directory (store, device id, relay token)
-//! and dedicated-relay settings from `~/.config/pendant/config.toml`, both
-//! overridable from the CLI so several instances can run side by side.
+//! Runtime configuration: data directory (stores, node key, device id,
+//! workspace token) and the pairing (relay, token, peers) from
+//! `~/.config/pendant/config.toml`, overridable from the CLI so several
+//! instances can run side by side.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use pendant_core::{DeviceId, PairInfo};
+use pendant_local::{EndpointId, PeerKind, PeerTarget, RelayTarget, RelayUrl};
 
 use crate::errors::{Error, Report, Result, ResultExt};
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct FileConfig {
-    server: Option<String>,
+    /// Home relay URL.
+    relay: Option<String>,
+    /// Workspace token adopted from a pairing URI.
     token: Option<String>,
-    fallback: Option<String>,
-    /// Device id of the desktop behind `server` (from its pairing URI);
-    /// lets discovery re-find it when its address or port changes.
-    relay_id: Option<String>,
+    /// Endpoint id of the workspace's cloud replica.
+    replica: Option<String>,
+    /// Nodes this desktop dials.
+    #[serde(default)]
+    peers: Vec<PeerFile>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PeerFile {
+    node: String,
+    #[serde(default)]
+    addrs: Vec<String>,
 }
 
 /// Everything the app needs to start.
 pub struct RuntimeConfig {
     pub store_path: PathBuf,
-    /// Separate redb for the embedded relay's copy of the docs.
-    pub relay_store_path: PathBuf,
+    /// Separate redb for the node's mirror of every doc.
+    pub node_store_path: PathBuf,
+    pub node_key_path: PathBuf,
     pub device: DeviceId,
-    /// Per-install token the embedded relay always accepts.
-    pub relay_token: String,
-    /// Dedicated relay (`ws://host:port/ws`), joined workspace's direct
-    /// path, or absent: then this desktop only serves its own relay.
-    pub server: Option<String>,
-    /// Second remote relay from a joined workspace's pairing URI.
-    pub fallback: Option<String>,
-    /// Token for the remote relays; empty when none configured.
+    /// Per-install token this node always accepts; what our QR carries
+    /// until we adopt a workspace.
+    pub workspace_token: String,
+    pub relay: Option<RelayUrl>,
+    /// Adopted workspace token; empty when none.
     pub token: String,
-    /// Paired desktop's device id when `server` is its embedded relay.
-    pub relay_id: Option<String>,
+    pub replica: Option<EndpointId>,
+    /// Peers from the config, without the replica.
+    pub peers: Vec<PeerTarget>,
 }
 
 impl RuntimeConfig {
     pub fn resolve(
         data_dir: Option<PathBuf>,
-        server: Option<String>,
+        relay: Option<String>,
         token: Option<String>,
     ) -> Result<Self> {
         let dirs = directories::ProjectDirs::from("dev", "darksailor", "pendant")
@@ -53,48 +64,102 @@ impl RuntimeConfig {
             .change_context(Error)
             .attach_with(|| format!("creating {}", data_dir.display()))?;
 
+        let relay = relay
+            .or(file.relay)
+            .map(|url| {
+                url.parse::<RelayUrl>()
+                    .change_context(Error)
+                    .attach_with(|| format!("relay url {url:?}"))
+            })
+            .transpose()?;
+        let token = token.or(file.token).unwrap_or_default();
+        let replica = file
+            .replica
+            .map(|id| {
+                id.parse::<EndpointId>()
+                    .change_context(Error)
+                    .attach_with(|| format!("replica id {id:?}"))
+            })
+            .transpose()?;
+        let peers = file
+            .peers
+            .iter()
+            .filter_map(|p| {
+                let id = p.node.parse::<EndpointId>().ok()?;
+                Some(PeerTarget {
+                    id,
+                    relay: relay.clone(),
+                    addrs: p.addrs.iter().filter_map(|a| a.parse().ok()).collect(),
+                    token: token.clone(),
+                    kind: PeerKind::Desktop,
+                })
+            })
+            .collect();
+
         Ok(Self {
             store_path: data_dir.join("pendant.redb"),
-            relay_store_path: data_dir.join("relay.redb"),
+            node_store_path: data_dir.join("node.redb"),
+            node_key_path: data_dir.join("node_key"),
             device: load_device_id(&data_dir.join("device_id"))?,
-            relay_token: load_secret(&data_dir.join("relay_token"))?,
-            server: server.or(file.server),
-            fallback: file.fallback,
-            token: token.or(file.token).unwrap_or_default(),
-            relay_id: file.relay_id,
+            workspace_token: load_workspace_token(&data_dir)?,
+            relay,
+            token,
+            replica,
+            peers,
         })
     }
 
-    /// Every remote relay this desktop connects to, with the shared token.
-    pub fn remote_relays(&self) -> Vec<String> {
-        self.server
-            .iter()
-            .chain(self.fallback.iter())
-            .cloned()
-            .collect()
-    }
-
-    /// Token other devices use to pair: the remote relays' token when there
-    /// are any (it must open both paths), else the embedded relay's own.
+    /// Token other devices use to pair: the adopted workspace token when
+    /// there is one, else our own.
     pub fn pair_token(&self) -> String {
         if self.token.is_empty() {
-            self.relay_token.clone()
+            self.workspace_token.clone()
         } else {
             self.token.clone()
         }
     }
+
+    pub fn relay_target(&self) -> Option<RelayTarget> {
+        self.relay.clone().map(|url| RelayTarget {
+            url,
+            token: self.pair_token(),
+        })
+    }
+
+    /// Every node to dial: configured peers plus the replica.
+    pub fn peer_targets(&self) -> Vec<PeerTarget> {
+        let mut peers: Vec<PeerTarget> = self
+            .peers
+            .iter()
+            .cloned()
+            .map(|mut p| {
+                p.token = self.pair_token();
+                p
+            })
+            .collect();
+        if let Some(id) = self.replica {
+            peers.push(PeerTarget {
+                id,
+                relay: self.relay.clone(),
+                addrs: Vec::new(),
+                token: self.pair_token(),
+                kind: PeerKind::Replica,
+            });
+        }
+        peers
+    }
 }
 
-/// `pendant pair <uri>`: persist the pairing URI's server + token to
-/// config.toml so the next launch syncs against it.
+/// `pendant pair <uri>`: persist the pairing URI to config.toml so the
+/// next launch dials it.
 pub fn adopt_pair(uri: &str) -> Result<()> {
     let info = PairInfo::parse(uri)
         .ok_or_else(|| Report::new(Error).attach("not a pendant://pair URI"))?;
     let path = persist_pair(&info)?;
     writeln!(
         std::io::stdout(),
-        "paired: {} -> {}",
-        info.server,
+        "paired with node {} -> {}",
+        info.node,
         path.display()
     )
     .change_context(Error)?;
@@ -102,7 +167,7 @@ pub fn adopt_pair(uri: &str) -> Result<()> {
 }
 
 /// Write the pairing coordinates to config.toml; returns the path written.
-/// Shared by the CLI, the in-app join flow, and discovery re-pointing.
+/// Shared by the CLI and the in-app join flow.
 pub fn persist_pair(info: &PairInfo) -> Result<std::path::PathBuf> {
     let dirs = directories::ProjectDirs::from("dev", "darksailor", "pendant")
         .ok_or_else(|| Report::new(Error).attach("no home directory"))?;
@@ -112,10 +177,13 @@ pub fn persist_pair(info: &PairInfo) -> Result<std::path::PathBuf> {
         .attach_with(|| format!("creating {}", config_dir.display()))?;
     let path = config_dir.join("config.toml");
     let raw = toml::to_string_pretty(&FileConfig {
-        server: Some(info.server.clone()),
+        relay: info.relay.clone(),
         token: Some(info.token.clone()),
-        fallback: info.fallback.clone(),
-        relay_id: info.relay_id.clone(),
+        replica: info.replica.clone(),
+        peers: vec![PeerFile {
+            node: info.node.clone(),
+            addrs: info.addrs.clone(),
+        }],
     })
     .change_context(Error)?;
     std::fs::write(&path, raw)
@@ -132,21 +200,35 @@ fn read_config(config_dir: &Path) -> Result<FileConfig> {
     let raw = std::fs::read_to_string(&path)
         .change_context(Error)
         .attach_with(|| format!("reading {}", path.display()))?;
-    toml::from_str(&raw)
-        .change_context(Error)
-        .attach_with(|| format!("parsing {}", path.display()))
+    match toml::from_str(&raw) {
+        Ok(file) => Ok(file),
+        Err(err) => {
+            // A pre-P2P config (server/fallback keys) is simply stale.
+            tracing::warn!(%err, path = %path.display(), "ignoring unreadable config");
+            Ok(FileConfig::default())
+        }
+    }
 }
 
-/// Stable per-install random secret (the embedded relay's token), created
-/// on first run. A ULID carries 80 random bits, plenty for a bearer token.
-fn load_secret(path: &Path) -> Result<String> {
-    if let Ok(raw) = std::fs::read_to_string(path)
-        && !raw.trim().is_empty()
-    {
-        return Ok(raw.trim().to_string());
+/// Stable per-install random secret, created on first run (migrating the
+/// pre-P2P `relay_token` file). A ULID carries 80 random bits, plenty for
+/// a bearer token.
+fn load_workspace_token(data_dir: &Path) -> Result<String> {
+    let path = data_dir.join("workspace_token");
+    let legacy = data_dir.join("relay_token");
+    for candidate in [&path, &legacy] {
+        if let Ok(raw) = std::fs::read_to_string(candidate)
+            && !raw.trim().is_empty()
+        {
+            let token = raw.trim().to_string();
+            if candidate != &path {
+                let _ = std::fs::write(&path, &token);
+            }
+            return Ok(token);
+        }
     }
     let secret = ulid::Ulid::new().to_string();
-    std::fs::write(path, &secret)
+    std::fs::write(&path, &secret)
         .change_context(Error)
         .attach_with(|| format!("writing {}", path.display()))?;
     Ok(secret)

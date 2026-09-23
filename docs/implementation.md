@@ -14,11 +14,12 @@ rather than repeating them.
 | Language, toolchain | Rust, edition 2024, workspace resolver 3; nix flake (crane) for CI, dev shells and packages | `Cargo.toml`, `flake.nix` |
 | Document model | Loro 1.13 CRDT wrapped so no Loro type escapes; postcard for wire and chunk encoding; ULID ids | `crates/pendant-core/src/{note,workspace,sync_doc,ids,stroke}.rs` |
 | Persistence | redb 4 (`snapshots` + `updates` tables keyed by `DocKey(u128)`) | `crates/pendant-core/src/store.rs` |
-| Sync protocol | sans-io state machines, one version byte + postcard frame, WebSocket transport | `crates/pendant-core/src/sync.rs` |
+| Sync protocol | sans-io state machines, one version byte + postcard frame; QUIC lanes or in-process channels underneath | `crates/pendant-core/src/sync.rs` |
 | Ink | `BrushSpec` presets, EMA input model, tip evaluator, lyon 1.0 stroker and a convex-hull nib sweeper, one `InkMesh` type | `crates/pendant-core/src/{brush,geom}/` |
 | Shapes | deterministic draw-and-hold recogniser (ShortStraw corners, PCA fits) | `crates/pendant-core/src/shape.rs` |
-| Relay | axum 0.8 with `ws`, tokio, bearer token, redb behind a `DocProvider` | `crates/pendant-server` |
-| Desktop | Bevy 0.19.1 (`wayland`), bevy_egui 0.42, egui_commonmark 0.25, custom `Material2d` + WGSL; embedded relay with mDNS (`_pendant._tcp`) | `crates/pendant` |
+| Sync node | iroh 1.2 `Endpoint` (hole punching, relay fallback), redb mirror of every doc, hub fan-out, mDNS (`_pendant._udp`, feature `mdns`) | `crates/pendant-local` |
+| Cloud | iroh relay (`iroh-relay` server, workspace-token access control) + headless replica node in one binary | `crates/pendant-server` |
+| Desktop | Bevy 0.19.1 (`wayland`), bevy_egui 0.42, egui_commonmark 0.25, custom `Material2d` + WGSL; runs a `pendant-local` node in-process | `crates/pendant` |
 | iPad bridge | UniFFI 0.32 proc-macro bindings, staticlib per iOS target, XCFramework + generated `Pendant.swift` in a local SPM package | `crates/pendant-ffi`, `ios/PendantCore` |
 | iPad app | SwiftUI + UIKit, iOS 17 deployment target, Metal renderer (4x MSAA, sRGB, depth), PencilKit only as the tool picker, VisionKit QR scanner, Bonjour discovery; XcodeGen project | `ios/Pendant` |
 
@@ -28,14 +29,15 @@ rather than repeating them.
 Cargo.toml              virtual workspace: crates/*
 flake.nix               crane checks (clippy, fmt, toml-fmt, audit, deny, nextest, llvm-cov, docs), packages, dev shells
 crates/pendant-core     platform-free core (no async, no UI); ~8.4k lines
-crates/pendant-server   relay library + `pendant-server` binary
-crates/pendant          desktop binary (Bevy) with embedded relay, `pair` and `replay` subcommands
+crates/pendant-local    sync node library (iroh endpoint, hub, lanes, mDNS); compiles for iOS
+crates/pendant-server   `pendant-server` binary: iroh relay + replica node
+crates/pendant          desktop binary (Bevy) running a node, `pair` and `replay` subcommands
 crates/pendant-ffi      UniFFI surface for Swift, `uniffi-bindgen` bin behind the `bindgen` feature
 ios/PendantCore         SPM package: generated XCFramework + Pendant.swift (outputs of scripts/build-ios-core.sh)
 ios/Pendant             XcodeGen spec (project.yml), Sources/, UITests/
 scripts/build-ios-core.sh   cargo rustc for aarch64-apple-ios{,-sim} → bindgen → xcodebuild -create-xcframework
 scripts/swift-smoke.sh      host cdylib + bindgen + scripts/smoke/main.swift, run on macOS
-docs/architecture.md    sync topology, pairing, bridging, failure modes
+docs/architecture.md    sync topology, wire, pairing, fan-out, cloud deployment, failure modes
 docs/plans/             ink-renderer (done), shape-recognizer (done), brush-engine (P0–P2 done, P3–P4 planned)
 .github/workflows       build.yaml (nix check matrix + llvm-cov → codecov), docs.yaml (cargo doc check)
 ```
@@ -184,37 +186,49 @@ confidence; pen-up commits a `ShapeElement` under the wet stroke's id.
   behind `InputModelKind::Ism` / `BrushModeler::with_model`; the P4 trial,
   not what the canvas uses (decision in `docs/plans/brush-engine.md`).
 
-## 4. Relay (`pendant-server`)
+## 4. Sync node (`pendant-local`) and cloud (`pendant-server`)
 
-`AppState::new(store, tokens)` builds the axum router with one route,
-`/ws`. Each connection owns a `ServerSession`; `PeerRegistry` fans out
-`Broadcast` effects; `ServerDocs` lazily loads `SyncDoc`s over the store,
-checkpoints every 30 s and unloads idle ones (`maintenance`). The binary
-takes a TOML config or `--listen`, `--db`, `--token` (repeatable). The
-library is what the desktop embeds in-process. `tests/relay.rs` mounts the
-real router on an ephemeral port.
+Every device runs one `pendant_local::Node`: an iroh `Endpoint` with a
+persisted key (`node_key`), a redb mirror of every doc (`node.redb`,
+`ServerDocs` from `docs.rs`, checkpointed every 30 s, idle docs unloaded)
+and a `Hub` (peer registry, tokens, changed-gated fan-out). Inbound QUIC
+connections and the app's in-process `LocalLink` are served by the same
+`ServerSession` loop (`serve.rs`); outbound peers are driven by one dial
+loop each (`outbound.rs`: backoff, `ClientSession`, route reporting).
+Wire: ALPN `pendant/sync/1`, two lanes per connection (`framing.rs`).
+`Node` API: `start`, `local_link`, `set_peers`, `set_relay`,
+`add_addr_hint`, `add_token`, `peers` / `watch_peers`, `relay_health`,
+`suspend` / `resume` / `network_changed`, `shutdown`. `mdns.rs` (feature
+`mdns`, desktop only) advertises `_pendant._udp` and turns hits into
+address hints. `tests/mesh.rs` runs three nodes with the relay disabled.
+
+`pendant-server` is one binary: `relay.rs` spawns an `iroh_relay` server
+whose `TokenAccess` admits only workspace tokens; `replica.rs` starts a
+`Role::Replica` node behind it (accepts every token holder, never dials,
+pinned UDP port). `config.rs` reads the TOML shown in
+`docs/architecture.md`; `--dev` is plain HTTP on `127.0.0.1:3340` with
+the replica on and prints a pair URI. `tests/relay.rs` runs the real relay
+on an ephemeral port: convergence through the relay, latency, denied
+tokens, replica bridging offline edits.
 
 ## 5. Desktop (`pendant`)
 
 Bevy app with egui UI. Modules:
 
-- `config.rs`: data dir (store, device id, `relay_token`) and
-  `~/.config/pendant/config.toml` (`server`, `fallback`, `token`), all
-  overridable by `cli.rs` flags (`--data-dir`, `--server`, `--token`,
-  `--relay-listen`, `--follow-latest`). Subcommands: `completions`, `pair <uri>`,
-  `replay` (headless 120 Hz latency rig).
+- `config.rs`: data dir (store, `node.redb`, `node_key`, device id,
+  per-install `workspace_token`) and `~/.config/pendant/config.toml`
+  (`relay`, `token`, `replica`, `[[peers]]`), overridable by `cli.rs` flags
+  (`--data-dir`, `--relay`, `--token`, `--follow-latest`). Subcommands:
+  `completions`, `pair <uri>` (writes the pairing to config.toml),
+  `replay` (headless 120 Hz latency rig dialling a `--pair` URI),
+  `brush-lab`.
 - `docs.rs`: workspace registry and open notes over the shared store.
-- `relay.rs`: `EmbeddedRelay` serving the server router on `0.0.0.0` at an
-  ephemeral port (new each launch; `--relay-listen` pins one, falling back
-  to ephemeral if taken), advertised over mDNS with the device id in TXT.
-  8722 is reserved for the dedicated `pendant-server`.
-- `discovery.rs`: desktop-side `_pendant._tcp` browser (mdns-sd) for a
-  joined desktop's `relay_id`; repoints the direct link and persists the
-  new url when that desktop shows up at another address/port.
-- `sync.rs`: one tokio task per relay link owning its WebSocket with
-  backoff; the Bevy side drives one `ClientSession` per link each frame and
-  bridges updates between links. Link 0 is the embedded relay, link 1 the
-  optional dedicated relay. See `docs/architecture.md`.
+- `node.rs`: the `pendant-local` node as a Bevy resource (`SyncNode`),
+  mDNS advertise/browse feeding `add_addr_hint`, and the QR's direct
+  addresses following the endpoint's.
+- `sync.rs`: one `ClientSession` over the node's `LocalLink`, driven once
+  per frame; the node does peers, relay and fan-out. See
+  `docs/architecture.md`.
 - `ui.rs`: library sidebar, markdown editor bound to the CRDT by
   prefix/suffix diffing, live preview. `settings.rs`: sync state, devices,
   pairing QR, paste-to-join.
@@ -246,9 +260,10 @@ Bevy app with egui UI. Modules:
 
 UniFFI proc macros (`uniffi::setup_scaffolding!("pendant")`), no UDL.
 
-- `engine.rs`: `Core` (store, note registry, background sync; `create_note`,
-  `open_note`, `set_sync_server(direct, token, fallback)`, `connect`,
-  `suspend`, device registry) and `NoteSession` (text edits, title,
+- `engine.rs`: `Core` (store, the in-process `pendant-local` node, note
+  registry; `create_note`, `open_note`, `set_pairing(PairInfo)`,
+  `add_peer_addr`, `connect`, `suspend`, `network_changed`, `node_id`,
+  `bound_port`, `peers`, `sync_state`, `pair_info`, device registry) and `NoteSession` (text edits, title,
   sketches, `elements`, `begin_stroke` / `append_points` / `finish_stroke` /
   `cancel_stroke`, `finish_shape`, `erase_at`, `remove_element`). Events
   come back through the foreign traits `CoreListener` (`notes_changed`,
@@ -298,8 +313,9 @@ Bonjour usage strings, file sharing for recordings).
   links; images resolved by a caller callback. `SketchPreview.swift`:
   read-only preview on top of it with tappable sketch thumbnails.
 - `SettingsScreen.swift`, `PairScreen.swift`, `ScanScreen.swift`,
-  `RelayDiscovery.swift`: sync state, device registry, pairing QR out and in
-  (VisionKit), Bonjour lookup of the desktop relay.
+  `PeerDiscovery.swift`: peers and routes, device registry, pairing QR out
+  and in (VisionKit), Bonjour lookup (`_pendant._udp`, UDP resolve) of the
+  paired desktop for the relay-less LAN.
 - `SketchScreen.swift`: the canvas. A `UIScrollView` owns finger pan, zoom
   and inertia over an empty content view; the Metal view sits above it
   pinned to the screen and reads the scroll state into its `Viewport`.
@@ -343,11 +359,10 @@ Bonjour usage strings, file sharing for recordings).
   that replays the bundled `brush/` recordings through every input model
   with their metrics (`-labPage`, `-labModel` preselect).
 
-Launch arguments read from `UserDefaults`: `serverURL`, `altURLs`,
-`fallbackURL`, `token`, `relayId`, `pairURI`, `spike`, `brushLab`, `labPage`, `labModel`,
-`recordStrokes`, `tool`, `figureEight`, `fakeEstimates`, `pencilOnly`,
-`anyInput`. UI tests take the relay from `PENDANT_TEST_SERVER` and
-`PENDANT_TEST_TOKEN`.
+Launch arguments read from `UserDefaults`: `pairURI`, `spike`, `brushLab`,
+`labPage`, `labModel`, `recordStrokes`, `tool`, `figureEight`,
+`fakeEstimates`, `pencilOnly`, `anyInput`. UI tests take the pairing URI
+from `PENDANT_TEST_PAIR` (what `pendant-server --dev` prints).
 
 UI tests (`UITests/`): `SketchUITests` (create and draw, remote stroke and
 erase, marker self-overlap luminance, estimate settling, hold-to-shape,
@@ -371,11 +386,12 @@ other in the same commit.
 
 ```sh
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace                       # core 85+ tests, ffi + server relay round trips
+cargo test --workspace                       # core, local mesh, server relay, ffi round trips
 cargo fmt --all -- --check
 nix flake check                              # clippy, fmt, toml-fmt, audit, deny, nextest, llvm-cov, docs
-cargo run -p pendant                         # desktop with embedded relay
-cargo run -p pendant-server -- --listen 127.0.0.1:8722 --db relay.redb --token demo
+cargo run -p pendant                         # desktop node (LAN only without --relay)
+cargo run -p pendant-server -- --dev         # relay + replica on 127.0.0.1:3340, prints a pair URI
+cargo run -p pendant -- --data-dir /tmp/b pair '<uri>'   # second desktop joins
 
 scripts/build-ios-core.sh                    # xcframework + Pendant.swift
 scripts/swift-smoke.sh                       # bindings smoke
@@ -383,7 +399,7 @@ scripts/check-ipad.sh                        # simulator compile, no signing
 scripts/deploy-ipad.sh                       # device build + install + launch (paseo: run-ipad)
 scripts/gen-xcodeproj.sh                     # regenerate Pendant.xcodeproj from project.yml
 xcodebuild -project Pendant.xcodeproj -scheme Pendant -destination 'platform=iOS Simulator,id=<udid>' build-for-testing
-PENDANT_TEST_SERVER=ws://127.0.0.1:8722/ws PENDANT_TEST_TOKEN=demo xcodebuild test-without-building ... -only-testing:PendantUITests/SketchUITests
+PENDANT_TEST_PAIR='pendant://pair?…' xcodebuild test-without-building ... -only-testing:PendantUITests/SketchUITests
 ```
 
 The iOS scripts need Xcode. Run on Linux, each one hands itself to the Mac

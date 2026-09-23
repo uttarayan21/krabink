@@ -3,25 +3,19 @@
 pub struct Cli {
     #[clap(subcommand)]
     pub cmd: Option<SubCommand>,
-    /// Override the data directory (store + device id). Lets several
-    /// instances run side by side.
+    /// Override the data directory (stores, node key, device id). Lets
+    /// several instances run side by side.
     #[clap(long)]
     pub data_dir: Option<std::path::PathBuf>,
-    /// Dedicated relay url, e.g. wss://relay.example.com/ws, used as the
-    /// fallback path when a device cannot reach this desktop's embedded
-    /// relay directly. Overrides config.toml.
+    /// Home relay URL, e.g. https://relay.example.org: brokers the
+    /// handshake with peers and carries traffic when hole punching fails.
+    /// Overrides config.toml.
     #[clap(long)]
-    pub server: Option<String>,
-    /// Bearer token for the dedicated relay. Overrides config.toml.
+    pub relay: Option<String>,
+    /// Workspace token (relay access + peer handshake). Overrides
+    /// config.toml.
     #[clap(long)]
     pub token: Option<String>,
-    /// Address the embedded relay listens on. Port 0 (the default) picks
-    /// a free port each launch so the app never collides with a dedicated
-    /// pendant-server on 8722; paired devices re-find it over mDNS. Pin a
-    /// port only for firewall rules or scripted clients (falls back to an
-    /// ephemeral port when taken).
-    #[clap(long, default_value = crate::relay::DEFAULT_LISTEN)]
-    pub relay_listen: std::net::SocketAddr,
     /// Auto-open the most recently updated note whenever the library
     /// changes. Meant for demos and the replay latency rig.
     #[clap(long)]
@@ -63,14 +57,11 @@ pub enum SubCommand {
         #[clap(long)]
         metrics: bool,
     },
-    /// Stream synthetic 120Hz pen strokes through the relay (latency rig).
+    /// Stream synthetic 120Hz pen strokes to a paired node (latency rig).
     Replay {
-        /// Sync server url, e.g. ws://127.0.0.1:8722/ws.
+        /// The target's `pendant://pair` URI (from its settings screen).
         #[clap(long)]
-        server: String,
-        /// Bearer token for the sync server.
-        #[clap(long)]
-        token: String,
+        pair: String,
         /// How many strokes to draw.
         #[clap(long, default_value_t = 3)]
         strokes: usize,

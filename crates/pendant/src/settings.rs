@@ -1,20 +1,21 @@
-//! Settings window: per-relay sync state, this device, the synced device
+//! Settings window: peers and their routes, this device, the synced device
 //! registry, this desktop's `pendant://pair` QR for other devices to scan,
 //! and a paste field to join another workspace (mirrors the iPad screen).
 
 use bevy::prelude::*;
 use bevy_egui::egui;
 use pendant_core::{DeviceId, DeviceMeta, PairInfo};
+use pendant_local::{PeerKind, PeerState, PeerStatus, PeerTarget, RelayHealth, RelayTarget, Route};
 
-use crate::discovery::PairedDesktop;
-use crate::sync::{LOCAL_PLATFORM, LinkKind, LinkStatus, SyncStatus, local_device_name};
+use crate::node::SyncNode;
+use crate::sync::{LOCAL_PLATFORM, local_device_name};
 use crate::theme;
 
 /// Quiet-zone border around the QR matrix, in modules (spec minimum is 4).
 const QUIET_ZONE: usize = 4;
 
 /// Raised when the user joined a workspace from the pairing window; the
-/// handler persists it and swaps the live transport.
+/// handler persists it and repoints the node.
 #[derive(Message)]
 pub struct PairAdopted(pub PairInfo);
 
@@ -27,48 +28,59 @@ impl Plugin for SettingsPlugin {
     }
 }
 
-/// Persist the adopted coordinates, swap the remote links to the new
-/// workspace's relays, teach the embedded relay the new token, repoint
-/// the shared QR, and (when the URI came from a desktop) start looking
-/// for that desktop over mDNS. Registration with the new workspace rides
-/// the resulting `Connected` effect.
+/// Persist the adopted coordinates, teach the node the new token, move it
+/// to the workspace's relay, dial the pairing node (and replica), and
+/// repoint the shared QR. Registration with the new workspace rides the
+/// resulting catch-up.
 fn apply_adopted(
     mut adopted: MessageReader<PairAdopted>,
-    mut commands: Commands,
     runtime: Res<crate::Runtime>,
-    relay: Res<crate::relay::EmbeddedRelay>,
-    mut transport: ResMut<crate::sync::SyncTransport>,
+    sync: Res<SyncNode>,
     mut settings: ResMut<Settings>,
 ) {
     let Some(PairAdopted(info)) = adopted.read().last() else {
         return;
     };
-    match PairedDesktop::from_pair(info) {
-        Some(paired) => commands.insert_resource(paired),
-        None => commands.remove_resource::<PairedDesktop>(),
+    let target = match PeerTarget::from_pair(info, PeerKind::Desktop) {
+        Ok(target) => target,
+        Err(err) => {
+            tracing::error!(err, "pairing uri rejected");
+            return;
+        }
+    };
+    let mut peers = vec![target];
+    match PeerTarget::replica_from_pair(info) {
+        Ok(Some(replica)) => peers.push(replica),
+        Ok(None) => {}
+        Err(err) => tracing::warn!(err, "ignoring replica in pairing uri"),
     }
     match crate::config::persist_pair(info) {
         // Connect live either way; persistence only affects the next launch.
-        Ok(path) => tracing::info!(server = %info.server, path = %path.display(), "pair adopted"),
+        Ok(path) => tracing::info!(node = %info.node, path = %path.display(), "pair adopted"),
         Err(err) => tracing::error!(%err, "persisting pairing failed"),
     }
-    relay.add_token(&info.token);
-    // Desktop-to-desktop takes the preferred direct path + fallback only;
-    // the alternates are for mobile clients that hop networks.
-    transport.replace_remotes(
-        runtime.0.handle(),
-        std::iter::once(info.server.clone()).chain(info.fallback.clone()),
-        &info.token,
-    );
-    // Our QR keeps advertising our own relay as the direct path; the
-    // workspace we joined becomes the fallback everyone shares.
-    settings.adopt(PairInfo {
-        server: relay.advertised.clone(),
+    let node = sync.node.clone();
+    let relay = peers[0].relay.clone().map(|url| RelayTarget {
+        url,
         token: info.token.clone(),
-        fallback: Some(info.fallback.clone().unwrap_or_else(|| info.server.clone())),
-        alt: relay.alt.clone(),
-        relay_id: Some(transport.device().to_string()),
     });
+    node.add_token(info.token.clone());
+    runtime.0.block_on(async {
+        if let Err(err) = node.set_relay(relay).await {
+            tracing::error!(%err, "switching relay failed");
+        }
+        node.set_peers(peers).await;
+    });
+    // Our QR keeps pointing at us; the workspace's token, relay and
+    // replica become everyone's.
+    let own = PairInfo {
+        node: settings.info.node.clone(),
+        token: info.token.clone(),
+        relay: info.relay.clone(),
+        addrs: settings.info.addrs.clone(),
+        replica: info.replica.clone(),
+    };
+    settings.adopt(own);
 }
 
 /// What the user asked for from the window this frame.
@@ -82,12 +94,9 @@ pub enum SettingsAction {
 /// Read-only snapshot the window renders each frame; gathered by the
 /// caller because it spans several ECS resources.
 pub struct SettingsView {
-    pub links: Vec<LinkStatus>,
+    pub peers: Vec<PeerStatus>,
+    pub relay: RelayHealth,
     pub mdns_name: Option<String>,
-    /// Device id of the desktop we joined, when there is one.
-    pub paired_relay: Option<String>,
-    /// Where mDNS last saw that desktop; `None` until found.
-    pub discovered: Option<String>,
     pub this_device: DeviceId,
     pub devices: Vec<DeviceMeta>,
     pub now_ms: u64,
@@ -95,8 +104,8 @@ pub struct SettingsView {
 
 #[derive(Resource)]
 pub struct Settings {
-    /// What the QR advertises: our embedded relay + the shared token, plus
-    /// the dedicated relay as fallback when one is configured.
+    /// What the QR advertises: our node, the shared token, the relay and
+    /// replica (when configured) and our direct addresses.
     pub info: PairInfo,
     pub open: bool,
     texture: Option<egui::TextureHandle>,
@@ -118,11 +127,10 @@ impl Settings {
         }
     }
 
-    /// The joined desktop moved (`from` → `to`): when our QR's fallback
-    /// pointed at it, follow it so devices we pair inherit the live path.
-    pub fn direct_repointed(&mut self, from: &str, to: &str) {
-        if self.info.fallback.as_deref() == Some(from) {
-            self.info.fallback = Some(to.to_string());
+    /// The endpoint's direct addresses changed: refresh the QR.
+    pub fn set_addrs(&mut self, addrs: Vec<String>) {
+        if self.info.addrs != addrs {
+            self.info.addrs = addrs;
             self.texture = None;
         }
     }
@@ -189,57 +197,86 @@ impl Settings {
 
     fn sync_section(&self, ui: &mut egui::Ui, view: &SettingsView) {
         theme::section(ui, "Sync", |ui| {
-            egui::Grid::new("links")
+            let peers: Vec<&PeerStatus> = view
+                .peers
+                .iter()
+                .filter(|p| p.kind != PeerKind::Local)
+                .collect();
+            if peers.is_empty() {
+                ui.weak("No peers yet. Pair a device below or join another workspace.");
+            }
+            egui::Grid::new("peers")
                 .num_columns(3)
                 .spacing([16.0, 8.0])
                 .show(ui, |ui| {
-                    for link in &view.links {
-                        let (dot, label) = match link.status {
-                            SyncStatus::Connected => (theme::SUCCESS, "connected"),
-                            SyncStatus::Connecting => (theme::WARN, "connecting…"),
+                    for peer in peers {
+                        let (dot, label) = match &peer.state {
+                            PeerState::Connected {
+                                route: Some(Route::Direct(_)),
+                            } => (theme::SUCCESS, "direct"),
+                            PeerState::Connected {
+                                route: Some(Route::Relay(_)),
+                            } => (theme::SUCCESS, "via relay"),
+                            PeerState::Connected { route: None } => (theme::SUCCESS, "connected"),
+                            PeerState::Connecting => (theme::WARN, "connecting…"),
+                            PeerState::Fatal { .. } => (theme::DANGER, "rejected"),
                         };
                         theme::status_dot(ui, dot, label);
-                        ui.label(match link.kind {
-                            LinkKind::Embedded => "this desktop's relay",
-                            LinkKind::Remote => "dedicated relay",
+                        ui.label(match peer.kind {
+                            PeerKind::Replica => "cloud replica",
+                            PeerKind::Desktop => "desktop",
+                            PeerKind::Tablet => "tablet",
+                            PeerKind::Local | PeerKind::Unknown => {
+                                if peer.inbound {
+                                    "device (dialled us)"
+                                } else {
+                                    "peer"
+                                }
+                            }
                         });
-                        ui.monospace(
-                            egui::RichText::new(match link.kind {
-                                // Show the address peers use, not the loopback one.
-                                LinkKind::Embedded => &self.info.server,
-                                LinkKind::Remote => &link.server,
-                            })
-                            .color(theme::MUTED),
-                        );
+                        let detail = match &peer.state {
+                            PeerState::Connected {
+                                route: Some(Route::Direct(addr)),
+                            } => addr.to_string(),
+                            PeerState::Connected {
+                                route: Some(Route::Relay(url)),
+                            } => url.to_string(),
+                            PeerState::Fatal { message } => message.clone(),
+                            _ => peer
+                                .id
+                                .map(|id| id.fmt_short().to_string())
+                                .unwrap_or_default(),
+                        };
+                        ui.monospace(egui::RichText::new(detail).color(theme::MUTED));
                         ui.end_row();
                     }
                 });
-            if !self.info.alt.is_empty() {
-                ui.add_space(4.0);
-                ui.weak("also reachable at:");
-                for alt in &self.info.alt {
-                    ui.monospace(egui::RichText::new(alt).color(theme::MUTED));
-                }
-            }
             ui.add_space(4.0);
+            ui.weak(match (&self.info.relay, &view.relay) {
+                (Some(url), health) if health.connected => format!("relay {url}: connected"),
+                (Some(url), health) => match &health.error {
+                    Some(err) => format!("relay {url}: {err}"),
+                    None => format!("relay {url}: connecting…"),
+                },
+                (None, _) => "no relay: LAN only".to_string(),
+            });
             ui.weak(match &view.mdns_name {
                 Some(name) => format!("mDNS: {name}"),
                 None => "mDNS: off (advertising failed)".to_string(),
             });
-            if let Some(relay) = &view.paired_relay {
-                ui.weak(match &view.discovered {
-                    Some(url) => format!("paired desktop {relay}: seen over mDNS at {url}"),
-                    None => format!(
-                        "paired desktop {relay}: not seen over mDNS yet (using stored address)"
-                    ),
-                });
+            if !self.info.addrs.is_empty() {
+                ui.add_space(4.0);
+                ui.weak("direct addresses:");
+                for addr in &self.info.addrs {
+                    ui.monospace(egui::RichText::new(addr).color(theme::MUTED));
+                }
             }
-            if view.links.len() == 1 {
+            if self.info.relay.is_none() {
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(
-                        "No dedicated relay: devices must reach this desktop directly. \
-                         Add one with --server or config.toml to sync across networks.",
+                        "No relay: devices must reach this desktop on the LAN. \
+                         Add one with --relay or by joining a workspace to sync across networks.",
                     )
                     .color(theme::WARN),
                 );
@@ -261,6 +298,9 @@ impl Settings {
                     ui.monospace(
                         egui::RichText::new(view.this_device.to_string()).color(theme::MUTED),
                     );
+                    ui.end_row();
+                    ui.weak("node");
+                    ui.monospace(egui::RichText::new(&self.info.node).color(theme::MUTED));
                     ui.end_row();
                 });
         });
@@ -323,13 +363,13 @@ impl Settings {
                 "Scan with the other device's camera (iPad: Settings, then Scan pairing code), \
                  or run: pendant pair '<uri below>'.",
             );
-            ui.weak(match &self.info.fallback {
-                Some(fallback) => format!(
-                    "The device connects straight to this desktop on the LAN and falls back \
-                     to {fallback} elsewhere."
+            ui.weak(match &self.info.relay {
+                Some(relay) => format!(
+                    "The device meets this desktop through {relay} and talks to it \
+                     directly whenever a path exists (LAN, Tailscale, hole-punched)."
                 ),
-                None => "The device connects straight to this desktop on the LAN \
-                         (no fallback relay: it must be on the same network)."
+                None => "No relay configured: the device must be on the same network \
+                         (mDNS) or reach one of the addresses below."
                     .to_string(),
             });
             ui.add_space(10.0);

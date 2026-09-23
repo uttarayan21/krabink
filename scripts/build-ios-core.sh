@@ -15,6 +15,18 @@ out="$root/ios/PendantCore"
 gen="$root/target/uniffi-ios"
 profile=release
 
+# `ring` (iroh's TLS) builds C with `cc`; the nix devshell's CC targets
+# macOS, so point each iOS target at the matching Apple clang + SDK.
+ios_sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+sim_sdk=$(xcrun --sdk iphonesimulator --show-sdk-path)
+export CC_aarch64_apple_ios="$(xcrun --sdk iphoneos --find clang)"
+export AR_aarch64_apple_ios="$(xcrun --find ar)"
+export CFLAGS_aarch64_apple_ios="-isysroot $ios_sdk -target arm64-apple-ios17.0"
+export CC_aarch64_apple_ios_sim="$(xcrun --sdk iphonesimulator --find clang)"
+export AR_aarch64_apple_ios_sim="$(xcrun --find ar)"
+export CFLAGS_aarch64_apple_ios_sim="-isysroot $sim_sdk -target arm64-apple-ios17.0-simulator"
+export IPHONEOS_DEPLOYMENT_TARGET=17.0
+
 targets=(aarch64-apple-ios aarch64-apple-ios-sim)
 for target in "${targets[@]}"; do
   # staticlib only: no link step, so the (macOS-targeting) nix cc-wrapper and

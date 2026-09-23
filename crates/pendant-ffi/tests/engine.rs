@@ -1,16 +1,18 @@
-//! FFI engine tests: local persistence plus a full two-client sync round trip
-//! through the real relay router (in-process, ephemeral port).
+//! FFI engine tests: local persistence, then two `Core`s converging over
+//! their nodes — directly on loopback, and through a real dev relay with
+//! the headless replica in the middle.
 
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pendant_ffi::{
-    AssetInfo, AssetKind, BrushInfo, Core, CoreListener, Element, NoteInfo, NoteListener, Point2,
-    PointKind, Shape, ShapeElement, Stroke, StrokePoint, SyncState, Tool,
+    AssetInfo, AssetKind, BrushInfo, Core, CoreListener, Element, NoteInfo, NoteListener, PairInfo,
+    Point2, PointKind, Route, Shape, ShapeElement, Stroke, StrokePoint, SyncState, Tool,
 };
 
 fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         if cond() {
             return;
@@ -20,24 +22,74 @@ fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
-/// Real relay on an ephemeral port, on its own thread + runtime.
-fn start_server(dir: &std::path::Path, token: &str) -> String {
-    let store = pendant_core::Store::open(&dir.join("server.redb")).unwrap();
-    let state = pendant_server::AppState::new(store, vec![token.to_string()]);
-    let (addr_tx, addr_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async move {
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                addr_tx.send(listener.local_addr().unwrap()).unwrap();
-                axum::serve(listener, state.router()).await.unwrap();
-            });
-    });
-    let addr = addr_rx.recv().unwrap();
-    format!("ws://{addr}/ws")
+const TOKEN: &str = "secret";
+
+/// A dev relay (plain HTTP, ephemeral port) plus the workspace replica, on
+/// their own thread + runtime. Returns the replica's pairing URI, exactly
+/// what `pendant-server --dev` prints.
+struct Cloud {
+    pair: PairInfo,
+    _thread: std::thread::JoinHandle<()>,
+    stop: tokio::sync::oneshot::Sender<()>,
+}
+
+impl Cloud {
+    fn start(dir: &std::path::Path) -> Self {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let dir = dir.to_path_buf();
+        let thread = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let server = pendant_server::relay::spawn(
+                        pendant_server::RelayOpts::dev(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+                        vec![TOKEN.into()],
+                    )
+                    .await
+                    .expect("relay spawns");
+                    let url: iroh::RelayUrl =
+                        format!("http://{}", server.http_addr().expect("http listener"))
+                            .parse()
+                            .unwrap();
+                    let replica = pendant_server::replica::start(
+                        &pendant_server::ReplicaConfig {
+                            db: dir.join("replica.redb"),
+                            key: dir.join("replica.key"),
+                            udp_port: None,
+                        },
+                        url.clone(),
+                        vec![TOKEN.into()],
+                    )
+                    .await
+                    .expect("replica starts");
+                    ready_tx
+                        .send(PairInfo {
+                            node: replica.id().to_string(),
+                            token: TOKEN.into(),
+                            relay: Some(url.to_string()),
+                            addrs: Vec::new(),
+                            replica: None,
+                        })
+                        .unwrap();
+                    let _ = stop_rx.await;
+                    let _ = replica.shutdown().await;
+                    let _ = server.shutdown().await;
+                });
+        });
+        Self {
+            pair: ready_rx.recv().unwrap(),
+            _thread: thread,
+            stop,
+        }
+    }
+}
+
+fn connected(state: &SyncState) -> bool {
+    matches!(state, SyncState::Connected { .. })
 }
 
 #[derive(Default)]
@@ -187,40 +239,102 @@ fn bad_ids_are_rejected() {
     assert!(core.clone().open_note("not-a-ulid".into()).is_err());
     let note = core.clone().create_note("x".into()).unwrap();
     assert!(note.strokes("nope".into()).is_err());
-    assert!(core.connect().is_err(), "connect without server must fail");
+    assert!(
+        core.set_pairing(PairInfo {
+            node: "not-a-key".into(),
+            token: "t".into(),
+            relay: None,
+            addrs: Vec::new(),
+            replica: None,
+        })
+        .is_err(),
+        "bad node id must be rejected"
+    );
+    assert!(core.add_peer_addr(core.node_id(), "nope".into()).is_err());
+    // Unpaired: nothing to connect to, but the node is up and dialable.
+    assert!(core.bound_port().is_some());
+    assert_eq!(core.sync_state(), SyncState::Disconnected);
+}
+
+/// Two cores on one machine, no relay: B scans A's QR (with a loopback
+/// address for the test) and connects straight to it.
+#[test]
+fn two_cores_converge_direct() {
+    let dir = tempfile::tempdir().unwrap();
+    let core_a = Core::new(dir.path().join("a").to_str().unwrap().into()).unwrap();
+    let core_b = Core::new(dir.path().join("b").to_str().unwrap().into()).unwrap();
+    let rec_b = Arc::new(RecCore::default());
+    core_b.set_listener(rec_b.clone());
+
+    let mut pair = core_a.pair_info();
+    assert_eq!(pair.node, core_a.node_id());
+    assert!(pair.relay.is_none());
+    pair.addrs = vec![format!("127.0.0.1:{}", core_a.bound_port().unwrap())];
+    core_b.set_pairing(pair).unwrap();
+    wait_for("B connects to A", || connected(&core_b.sync_state()));
+    match core_b.sync_state() {
+        SyncState::Connected { peer, route } => {
+            assert_eq!(peer, core_a.node_id());
+            assert!(
+                matches!(route, Some(Route::Direct { .. })),
+                "loopback must be direct: {route:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(rec_b.states.lock().unwrap().iter().any(connected));
+    // A sees B as an inbound peer.
+    wait_for("A lists B", || {
+        core_a
+            .peers()
+            .iter()
+            .any(|p| p.inbound && p.node == core_b.node_id())
+    });
+
+    let note_a = core_a.clone().create_note("direct".into()).unwrap();
+    note_a.apply_text_edit(0, 0, "hi".into()).unwrap();
+    wait_for("note reaches B", || {
+        core_b.list_notes().iter().any(|n| n.title == "direct")
+    });
+    let note_b = core_b.clone().open_note(note_a.id()).unwrap();
+    wait_for("text reaches B", || note_b.text().unwrap() == "hi");
+
+    // Suspend drops the connection; connect brings it back.
+    core_b.suspend();
+    assert_eq!(core_b.sync_state(), SyncState::Disconnected);
+    note_a.apply_text_edit(2, 0, "!".into()).unwrap();
+    core_b.connect().unwrap();
+    wait_for("B reconnects", || connected(&core_b.sync_state()));
+    wait_for("offline edit reaches B", || note_b.text().unwrap() == "hi!");
 }
 
 #[test]
 fn two_cores_converge_through_relay() {
     let dir = tempfile::tempdir().unwrap();
-    let url = start_server(dir.path(), "secret");
+    let cloud = Cloud::start(dir.path());
 
-    // A: create a note, then go online.
+    // A: pair with the cloud (the `pendant-server --dev` URI), create a note.
     let core_a = Core::new(dir.path().join("a").to_str().unwrap().into()).unwrap();
+    core_a.set_pairing(cloud.pair.clone()).unwrap();
+    wait_for("A reaches the replica", || connected(&core_a.sync_state()));
     let note_a = core_a.clone().create_note("shared".into()).unwrap();
     let rec_a = Arc::new(RecNote::default());
     note_a.set_listener(rec_a.clone());
-    core_a.set_sync_server(vec![url.clone()], "secret".into(), None);
-    core_a.connect().unwrap();
     wait_for("A note synced", || *rec_a.synced.lock().unwrap() > 0);
 
-    // B: connect fresh, discover the note via the workspace, open it.
+    // B: scan A's QR. It carries the relay, so B reaches A even without a
+    // usable direct address; the replica is not named, so A is B's only peer.
     let core_b = Core::new(dir.path().join("b").to_str().unwrap().into()).unwrap();
     let rec_core_b = Arc::new(RecCore::default());
     core_b.set_listener(rec_core_b.clone());
-    core_b.set_sync_server(vec![url], "secret".into(), None);
-    core_b.connect().unwrap();
+    let mut pair = core_a.pair_info();
+    assert_eq!(pair.relay, cloud.pair.relay);
+    pair.addrs.clear();
+    core_b.set_pairing(pair).unwrap();
     wait_for("B discovers the note", || {
         core_b.list_notes().iter().any(|n| n.title == "shared")
     });
-    assert!(
-        rec_core_b
-            .states
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|s| matches!(s, SyncState::Connected { .. }))
-    );
+    assert!(rec_core_b.states.lock().unwrap().iter().any(connected));
 
     let note_b = core_b.clone().open_note(note_a.id()).unwrap();
     let rec_b = Arc::new(RecNote::default());
@@ -409,10 +523,26 @@ fn two_cores_converge_through_relay() {
         note_a.text().unwrap().ends_with("- from B")
     });
 
-    // Suspend is quiet and reconnect works.
+    // A goes to the background; B's edit waits in the replica; A comes
+    // back and catches up through it.
     core_a.suspend();
+    let len = note_b.text().unwrap().chars().count() as u64;
+    note_b
+        .apply_text_edit(len, 0, " (while A slept)".into())
+        .unwrap();
     core_a.connect().unwrap();
-    wait_for("A resynced after suspend", || {
-        *rec_a.synced.lock().unwrap() >= 2
+    wait_for("A catches up after suspend", || {
+        note_a.text().unwrap().ends_with("(while A slept)")
     });
+
+    // A wrong token is fatal, not an endless retry.
+    let core_c = Core::new(dir.path().join("c").to_str().unwrap().into()).unwrap();
+    let mut bad = cloud.pair.clone();
+    bad.token = "wrong".into();
+    core_c.set_pairing(bad).unwrap();
+    wait_for("C is rejected", || {
+        matches!(core_c.sync_state(), SyncState::Fatal { .. })
+    });
+
+    let _ = cloud.stop.send(());
 }

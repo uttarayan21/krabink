@@ -48,9 +48,11 @@ impl SyncDoc {
         Ok(self.doc.export(ExportMode::Snapshot)?)
     }
 
-    pub fn import_update(&self, bytes: &[u8]) -> Result<()> {
-        self.doc.import(bytes)?;
-        Ok(())
+    /// Import a remote update. Returns whether it added anything the doc
+    /// did not already have (false = duplicate, safe to not re-broadcast).
+    pub fn import_update(&self, bytes: &[u8]) -> Result<bool> {
+        let status = self.doc.import(bytes)?;
+        Ok(!status.success.is_empty())
     }
 }
 

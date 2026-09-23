@@ -92,11 +92,13 @@ impl DocProvider for ServerDocs {
         })
     }
 
-    fn import_update(&mut self, doc: DocKey, payload: &[u8]) -> Result<()> {
+    fn import_update(&mut self, doc: DocKey, payload: &[u8]) -> Result<bool> {
         self.ensure_open(doc)?;
         let entry = self.open.get_mut(&doc).expect("ensured above");
         entry.last_used = Instant::now();
-        entry.doc.import_update(payload)?;
+        if !entry.doc.import_update(payload)? {
+            return Ok(false); // duplicate: nothing new to persist or relay
+        }
         entry.pending_updates += 1;
         if entry.pending_updates >= COMPACT_AFTER_UPDATES {
             let snapshot = entry.doc.export_snapshot()?;
@@ -106,10 +108,18 @@ impl DocProvider for ServerDocs {
             // No fsync on the hot path; maintain() checkpoints durably.
             self.store.append_update(doc, payload, Flush::Eventual)?;
         }
-        Ok(())
+        Ok(true)
     }
 
+    /// Every doc on disk plus the open ones (a fresh doc may not have
+    /// been checkpointed yet).
     fn list_docs(&mut self) -> Vec<DocKey> {
-        self.open.keys().copied().collect()
+        let mut keys: Vec<DocKey> = self.store.keys().unwrap_or_default();
+        for key in self.open.keys() {
+            if !keys.contains(key) {
+                keys.push(*key);
+            }
+        }
+        keys
     }
 }

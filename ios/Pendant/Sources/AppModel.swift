@@ -11,18 +11,16 @@ import UIKit
 final class AppModel {
     let core: Core
     var notes: [NoteInfo] = []
-    var syncState = "offline"
-    private var target: PairInfo?
-    private var discovery: RelayDiscovery?
-    private var graceTask: Task<Void, Never>?
-    private var graceOver = false
-    /// Last direct list handed to the core, to skip no-op reconnects.
-    private var applied: [String]?
+    var syncState = "not paired"
+    /// Every peer the node knows, refreshed on each sync-state change.
+    var peers: [PeerInfo] = []
+    /// The workspace adopted from a pairing URI; nil until paired.
+    private(set) var paired: PairInfo?
+    private var discovery: PeerDiscovery?
     private var open: [String: NoteModel] = [:]
-    private var hasServer = false
     private let pathMonitor = NWPathMonitor()
     /// Suppress the very first path callback (fires with the initial state
-    /// right after connect(), which would be a redundant reconnect).
+    /// right after start).
     private var sawInitialPath = false
 
     init() {
@@ -35,33 +33,21 @@ final class AppModel {
         BrushLibrary.shared.attach(core)
         InkAssets.shared.setShared(core.listAssets())
 
-        // Server config via UserDefaults; launch arguments like
-        // `-serverURL ws://… -token demo` populate these automatically.
-        let defaults = UserDefaults.standard
-        if let url = defaults.string(forKey: "serverURL"),
-            let token = defaults.string(forKey: "token")
-        {
-            applyTarget(
-                PairInfo(
-                    server: url, token: token,
-                    fallback: defaults.string(forKey: "fallbackURL"),
-                    alt: defaults.stringArray(forKey: "altURLs") ?? [],
-                    relayId: defaults.string(forKey: "relayId")))
-        }
-        // `-pairURI pendant://pair?…` takes the same path as a scanned QR;
-        // exists so UI tests can exercise pairing without a camera.
-        if let uri = defaults.string(forKey: "pairURI") {
+        // The pairing persists as its URI; `-pairURI pendant://pair?…` as a
+        // launch argument takes the same path as a scanned QR (UI tests
+        // exercise pairing without a camera).
+        if let uri = UserDefaults.standard.string(forKey: "pairURI") {
             _ = adoptPair(uri: uri)
         }
 
-        // Reconnect when a usable network path returns (Wi-Fi handoff, VPN,
-        // airplane-mode off). The net task already backs off on drops; this
-        // just shortcuts the wait.
+        // Tell the node when the network changes (Wi-Fi handoff, VPN,
+        // airplane-mode off): it re-probes paths instead of waiting for
+        // timeouts.
         pathMonitor.pathUpdateHandler = { [weak self] path in
             guard path.status == .satisfied else { return }
             Task { @MainActor [weak self] in
-                guard let self, self.hasServer else { return }
-                if self.sawInitialPath { self.resume() } else { self.sawInitialPath = true }
+                guard let self else { return }
+                if self.sawInitialPath { self.core.networkChanged() } else { self.sawInitialPath = true }
             }
         }
         pathMonitor.start(queue: .global(qos: .utility))
@@ -72,87 +58,46 @@ final class AppModel {
     /// launch reconnects without re-pairing.
     func adoptPair(uri: String) -> Bool {
         guard let info = parsePairUri(uri: uri) else { return false }
-        let defaults = UserDefaults.standard
-        defaults.set(info.server, forKey: "serverURL")
-        defaults.set(info.token, forKey: "token")
-        defaults.set(info.fallback, forKey: "fallbackURL")
-        defaults.set(info.alt, forKey: "altURLs")
-        defaults.set(info.relayId, forKey: "relayId")
-        applyTarget(info)
-        return true
-    }
-
-    /// The stored pairing coordinates; nil while offline.
-    var pairInfo: PairInfo? {
-        let defaults = UserDefaults.standard
-        guard let url = defaults.string(forKey: "serverURL"),
-            let token = defaults.string(forKey: "token")
-        else { return nil }
-        return PairInfo(
-            server: url, token: token,
-            fallback: defaults.string(forKey: "fallbackURL"),
-            alt: defaults.stringArray(forKey: "altURLs") ?? [],
-            relayId: defaults.string(forKey: "relayId"))
-    }
-
-    /// The URI this device shows as a QR code; nil while offline.
-    var pairURI: String? {
-        pairInfo.map(buildPairUri)
-    }
-
-    /// Direct URL Bonjour found for the paired desktop, if any.
-    var discoveredURL: String? { discovery?.url }
-
-    /// Adopt pairing coordinates: start looking for the desktop on the
-    /// local network, then hand the core its candidate list (see
-    /// `retarget`). Registration in the device registry rides along.
-    private func applyTarget(_ info: PairInfo) {
-        target = info
-        hasServer = true
-        applied = nil
-        graceOver = false
-        discovery?.stop()
-        discovery = nil
-        graceTask?.cancel()
-        if let relayId = info.relayId {
-            let finder = RelayDiscovery(relayId: relayId)
-            finder.onChange = { [weak self] in self?.retarget() }
-            finder.start()
-            discovery = finder
-            syncState = "looking for desktop…"
-            // Give Bonjour a moment before committing to the stored
-            // addresses; a hit cancels the wait via onChange.
-            graceTask = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(2))
-                guard !Task.isCancelled else { return }
-                self?.graceOver = true
-                self?.retarget()
-            }
-        } else {
-            graceOver = true
-            retarget()
+        do {
+            try core.setPairing(info: info)
+        } catch {
+            syncState = "error: \(error)"
+            return false
         }
+        UserDefaults.standard.set(uri, forKey: "pairURI")
+        paired = info
+        syncState = "connecting"
+        applyDiscovery(info)
         // Announce this device in the synced registry so peers can list it.
         try? core.registerDevice(
             name: UIDevice.current.name, platform: UIDevice.current.model)
+        return true
     }
 
-    /// Hand the core its direct candidates (Bonjour hit first, then the
-    /// QR's addresses) plus the fallback relay. The core races the direct
-    /// paths and only uses the fallback when none answers.
-    private func retarget() {
-        guard let target, graceOver || discovery?.url != nil else { return }
-        graceOver = true
-        var direct = [target.server] + target.alt
-        if let found = discovery?.url {
-            direct.removeAll { $0 == found }
-            direct.insert(found, at: 0)
+    /// What this device shows as a QR: its own node plus the adopted
+    /// workspace's token and relay. Valid before pairing too (then it
+    /// carries this device's own token and no relay).
+    var pairInfo: PairInfo { core.pairInfo() }
+
+    var pairURI: String { buildPairUri(info: pairInfo) }
+
+    /// Direct address Bonjour found for the paired desktop, if any.
+    var discoveredAddr: String? { discovery?.addr }
+
+    /// Look for the paired desktop on the local network; a hit becomes an
+    /// address hint for the node (only matters when the relay is down).
+    private func applyDiscovery(_ info: PairInfo) {
+        discovery?.stop()
+        let finder = PeerDiscovery(nodeId: info.node)
+        finder.onFound = { [weak self] addr in
+            try? self?.core.addPeerAddr(node: info.node, addr: addr)
         }
-        guard direct != applied else { return }
-        applied = direct
-        core.setSyncServer(direct: direct, token: target.token, fallback: target.fallback)
-        try? core.connect()
-        syncState = "connecting"
+        finder.start()
+        discovery = finder
+    }
+
+    func refreshPeers() {
+        peers = core.peers()
     }
 
     /// Registry row is gone everywhere once this syncs; note history stays
@@ -173,14 +118,14 @@ final class AppModel {
         try? core.removeDevice(id: id)
     }
 
-    /// Foreground / network-return: restart background sync.
+    /// Foreground: bring the node back online and redial every peer.
     func resume() {
-        guard hasServer else { return }
         discovery?.start()
         try? core.connect()
     }
 
-    /// Background: drop the socket so iOS doesn't kill us holding it.
+    /// Background: close every connection so iOS doesn't kill us holding
+    /// them.
     func suspend() {
         discovery?.stop()
         core.suspend()
@@ -364,14 +309,25 @@ private final class CoreEvents: CoreListener {
     }
 
     func syncState(state: SyncState) {
-        let label: String
-        switch state {
-        case .disconnected: label = "offline"
-        case .connecting: label = "connecting"
-        case .connected(let url): label = "connected via \(url)"
-        case .fatal(let message): label = "error: \(message)"
+        Task { @MainActor [weak model] in
+            guard let model else { return }
+            model.syncState = Self.label(state, paired: model.paired != nil)
+            model.refreshPeers()
         }
-        Task { @MainActor [weak model] in model?.syncState = label }
+    }
+
+    static func label(_ state: SyncState, paired: Bool) -> String {
+        switch state {
+        case .disconnected: return paired ? "offline" : "not paired"
+        case .connecting: return "connecting"
+        case .connected(_, let route):
+            switch route {
+            case .direct(let addr): return "connected direct \(addr)"
+            case .relay: return "connected via relay"
+            case nil: return "connected"
+            }
+        case .fatal(let message): return "error: \(message)"
+        }
     }
 }
 

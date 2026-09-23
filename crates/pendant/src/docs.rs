@@ -207,18 +207,19 @@ impl Docs {
 }
 
 impl ClientDocs for Docs {
-    fn import(&mut self, doc: DocKey, payload: &[u8]) -> pendant_core::Result<()> {
+    fn import(&mut self, doc: DocKey, payload: &[u8]) -> pendant_core::Result<bool> {
         if payload.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
-        if doc == DocKey::WORKSPACE {
-            self.workspace.import_update(payload)?;
+        let changed = if doc == DocKey::WORKSPACE {
+            self.workspace.import_update(payload)?
         } else if let Some((_, note)) = self.open.iter().find(|(id, _)| DocKey::from(**id) == doc) {
-            note.import_update(payload)?;
+            note.import_update(payload)?
         } else {
-            return Ok(()); // not open; server keeps it, nothing to do
-        }
-        self.persist(doc, payload)
+            return Ok(false); // not open; the node keeps it, nothing to do
+        };
+        self.persist(doc, payload)?;
+        Ok(changed)
     }
 
     fn updates_since(&mut self, doc: DocKey, have: &[u8]) -> pendant_core::Result<Vec<u8>> {

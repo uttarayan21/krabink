@@ -219,26 +219,26 @@ impl From<pcore::DeviceMeta> for DeviceInfo {
 /// Sync coordinates carried by a `pendant://pair` URI (QR pairing).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct PairInfo {
-    /// Preferred direct path: the sharing desktop's embedded relay.
-    pub server: String,
+    /// Endpoint id (public key) of the sharing device's node.
+    pub node: String,
+    /// Workspace token every node and the relay accept.
     pub token: String,
-    /// Dedicated relay to route through when no direct path is reachable.
-    pub fallback: Option<String>,
-    /// Further direct paths to the same desktop (other interfaces).
-    pub alt: Vec<String>,
-    /// The desktop's device id: match against the `id` TXT record of a
-    /// browsed `_pendant._tcp` service to find it by mDNS.
-    pub relay_id: Option<String>,
+    /// Home relay URL, e.g. `https://relay.example.org`.
+    pub relay: Option<String>,
+    /// Direct `ip:port` hints for the node, best first.
+    pub addrs: Vec<String>,
+    /// Endpoint id of the workspace's cloud replica.
+    pub replica: Option<String>,
 }
 
 impl From<pcore::PairInfo> for PairInfo {
     fn from(p: pcore::PairInfo) -> Self {
         Self {
-            server: p.server,
+            node: p.node,
             token: p.token,
-            fallback: p.fallback,
-            alt: p.alt,
-            relay_id: p.relay_id,
+            relay: p.relay,
+            addrs: p.addrs,
+            replica: p.replica,
         }
     }
 }
@@ -246,11 +246,11 @@ impl From<pcore::PairInfo> for PairInfo {
 impl From<PairInfo> for pcore::PairInfo {
     fn from(p: PairInfo) -> Self {
         Self {
-            server: p.server,
+            node: p.node,
             token: p.token,
-            fallback: p.fallback,
-            alt: p.alt,
-            relay_id: p.relay_id,
+            relay: p.relay,
+            addrs: p.addrs,
+            replica: p.replica,
         }
     }
 }
@@ -308,16 +308,103 @@ impl From<pcore::NoteMeta> for NoteInfo {
     }
 }
 
-/// Connection state reported to [`crate::CoreListener::sync_state`].
+/// The path a peer connection currently uses.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum Route {
+    /// Hole-punched or LAN path straight to the peer.
+    Direct { addr: String },
+    /// Bytes go through the home relay (no direct path yet, or none possible).
+    Relay { url: String },
+}
+
+impl From<pendant_local::Route> for Route {
+    fn from(r: pendant_local::Route) -> Self {
+        match r {
+            pendant_local::Route::Direct(addr) => Self::Direct {
+                addr: addr.to_string(),
+            },
+            pendant_local::Route::Relay(url) => Self::Relay {
+                url: url.to_string(),
+            },
+        }
+    }
+}
+
+/// What a peer is to this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PeerKind {
+    Replica,
+    Desktop,
+    Tablet,
+    Unknown,
+}
+
+impl PeerKind {
+    /// `None` for the in-process app link, which is not a peer to show.
+    pub(crate) fn from_local(k: pendant_local::PeerKind) -> Option<Self> {
+        Some(match k {
+            pendant_local::PeerKind::Local => return None,
+            pendant_local::PeerKind::Replica => Self::Replica,
+            pendant_local::PeerKind::Desktop => Self::Desktop,
+            pendant_local::PeerKind::Tablet => Self::Tablet,
+            pendant_local::PeerKind::Unknown => Self::Unknown,
+        })
+    }
+}
+
+/// One live or wanted peer connection of this node.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PeerInfo {
+    /// Endpoint id; empty until an inbound peer is identified.
+    pub node: String,
+    pub kind: PeerKind,
+    /// True when the peer dialled us.
+    pub inbound: bool,
+    /// Handshake done.
+    pub connected: bool,
+    /// Path in use; `None` while connecting or before the first path report.
+    pub route: Option<Route>,
+    /// Why the peer rejected us, when it did.
+    pub error: Option<String>,
+    /// The peer's device id in the synced registry, once it said hello.
+    pub device: Option<String>,
+}
+
+impl PeerInfo {
+    pub(crate) fn from_status(s: pendant_local::PeerStatus) -> Option<Self> {
+        let kind = PeerKind::from_local(s.kind)?;
+        let (connected, route, error) = match s.state {
+            pendant_local::PeerState::Connecting => (false, None, None),
+            pendant_local::PeerState::Connected { route } => (true, route.map(Into::into), None),
+            pendant_local::PeerState::Fatal { message } => (false, None, Some(message)),
+        };
+        Some(Self {
+            node: s.id.map(|id| id.to_string()).unwrap_or_default(),
+            kind,
+            inbound: s.inbound,
+            connected,
+            route,
+            error,
+            device: s.device.map(|d| d.to_string()),
+        })
+    }
+}
+
+/// Aggregate connection state reported to
+/// [`crate::CoreListener::sync_state`]: the best peer wins.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum SyncState {
+    /// Suspended, or nothing to connect to (no pairing, no inbound peer).
     Disconnected,
     Connecting,
-    /// Handshake done; `url` is the path that won (direct or fallback).
+    /// At least one peer is up; `peer` is the endpoint id of the best one
+    /// (direct beats relay) and `route` how it is reached.
     Connected {
-        url: String,
+        peer: String,
+        route: Option<Route>,
     },
-    /// Server rejected us; reconnecting without change is pointless.
+    /// A peer or the relay rejected us; reconnecting without change is
+    /// pointless.
     Fatal {
         message: String,
     },

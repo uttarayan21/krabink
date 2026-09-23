@@ -25,7 +25,7 @@ impl Docs {
 }
 
 impl ClientDocs for Docs {
-    fn import(&mut self, doc: DocKey, payload: &[u8]) -> Result<()> {
+    fn import(&mut self, doc: DocKey, payload: &[u8]) -> Result<bool> {
         self.0[&doc].import_update(payload)
     }
 
@@ -43,7 +43,7 @@ impl DocProvider for Docs {
         })
     }
 
-    fn import_update(&mut self, doc: DocKey, payload: &[u8]) -> Result<()> {
+    fn import_update(&mut self, doc: DocKey, payload: &[u8]) -> Result<bool> {
         self.0[&doc].import_update(payload)
     }
 

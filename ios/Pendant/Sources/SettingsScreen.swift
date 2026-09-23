@@ -26,16 +26,19 @@ struct SettingsScreen: View {
                                 .truncationMode(.middle)
                         }
                     }
-                    row(
-                        "server",
-                        UserDefaults.standard.string(forKey: "serverURL") ?? "not set")
-                    if let alt = model.pairInfo?.alt, !alt.isEmpty {
-                        row("also", alt.joined(separator: "\n"))
+                    if let paired = model.paired {
+                        row("desktop", shortId(paired.node), mono: true)
+                        row("relay", paired.relay ?? "none")
+                        if let replica = paired.replica {
+                            row("replica", shortId(replica), mono: true)
+                        }
+                    } else {
+                        row("workspace", "not paired")
                     }
-                    row("found nearby", model.discoveredURL ?? "no")
-                    row(
-                        "fallback relay",
-                        UserDefaults.standard.string(forKey: "fallbackURL") ?? "none")
+                    row("found nearby", model.discoveredAddr ?? "no")
+                    ForEach(Array(model.peers.enumerated()), id: \.offset) { _, peer in
+                        row(peerLabel(peer), peerState(peer))
+                    }
                 } header: {
                     Caption("Sync")
                 }
@@ -91,13 +94,11 @@ struct SettingsScreen: View {
                     }
                 }
 
-                if let uri = model.pairURI {
-                    Section {
-                        PairScreen(uri: uri)
-                            .frame(maxWidth: .infinity)
-                    } header: {
-                        Caption("Pair a new device")
-                    }
+                Section {
+                    PairScreen(uri: model.pairURI)
+                        .frame(maxWidth: .infinity)
+                } header: {
+                    Caption("Pair a new device")
                 }
 
                 Section {
@@ -198,6 +199,28 @@ struct SettingsScreen: View {
 
     private func refresh() {
         devices = model.devices()
+        model.refreshPeers()
+    }
+
+    private func peerLabel(_ peer: PeerInfo) -> String {
+        let kind: String
+        switch peer.kind {
+        case .replica: kind = "replica"
+        case .desktop: kind = "desktop"
+        case .tablet: kind = "tablet"
+        case .unknown: kind = "peer"
+        }
+        return peer.inbound ? "\(kind) (dialled us)" : kind
+    }
+
+    private func peerState(_ peer: PeerInfo) -> String {
+        if let error = peer.error { return "rejected: \(error)" }
+        guard peer.connected else { return "connecting" }
+        switch peer.route {
+        case .direct(let addr): return "direct \(addr)"
+        case .relay: return "via relay"
+        case nil: return "connected"
+        }
     }
 
     private func shortId(_ id: String) -> String {

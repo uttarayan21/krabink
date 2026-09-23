@@ -10,14 +10,23 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
 - [ ] Presence cursors (who's editing / where, over the ephemeral channel).
 - [ ] Shallow-snapshot GC (compact old CRDT history, bound store growth).
 - [ ] `pendant export` CLI (markdown + SVG assets bundle to disk).
-- [ ] Config UI (server URL / token) instead of launch args + UserDefaults.
+- [ ] Config UI (relay URL / token) instead of launch args + UserDefaults.
+- [ ] Publish `{endpoint_id, relay}` in `DeviceMeta` so nodes dial every
+      workspace device without pairwise QRs (today: scanner dials QR owner,
+      everyone dials the replica).
 - [ ] Desktop-side sketch editing (currently view-only on desktop).
 
 ## Known debt
 
 ### Sync / transport
-- [ ] No `wss://` TLS on client sockets (desktop + FFI). Fine behind a reverse
-      proxy; add native TLS before direct internet exposure.
+- [ ] Second redb on every device: the node mirrors docs in `node.redb`
+      next to the app's own store (`pendant.redb`). Accepted for now (idle
+      unload 300 s, compaction every 1000 updates); later make the FFI
+      `State` and desktop `Docs` implement `DocProvider` directly.
+- [ ] Peer `Fatal` (bad token) is sticky until `set_peers` / `resume`; no
+      retry timer, no UI action to re-pair besides scanning again.
+- [ ] mDNS is desktop-to-desktop and iPad-to-desktop only; an iPad never
+      advertises, so two iPads on a relay-less LAN cannot find each other.
 - [ ] Note close/unsubscribe not exposed over FFI — open notes stay subscribed
       for the session.
 - [ ] Change events are coarse (full-text + per-sketch, not deltas). Fine until
@@ -38,6 +47,13 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
       UITextView↔CRDT offset mapping requires view text == CRDT text.
 - [ ] Wet ink carries no per-point size yet; receivers (desktop and iPad, same
       ribbon code) fall back to `base_width * force` until the commit lands.
+
+### Core
+- [ ] `shape::tests::clean_shapes_are_recognised_equivariantly` fails on the
+      case proptest saved in `crates/pendant-core/proptest-regressions/shape.txt`
+      (found 2026-09-22 while running the suite; `shape.rs` unchanged). A
+      wide, shallow arc keeps its kind after scale + translate but its
+      bounds drift ~10 units past the tolerance (`shape.rs:2388`).
 
 ### Desktop
 - [ ] Cursor can jump when a remote edit lands while typing in the same note

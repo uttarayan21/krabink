@@ -24,14 +24,14 @@ ism = ["pendant-core/ism"]
 
 [dependencies]
 pendant-core.workspace = true
+pendant-local.workspace = true
 uniffi.workspace = true
 tokio.workspace = true
-tokio-tungstenite.workspace = true
-futures.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+ulid.workspace = true
 
 [dev-dependencies]
 pendant-server.workspace = true
-axum.workspace = true
+iroh.workspace = true
 tempfile.workspace = true

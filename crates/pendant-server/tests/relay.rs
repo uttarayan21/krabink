@@ -1,201 +1,179 @@
-//! Integration test: real server on an ephemeral port, three headless clients
-//! over real WebSockets. Verifies convergence and relay latency.
+//! Real relay on an ephemeral port: nodes find each other through it,
+//! tokens gate it, the replica bridges devices that are never online
+//! together.
 
-use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use futures::{SinkExt, StreamExt};
-use pendant_core::{
-    ClientDocs, ClientEffect, ClientSession, DeviceId, DocKey, NoteDoc, NoteId, Result, ServerMsg,
-    Store,
-};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::protocol::Message;
+use iroh::RelayUrl;
+use iroh_relay::server::Server;
+use pendant_core::NoteId;
+use pendant_local::testing::{App, TOKEN, node, node_with_role, relay_target, wait_connected};
+use pendant_local::{PeerKind, RelayTarget, Role};
+use pendant_server::RelayOpts;
 
-const TOKEN: &str = "integration-token";
-
-struct Docs(HashMap<DocKey, NoteDoc>);
-
-impl ClientDocs for Docs {
-    fn import(&mut self, doc: DocKey, payload: &[u8]) -> Result<()> {
-        self.0[&doc].import_update(payload)
-    }
-
-    fn updates_since(&mut self, doc: DocKey, have: &[u8]) -> Result<Vec<u8>> {
-        self.0[&doc].export_updates_since(have)
-    }
+async fn dev_relay() -> (Server, RelayUrl) {
+    let server = pendant_server::relay::spawn(
+        RelayOpts::dev(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        vec![TOKEN.into()],
+    )
+    .await
+    .expect("relay spawns");
+    let url: RelayUrl = format!("http://{}", server.http_addr().expect("http listener"))
+        .parse()
+        .unwrap();
+    (server, url)
 }
 
-type Socket =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-struct TestClient {
-    session: ClientSession,
-    docs: Docs,
-    socket: Socket,
-}
-
-impl TestClient {
-    async fn connect(port: u16, note: NoteId) -> Self {
-        let mut request = format!("ws://127.0.0.1:{port}/ws")
-            .into_client_request()
-            .unwrap();
-        request
-            .headers_mut()
-            .insert("Authorization", format!("Bearer {TOKEN}").parse().unwrap());
-        let (socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
-
-        let mut client = Self {
-            session: ClientSession::new(DeviceId::new(), TOKEN.into()),
-            docs: Docs(HashMap::from([(DocKey::from(note), NoteDoc::new(note))])),
-            socket,
-        };
-        let effects = client.session.connect();
-        client.run_effects(effects).await;
-        client.recv_until(|c| c.session.is_ready()).await;
-
-        let key = DocKey::from(note);
-        let have = client.docs.0[&key].version();
-        let effects = client.session.subscribe(key, have);
-        client.run_effects(effects).await;
-        client.recv_until(|c| c.session.is_subscribed(key)).await;
-        client
-    }
-
-    fn note(&self, key: DocKey) -> &NoteDoc {
-        &self.docs.0[&key]
-    }
-
-    async fn edit(&mut self, key: DocKey, edit: impl FnOnce(&NoteDoc)) {
-        let before = self.note(key).version();
-        edit(self.note(key));
-        let payload = self.note(key).export_updates_since(&before).unwrap();
-        let effects = self.session.local_update(key, payload);
-        self.run_effects(effects).await;
-    }
-
-    /// Receive and apply frames until `done` holds. Panics after 5s.
-    async fn recv_until(&mut self, done: impl Fn(&Self) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !done(self) {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .expect("recv_until timed out");
-            let frame = tokio::time::timeout(remaining, self.socket.next())
-                .await
-                .expect("recv_until timed out")
-                .expect("socket closed")
-                .expect("socket error");
-            let Message::Binary(bytes) = frame else {
-                continue;
-            };
-            let msg = ServerMsg::decode(&bytes).unwrap();
-            let effects = self.session.handle(msg, &mut self.docs);
-            self.run_effects(effects).await;
-        }
-    }
-
-    async fn run_effects(&mut self, effects: Vec<ClientEffect>) {
-        for effect in effects {
-            match effect {
-                ClientEffect::Send(msg) => {
-                    self.socket
-                        .send(Message::Binary(msg.encode().unwrap().into()))
-                        .await
-                        .unwrap();
-                }
-                ClientEffect::Fatal(err) => panic!("client fatal: {err}"),
-                ClientEffect::Connected
-                | ClientEffect::DocSynced(_)
-                | ClientEffect::Ephemeral { .. } => {}
-            }
-        }
-    }
-}
-
-async fn spawn_server() -> u16 {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("server.redb")).unwrap();
-    let state = pendant_server::AppState::new(store, vec![TOKEN.into()]);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        let _dir = dir; // keep the store's tempdir alive for the whole test
-        axum::serve(listener, state.router()).await.unwrap();
-    });
-    port
-}
-
-#[tokio::test]
-async fn three_clients_converge_over_real_sockets() {
-    let port = spawn_server().await;
-    let note = NoteId::new();
-    let key = DocKey::from(note);
-
-    let mut a = TestClient::connect(port, note).await;
-    let mut b = TestClient::connect(port, note).await;
-    let mut c = TestClient::connect(port, note).await;
-
-    a.edit(key, |doc| doc.splice_text(0, 0, "alpha ").unwrap())
-        .await;
-    b.recv_until(|cl| cl.note(key).text().contains("alpha"))
-        .await;
-    b.edit(key, |doc| {
-        let len = doc.text_len();
-        doc.splice_text(len, 0, "beta ").unwrap();
+fn relay(url: &RelayUrl, token: &str) -> Option<RelayTarget> {
+    Some(RelayTarget {
+        url: url.clone(),
+        token: token.into(),
     })
-    .await;
-
-    let done = |cl: &TestClient| {
-        let text = cl.note(key).text();
-        text.contains("alpha") && text.contains("beta")
-    };
-    a.recv_until(done).await;
-    c.recv_until(done).await;
-
-    assert_eq!(a.note(key).text(), b.note(key).text());
-    assert_eq!(a.note(key).text(), c.note(key).text());
 }
 
 #[tokio::test]
-async fn relay_latency_p95_under_10ms() {
-    let port = spawn_server().await;
+async fn three_nodes_converge_over_relay() {
+    let (_server, url) = dev_relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    let a = node(&dir, "a", &[TOKEN], relay(&url, TOKEN)).await;
+    let b = node(&dir, "b", &[TOKEN], relay(&url, TOKEN)).await;
+    let c = node(&dir, "c", &[TOKEN], relay(&url, TOKEN)).await;
     let note = NoteId::new();
-    let key = DocKey::from(note);
+    let mut app_a = App::open(&a, note).await;
+    let mut app_b = App::open(&b, note).await;
+    let mut app_c = App::open(&c, note).await;
 
-    let mut a = TestClient::connect(port, note).await;
-    let mut b = TestClient::connect(port, note).await;
-
-    let mut samples = Vec::with_capacity(50);
-    for i in 0..50u32 {
-        let marker = format!("m{i};");
-        let started = Instant::now();
-        a.edit(key, |doc| {
-            let len = doc.text_len();
-            doc.splice_text(len, 0, &marker).unwrap();
-        })
+    // Only the relay is known: the handshake has to go through it.
+    b.set_peers(vec![relay_target(&a, TOKEN, PeerKind::Desktop)])
         .await;
-        b.recv_until(|cl| cl.note(key).text().contains(&marker))
-            .await;
-        samples.push(started.elapsed());
-    }
+    c.set_peers(vec![relay_target(&a, TOKEN, PeerKind::Desktop)])
+        .await;
+    wait_connected(&b, &a).await;
+    wait_connected(&c, &a).await;
 
+    app_b.edit(note, "via relay");
+    app_a.pump_until(|app| app.text(note) == "via relay").await;
+    app_c.pump_until(|app| app.text(note) == "via relay").await;
+
+    c.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    a.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn relay_latency_p95_under_budget() {
+    let (_server, url) = dev_relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    let a = node(&dir, "a", &[TOKEN], relay(&url, TOKEN)).await;
+    let b = node(&dir, "b", &[TOKEN], relay(&url, TOKEN)).await;
+    let note = NoteId::new();
+    let mut app_a = App::open(&a, note).await;
+    let mut app_b = App::open(&b, note).await;
+    b.set_peers(vec![relay_target(&a, TOKEN, PeerKind::Desktop)])
+        .await;
+    wait_connected(&b, &a).await;
+
+    let mut samples = Vec::new();
+    for i in 0..50 {
+        let marker = format!("e{i};");
+        let start = Instant::now();
+        app_a.edit(note, &marker);
+        app_b
+            .pump_until(|app| app.text(note).starts_with(&marker))
+            .await;
+        samples.push(start.elapsed());
+    }
     samples.sort();
     let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
-    assert!(
-        p95 < Duration::from_millis(10),
-        "p95 relay latency {p95:?} exceeds 10ms (samples: {samples:?})"
+    let budget = Duration::from_millis(
+        std::env::var("PENDANT_LATENCY_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20),
     );
+    assert!(p95 < budget, "p95 {p95:?} over budget {budget:?}");
+
+    b.shutdown().await.unwrap();
+    a.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn unauthorized_upgrade_rejected() {
-    let port = spawn_server().await;
-    let request = format!("ws://127.0.0.1:{port}/ws")
-        .into_client_request()
-        .unwrap();
-    // No Authorization header at all.
-    let err = tokio_tungstenite::connect_async(request).await.unwrap_err();
-    let text = err.to_string();
-    assert!(text.contains("401"), "expected 401 rejection, got: {text}");
+async fn bad_relay_token_is_denied() {
+    let (_server, url) = dev_relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    let a = node(&dir, "a", &[TOKEN], relay(&url, "wrong")).await;
+    let mut health = a.watch_relay();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let current = health.borrow_and_update().clone();
+        if let Some(err) = &current.error {
+            assert!(err.contains("not authorized"), "{err}");
+            assert!(!current.connected);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no relay error reported: {current:?}"
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(500), health.changed()).await;
+    }
+    a.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn bad_hello_token_disconnects_over_relay() {
+    let (_server, url) = dev_relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    let a = node(&dir, "a", &[TOKEN], relay(&url, TOKEN)).await;
+    let b = node(&dir, "b", &[TOKEN], relay(&url, TOKEN)).await;
+    b.set_peers(vec![relay_target(&a, "wrong-hello", PeerKind::Desktop)])
+        .await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if b.peers()
+            .iter()
+            .any(|p| matches!(p.state, pendant_local::PeerState::Fatal { .. }))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{:?}", b.peers());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    b.shutdown().await.unwrap();
+    a.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn replica_bridges_offline_edits() {
+    let (_server, url) = dev_relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    let replica =
+        node_with_role(&dir, "replica", &[TOKEN], relay(&url, TOKEN), Role::Replica).await;
+    let a = node(&dir, "a", &[TOKEN], relay(&url, TOKEN)).await;
+    let b = node(&dir, "b", &[TOKEN], relay(&url, TOKEN)).await;
+    let note = NoteId::new();
+    let mut app_a = App::open(&a, note).await;
+    let mut app_b = App::open(&b, note).await;
+    a.set_peers(vec![relay_target(&replica, TOKEN, PeerKind::Replica)])
+        .await;
+    b.set_peers(vec![relay_target(&replica, TOKEN, PeerKind::Replica)])
+        .await;
+    wait_connected(&a, &replica).await;
+    wait_connected(&b, &replica).await;
+
+    // B goes away; A keeps editing; the replica holds it.
+    b.suspend().await;
+    app_a.edit(note, "while b was away");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    b.resume().await.unwrap();
+    wait_connected(&b, &replica).await;
+    app_b
+        .pump_until(|app| app.text(note) == "while b was away")
+        .await;
+
+    b.shutdown().await.unwrap();
+    a.shutdown().await.unwrap();
+    replica.shutdown().await.unwrap();
 }

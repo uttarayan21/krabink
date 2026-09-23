@@ -12,8 +12,7 @@ final class SketchUITests: XCTestCase {
         let app = XCUIApplication()
         let env = ProcessInfo.processInfo.environment
         app.launchArguments = [
-            "-serverURL", env["PENDANT_TEST_SERVER"] ?? "ws://127.0.0.1:8722/ws",
-            "-token", env["PENDANT_TEST_TOKEN"] ?? "demo",
+            "-pairURI", env["PENDANT_TEST_PAIR"] ?? "",
         ] + extra
         app.launch()
         return app

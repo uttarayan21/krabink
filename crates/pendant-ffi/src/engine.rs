@@ -1,22 +1,28 @@
 //! The FFI client engine: shared state behind [`Core`]/[`NoteSession`], with
 //! every mutator following the same shape — mutate the CRDT under the state
-//! lock, persist the delta, hand it to the network task. Listener callbacks
+//! lock, persist the delta, hand it to the session task. Listener callbacks
 //! are always invoked with the state lock released, so a listener may call
 //! straight back into `Core`/`NoteSession` without deadlocking.
+//!
+//! Networking is the device's [`Node`] (`pendant-local`): it accepts peers,
+//! dials the paired desktop and the workspace replica, and fans updates
+//! out. The app talks to it over the in-process link like any other peer.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use pendant_core as pcore;
 use pendant_core::{DeviceId, DocKey, Flush, NoteId, NoteMeta, SketchId, Store, WorkspaceDoc};
+use pendant_local::{Node, NodeConfig, PeerKind, PeerTarget, RelayTarget, Role, direct_addrs};
 use tokio::sync::mpsc;
 
 use crate::brush::{AssetInfo, AssetKind};
 use crate::net::{self, Cmd};
 use crate::types::{
-    BrushInfo, DeviceInfo, Element, NoteInfo, ShapeElement, Stroke, StrokePoint, SyncState, Tool,
-    rgba_from_u32,
+    BrushInfo, DeviceInfo, Element, NoteInfo, PairInfo, PeerInfo, ShapeElement, Stroke,
+    StrokePoint, SyncState, Tool, rgba_from_u32,
 };
 
 /// Errors crossing the FFI boundary. Flattened to message-carrying variants;
@@ -27,8 +33,8 @@ pub enum PendantError {
     MalformedId { id: String },
     #[error("unknown note: {id}")]
     UnknownNote { id: String },
-    #[error("sync server not configured")]
-    NoServer,
+    #[error("bad pairing: {message}")]
+    BadPairing { message: String },
     #[error("{message}")]
     Internal { message: String },
 }
@@ -101,24 +107,22 @@ pub(crate) struct State {
     pub workspace: WorkspaceDoc,
     pub notes: HashMap<NoteId, OpenNote>,
     pub core_listener: Option<Arc<dyn CoreListener>>,
-    pub server: Option<SyncTarget>,
+    /// The workspace adopted from a pairing URI, if any.
+    pub pairing: Option<pcore::PairInfo>,
 }
 
-/// Where background sync connects: every direct path is raced, the
-/// dedicated relay is only used when none of them answers; all take the
-/// same token.
-#[derive(Clone)]
-pub(crate) struct SyncTarget {
-    pub direct: Vec<String>,
-    pub token: String,
-    pub fallback: Option<String>,
-}
-
-/// Everything shared between the FFI objects and the network task.
+/// Everything shared between the FFI objects and the background tasks.
 pub(crate) struct Shared {
     pub device: DeviceId,
+    /// Per-install secret the node always accepts; what the app's own link
+    /// and, until a workspace is adopted, its QR use.
+    pub token: String,
     pub state: Mutex<State>,
     pub cmd: mpsc::UnboundedSender<Cmd>,
+    /// False between `suspend` and `connect`.
+    pub online: AtomicBool,
+    /// Wakes the sync-state watcher after `suspend`/`connect`/`set_pairing`.
+    pub poke: tokio::sync::Notify,
 }
 
 impl Shared {
@@ -154,6 +158,21 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Stable per-install random secret (a ULID carries 80 random bits).
+fn load_or_create_token(dir: &Path) -> Result<String> {
+    let path = dir.join("workspace_token");
+    if let Ok(text) = std::fs::read_to_string(&path)
+        && !text.trim().is_empty()
+    {
+        return Ok(text.trim().to_string());
+    }
+    let token = ulid::Ulid::new().to_string();
+    std::fs::write(&path, &token).map_err(|err| PendantError::Internal {
+        message: format!("writing {}: {err}", path.display()),
+    })?;
+    Ok(token)
+}
+
 fn load_or_create_device_id(dir: &Path) -> Result<DeviceId> {
     let path = dir.join("device_id");
     if let Ok(text) = std::fs::read_to_string(&path) {
@@ -169,18 +188,59 @@ fn load_or_create_device_id(dir: &Path) -> Result<DeviceId> {
     Ok(id)
 }
 
-/// The pendant client: local store + note registry + background sync.
+/// The pendant client: local store + note registry + the device's sync node.
 #[derive(uniffi::Object)]
 pub struct Core {
     shared: Arc<Shared>,
-    // Owns the network task; dropped (and shut down) with the last Core ref.
-    _runtime: tokio::runtime::Runtime,
+    node: Node,
+    // Drives the node and the session task; dropped (and shut down) with
+    // the last Core ref.
+    runtime: tokio::runtime::Runtime,
+}
+
+impl Core {
+    /// Run a node call to completion from an FFI thread.
+    fn block_on<T>(&self, fut: impl std::future::Future<Output = T>) -> T {
+        self.runtime.block_on(fut)
+    }
+
+    fn internal(err: impl std::fmt::Display) -> PendantError {
+        PendantError::Internal {
+            message: err.to_string(),
+        }
+    }
+
+    /// Adopted workspace token when paired, else our own.
+    fn pair_token(&self) -> String {
+        let state = self.shared.lock_state();
+        state
+            .pairing
+            .as_ref()
+            .map(|p| p.token.clone())
+            .unwrap_or_else(|| self.shared.token.clone())
+    }
+}
+
+impl Drop for Core {
+    fn drop(&mut self) {
+        // Final checkpoint and endpoint close. Never on a runtime thread
+        // (block_on would panic); a Swift release always comes from one of
+        // its own threads.
+        if tokio::runtime::Handle::try_current().is_err()
+            && let Err(err) = self.runtime.block_on(self.node.shutdown())
+        {
+            tracing::warn!(%err, "node shutdown failed");
+        }
+    }
 }
 
 #[uniffi::export]
 impl Core {
-    /// Open (or initialise) the app data directory: `pendant.redb` store plus
-    /// a stable per-install `device_id`.
+    /// Open (or initialise) the app data directory: `pendant.redb` store,
+    /// the node's `node.redb` mirror and `node_key`, plus a stable
+    /// per-install `device_id` and `workspace_token`. The node binds
+    /// immediately so this device can be dialled (its QR is valid) before
+    /// it is paired with anything.
     #[uniffi::constructor]
     pub fn new(data_dir: String) -> Result<Arc<Self>> {
         let dir = PathBuf::from(data_dir);
@@ -189,6 +249,7 @@ impl Core {
         })?;
         let store = Store::open(&dir.join("pendant.redb"))?;
         let device = load_or_create_device_id(&dir)?;
+        let token = load_or_create_token(&dir)?;
 
         let stored = store.load(DocKey::WORKSPACE)?;
         let workspace = WorkspaceDoc::from_bytes(
@@ -203,22 +264,38 @@ impl Core {
             .map_err(|err| PendantError::Internal {
                 message: format!("starting runtime: {err}"),
             })?;
+        let node = runtime
+            .block_on(Node::start(NodeConfig {
+                key_path: dir.join("node_key"),
+                store_path: dir.join("node.redb"),
+                device,
+                tokens: vec![token.clone()],
+                relay: None,
+                bind_port: None,
+                role: Role::Device,
+            }))
+            .map_err(Self::internal)?;
         let (tx, rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             device,
+            token,
             state: Mutex::new(State {
                 store,
                 workspace,
                 notes: HashMap::new(),
                 core_listener: None,
-                server: None,
+                pairing: None,
             }),
             cmd: tx,
+            online: AtomicBool::new(true),
+            poke: tokio::sync::Notify::new(),
         });
-        runtime.spawn(net::run(Arc::downgrade(&shared), rx));
+        runtime.spawn(net::run(Arc::downgrade(&shared), node.clone(), rx));
+        runtime.spawn(net::watch_status(Arc::downgrade(&shared), node.clone()));
         Ok(Arc::new(Self {
             shared,
-            _runtime: runtime,
+            node,
+            runtime,
         }))
     }
 
@@ -307,35 +384,127 @@ impl Core {
         }))
     }
 
-    /// Every `direct` path is dialled in parallel on each (re)connect and
-    /// the first handshake wins; `fallback` is only used when none of them
-    /// answers within a few seconds. While on the fallback the direct paths
-    /// are re-probed periodically and the session moves over as soon as
-    /// one answers.
-    pub fn set_sync_server(&self, direct: Vec<String>, token: String, fallback: Option<String>) {
-        self.shared.lock_state().server = Some(SyncTarget {
-            direct,
-            token,
-            fallback,
-        });
-    }
-
-    /// Start (or restart) background sync with the configured server.
-    pub fn connect(&self) -> Result<()> {
-        let Some(target) = self.shared.lock_state().server.clone() else {
-            return Err(PendantError::NoServer);
-        };
-        let _ = self.shared.cmd.send(Cmd::Connect(target));
+    /// Adopt a workspace from a scanned/opened pairing URI: accept its
+    /// token, use its relay, dial the node that showed the QR and (when
+    /// named) the workspace replica. The node keeps dialling with backoff
+    /// until [`Core::suspend`]; the relay is used only when no direct
+    /// path can be punched.
+    pub fn set_pairing(&self, info: PairInfo) -> Result<()> {
+        let info = pcore::PairInfo::from(info);
+        let bad = |message: String| PendantError::BadPairing { message };
+        let mut targets = vec![PeerTarget::from_pair(&info, PeerKind::Desktop).map_err(bad)?];
+        targets.extend(PeerTarget::replica_from_pair(&info).map_err(bad)?);
+        let relay = info
+            .relay
+            .as_deref()
+            .map(|url| {
+                url.parse()
+                    .map(|url| RelayTarget {
+                        url,
+                        token: info.token.clone(),
+                    })
+                    .map_err(|err| bad(format!("relay {url:?}: {err}")))
+            })
+            .transpose()?;
+        self.node.add_token(info.token.clone());
+        self.shared.lock_state().pairing = Some(info);
+        self.block_on(async {
+            self.node.set_relay(relay).await.map_err(Self::internal)?;
+            self.node.set_peers(targets).await;
+            Ok::<(), PendantError>(())
+        })?;
+        self.shared.poke.notify_one();
         Ok(())
     }
 
-    /// Drop the connection (app background). Reconnect with [`Core::connect`].
+    /// A direct `ip:port` for a peer found on the local network (Bonjour);
+    /// tried on the next dial and, when connected through the relay, as a
+    /// path upgrade.
+    pub fn add_peer_addr(&self, node: String, addr: String) -> Result<()> {
+        let id = node
+            .parse()
+            .map_err(|_| PendantError::MalformedId { id: node })?;
+        let addr = addr
+            .parse()
+            .map_err(|_| PendantError::MalformedId { id: addr })?;
+        self.node.add_addr_hint(id, addr);
+        Ok(())
+    }
+
+    /// Bring the node online (after [`Core::suspend`], or a no-op when it
+    /// already is): rebinds and redials every peer.
+    pub fn connect(&self) -> Result<()> {
+        self.block_on(self.node.resume()).map_err(Self::internal)?;
+        self.shared.online.store(true, Ordering::Release);
+        self.shared.poke.notify_one();
+        Ok(())
+    }
+
+    /// Close every connection and the endpoint (app background). Local
+    /// edits keep flowing into the node's store; [`Core::connect`] resumes.
     pub fn suspend(&self) {
-        let _ = self.shared.cmd.send(Cmd::Suspend);
+        self.shared.online.store(false, Ordering::Release);
+        self.block_on(self.node.suspend());
+        self.shared.poke.notify_one();
+    }
+
+    /// The network changed under us (Wi-Fi hop, VPN, cellular): re-probe
+    /// paths now instead of waiting for timeouts.
+    pub fn network_changed(&self) {
+        self.block_on(self.node.network_changed());
     }
 
     pub fn device_id(&self) -> String {
         self.shared.device.to_string()
+    }
+
+    /// This node's endpoint id (its public key), what peers dial.
+    pub fn node_id(&self) -> String {
+        self.node.id().to_string()
+    }
+
+    /// UDP port the node is bound to; `None` while suspended.
+    pub fn bound_port(&self) -> Option<u16> {
+        self.block_on(self.node.bound_port())
+    }
+
+    /// Every peer the node knows: dialled ones (with their dial state) and
+    /// inbound ones.
+    pub fn peers(&self) -> Vec<PeerInfo> {
+        self.node
+            .peers()
+            .into_iter()
+            .filter_map(PeerInfo::from_status)
+            .collect()
+    }
+
+    /// Current aggregate state (also pushed to the listener on change).
+    pub fn sync_state(&self) -> SyncState {
+        net::sync_state(&self.shared, &self.node)
+    }
+
+    /// What this device shows as a QR: its node id and direct addresses,
+    /// plus the adopted workspace's token, relay and replica (or our own
+    /// token while unpaired).
+    pub fn pair_info(&self) -> PairInfo {
+        let (relay, replica) = {
+            let state = self.shared.lock_state();
+            match &state.pairing {
+                Some(p) => (p.relay.clone(), p.replica.clone()),
+                None => (None, None),
+            }
+        };
+        let addrs = direct_addrs(&self.block_on(self.node.addr()))
+            .into_iter()
+            .map(|a| a.to_string())
+            .collect();
+        PairInfo {
+            node: self.node.id().to_string(),
+            token: self.pair_token(),
+            relay,
+            addrs,
+            replica,
+        }
     }
 
     /// Drop a note from the shared registry: every peer's list loses the row.

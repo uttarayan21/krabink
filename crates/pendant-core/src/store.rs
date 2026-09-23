@@ -103,6 +103,31 @@ impl Store {
         Ok(StoredDoc { snapshot, updates })
     }
 
+    /// Every doc with a snapshot or at least one update on disk.
+    pub fn keys(&self) -> Result<Vec<DocKey>> {
+        let txn = self.db.begin_read().map_err(redb::Error::from)?;
+        let mut keys = std::collections::BTreeSet::new();
+        for entry in txn
+            .open_table(SNAPSHOTS)
+            .map_err(redb::Error::from)?
+            .iter()
+            .map_err(redb::Error::from)?
+        {
+            let (k, _) = entry.map_err(redb::Error::from)?;
+            keys.insert(k.value());
+        }
+        for entry in txn
+            .open_table(UPDATES)
+            .map_err(redb::Error::from)?
+            .iter()
+            .map_err(redb::Error::from)?
+        {
+            let (k, _) = entry.map_err(redb::Error::from)?;
+            keys.insert(k.value().0);
+        }
+        Ok(keys.into_iter().map(DocKey).collect())
+    }
+
     /// Append one incremental update to a doc's log.
     pub fn append_update(&self, key: DocKey, update: &[u8], flush: Flush) -> Result<()> {
         let mut txn = self.db.begin_write().map_err(redb::Error::from)?;

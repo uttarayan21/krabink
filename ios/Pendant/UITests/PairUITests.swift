@@ -2,19 +2,17 @@
 // scan is simulated with the `-pairURI` launch argument, which routes
 // through the same adoptPair() path as a scanned pendant:// URL.
 //
-// Needs a relay running at PENDANT_TEST_SERVER (default ws://127.0.0.1:8722).
+// Needs `pendant-server --dev` running and its URI in PENDANT_TEST_PAIR.
 
 import XCTest
 
 final class PairUITests: XCTestCase {
     func testPairURIConnectsAndShowsQR() {
+        // The URI `pendant-server --dev` (or a desktop) printed.
         let env = ProcessInfo.processInfo.environment
-        let server = env["PENDANT_TEST_SERVER"] ?? "ws://127.0.0.1:8722/ws"
-        let token = env["PENDANT_TEST_TOKEN"] ?? "demo"
-        let uri =
-            "pendant://pair?server=\(percentEncode(server))&token=\(percentEncode(token))"
+        let uri = env["PENDANT_TEST_PAIR"] ?? ""
+        XCTAssertFalse(uri.isEmpty, "set PENDANT_TEST_PAIR to a pendant://pair URI")
 
-        // No -serverURL/-token: connectivity must come from the pair URI.
         let app = XCUIApplication()
         app.launchArguments = ["-pairURI", uri]
         app.launch()
@@ -45,11 +43,5 @@ final class PairUITests: XCTestCase {
         XCTAssertTrue(cancel.waitForExistence(timeout: 5))
         cancel.tap()
         XCTAssertTrue(app.buttons["scanPairing"].waitForExistence(timeout: 5))
-    }
-
-    private func percentEncode(_ raw: String) -> String {
-        let unreserved = CharacterSet(
-            charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
-        return raw.addingPercentEncoding(withAllowedCharacters: unreserved) ?? raw
     }
 }

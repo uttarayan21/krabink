@@ -1,12 +1,15 @@
+// bevy's `AsBindGroup` derive on `InkMaterial` needs more than the default
+// 128 for the auto-trait proof of its render-world system params.
+#![recursion_limit = "256"]
+
 mod cli;
 mod config;
-mod discovery;
 mod docs;
 mod errors;
 mod ink_assets;
 mod ink_material;
 mod lab;
-mod relay;
+mod node;
 mod replay;
 mod settings;
 mod sketch;
@@ -18,15 +21,16 @@ use bevy::prelude::*;
 use clap::Parser;
 use errors::{Error, Result, ResultExt};
 use pendant_core::Store;
+use pendant_local::{Node, NodeConfig, Role, direct_addrs};
 
 use crate::config::RuntimeConfig;
 use crate::docs::Docs;
-use crate::relay::EmbeddedRelay;
-use crate::sync::{LinkKind, SyncPlugin, SyncTransport};
+use crate::node::SyncNode;
+use crate::sync::{SyncPlugin, SyncTransport};
 use crate::ui::EditorUiPlugin;
 
-/// The tokio runtime behind the embedded relay and every sync link. Lives
-/// as a resource so it outlives transport swaps (joining a workspace).
+/// The tokio runtime behind the sync node. Lives as a resource so systems
+/// can drive the node's async calls.
 #[derive(Resource)]
 pub struct Runtime(pub tokio::runtime::Runtime);
 
@@ -37,15 +41,9 @@ fn main() -> Result<()> {
             cli::Cli::completions(shell);
             Ok(())
         }
-        Some(cli::SubCommand::Replay {
-            server,
-            token,
-            strokes,
-        }) => replay::run(replay::ReplayArgs {
-            server,
-            token,
-            strokes,
-        }),
+        Some(cli::SubCommand::Replay { pair, strokes }) => {
+            replay::run(replay::ReplayArgs { pair, strokes })
+        }
         Some(cli::SubCommand::BrushLab {
             corpus,
             presets,
@@ -67,7 +65,7 @@ fn main() -> Result<()> {
 }
 
 fn run_app(args: cli::Cli) -> Result<()> {
-    let config = RuntimeConfig::resolve(args.data_dir, args.server, args.token)?;
+    let config = RuntimeConfig::resolve(args.data_dir, args.relay, args.token)?;
     let store = Store::open(&config.store_path)
         .change_context(Error)
         .attach_with(|| format!("opening store {}", config.store_path.display()))?;
@@ -82,63 +80,47 @@ fn run_app(args: cli::Cli) -> Result<()> {
         .change_context(Error)
         .attach("tokio runtime")?;
 
-    // Always serve our own relay: accepts the per-install token plus the
-    // remote relays' token so one QR opens every path.
-    let relay = EmbeddedRelay::start(
-        runtime.handle(),
-        args.relay_listen,
-        &config.relay_store_path,
-        [config.relay_token.clone(), config.token.clone()]
-            .into_iter()
-            .filter(|t| !t.is_empty())
-            .collect(),
-        config.device,
-    )?;
-
-    let mut transport = SyncTransport::new(config.device);
-    transport.add_link(
-        runtime.handle(),
-        LinkKind::Embedded,
-        relay.local.clone(),
-        config.relay_token.clone(),
-    );
-    let remotes = config.remote_relays();
-    if remotes.is_empty() {
-        tracing::info!("no dedicated relay configured; direct pairing only");
+    // The node accepts our own token plus the adopted workspace's, so one
+    // QR opens every path.
+    let node = runtime
+        .block_on(Node::start(NodeConfig {
+            key_path: config.node_key_path.clone(),
+            store_path: config.node_store_path.clone(),
+            device: config.device,
+            tokens: [config.workspace_token.clone(), config.token.clone()]
+                .into_iter()
+                .filter(|t| !t.is_empty())
+                .collect(),
+            relay: config.relay_target(),
+            bind_port: None,
+            role: Role::Device,
+        }))
+        .change_context(Error)
+        .attach("starting sync node")?;
+    let peers = config.peer_targets();
+    if peers.is_empty() {
+        tracing::info!("no peers configured; waiting to be paired");
     }
-    for server in remotes {
-        transport.add_link(
-            runtime.handle(),
-            LinkKind::Remote,
-            server,
-            config.token.clone(),
-        );
-    }
+    runtime.block_on(node.set_peers(peers));
 
-    let pair = pendant_core::PairInfo {
-        server: relay.advertised.clone(),
-        token: config.pair_token(),
-        fallback: config.server.clone(),
-        alt: relay.alt.clone(),
-        relay_id: Some(config.device.to_string()),
+    let transport = {
+        let _guard = runtime.enter();
+        SyncTransport::new(node.clone(), config.workspace_token.clone())
     };
-
-    // A joined desktop's coordinates, if the persisted pairing named one.
-    let paired = config
-        .relay_id
-        .clone()
-        .zip(config.server.clone())
-        .map(|(relay_id, server)| discovery::PairedDesktop {
-            relay_id,
-            server,
-            token: config.token.clone(),
-            fallback: config.fallback.clone(),
-        });
+    let addrs = direct_addrs(&runtime.block_on(node.addr()))
+        .into_iter()
+        .map(|a| a.to_string())
+        .collect();
+    let pair = pendant_core::PairInfo {
+        node: node.id().to_string(),
+        token: config.pair_token(),
+        relay: config.relay.as_ref().map(ToString::to_string),
+        addrs,
+        replica: config.replica.map(|id| id.to_string()),
+    };
+    let sync_node = SyncNode::new(node, &runtime);
 
     let mut app = App::new();
-    if let Some(paired) = paired {
-        app.insert_resource(paired);
-    }
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: "pendant".into(),
@@ -153,28 +135,28 @@ fn run_app(args: cli::Cli) -> Result<()> {
         EditorUiPlugin,
         crate::sketch::SketchPlugin,
         settings::SettingsPlugin,
-        discovery::DiscoveryPlugin,
+        node::NodePlugin,
     ))
     .insert_resource(docs)
     .insert_resource(Runtime(runtime))
-    .insert_resource(relay)
+    .insert_resource(sync_node)
     .insert_resource(transport)
     .insert_resource(settings::Settings::new(pair))
-    .insert_resource(discovery::RelayFinder::new(config.device))
     .insert_resource(crate::ui::FollowLatest(args.follow_latest))
     .add_systems(Startup, setup)
     .run();
     Ok(())
 }
 
-fn setup(mut commands: Commands, relay: Res<EmbeddedRelay>) {
+fn setup(mut commands: Commands, sync: Res<SyncNode>, settings: Res<settings::Settings>) {
     commands.spawn(Camera2d);
     // Bevy's LogPlugin owns the subscriber; anything logged before App::run
-    // is lost, so announce the relay here.
+    // is lost, so announce the node here.
     info!(
-        advertised = %relay.advertised,
-        alt = ?relay.alt,
-        mdns = relay.mdns_name.as_deref().unwrap_or("off"),
-        "embedded relay up"
+        node = %sync.node.id(),
+        addrs = ?settings.info.addrs,
+        relay = settings.info.relay.as_deref().unwrap_or("none"),
+        mdns = sync.mdns_name().unwrap_or("off"),
+        "sync node up"
     );
 }

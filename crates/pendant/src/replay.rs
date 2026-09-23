@@ -1,19 +1,19 @@
-//! `pendant replay`: a headless client that creates a note with a sketch and
-//! streams synthetic 120Hz pen strokes through the relay — wet ink over the
-//! ephemeral channel, authoritative strokes committed to the CRDT at pen-up.
-//! This is the latency test rig for the desktop renderer (M5 gate).
+//! `pendant replay`: a headless node that pairs with a target, creates a
+//! note with a sketch and streams synthetic 120Hz pen strokes to it — wet
+//! ink over the ephemeral lane, authoritative strokes committed to the
+//! CRDT at pen-up. This is the latency test rig for the desktop renderer.
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::time::Duration;
 
-use futures::{SinkExt, StreamExt};
 use pendant_core::{
-    ClientDocs, ClientEffect, ClientMsg, DeviceId, DocKey, NoteDoc, NoteId, NoteMeta, PointKind,
+    ClientDocs, ClientEffect, DeviceId, DocKey, NoteDoc, NoteId, NoteMeta, PairInfo, PointKind,
     Rgba, SKETCH_URI_PREFIX, SketchId, Stroke, StrokeId, StrokePoint, Tool, WetInk, WorkspaceDoc,
 };
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
+use pendant_local::{
+    LocalLink, Node, NodeConfig, PeerKind, PeerState, PeerTarget, RelayTarget, Role,
+};
 
 use crate::docs::now_ms;
 use crate::errors::{Error, Result, ResultExt};
@@ -25,8 +25,8 @@ const STROKE_SAMPLES: usize = 144; // ~1.2s of ink
 const PAUSE_BETWEEN: Duration = Duration::from_millis(300);
 
 pub struct ReplayArgs {
-    pub server: String,
-    pub token: String,
+    /// The target's `pendant://pair` URI.
+    pub pair: String,
     pub strokes: usize,
 }
 
@@ -37,9 +37,9 @@ struct MemDocs {
 }
 
 impl ClientDocs for MemDocs {
-    fn import(&mut self, doc: DocKey, payload: &[u8]) -> pendant_core::Result<()> {
+    fn import(&mut self, doc: DocKey, payload: &[u8]) -> pendant_core::Result<bool> {
         if payload.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         if doc == DocKey::WORKSPACE {
             self.workspace.import_update(payload)
@@ -47,7 +47,7 @@ impl ClientDocs for MemDocs {
         {
             note.import_update(payload)
         } else {
-            Ok(())
+            Ok(false)
         }
     }
 
@@ -65,7 +65,8 @@ impl ClientDocs for MemDocs {
 }
 
 pub fn run(args: ReplayArgs) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .change_context(Error)
@@ -74,43 +75,64 @@ pub fn run(args: ReplayArgs) -> Result<()> {
 }
 
 async fn replay(args: ReplayArgs) -> Result<()> {
-    let mut request = args
-        .server
-        .as_str()
-        .into_client_request()
-        .change_context(Error)
-        .attach("parsing server url")?;
-    let auth = format!("Bearer {}", args.token)
-        .parse()
-        .change_context(Error)
-        .attach("token not header-safe")?;
-    request.headers_mut().insert("Authorization", auth);
+    let info = PairInfo::parse(&args.pair)
+        .ok_or_else(|| crate::errors::Report::new(Error).attach("not a pendant://pair URI"))?;
+    let target = PeerTarget::from_pair(&info, PeerKind::Desktop)
+        .map_err(|err| crate::errors::Report::new(Error).attach(err))?;
+    let mut peers = vec![target.clone()];
+    if let Ok(Some(replica)) = PeerTarget::replica_from_pair(&info) {
+        peers.push(replica);
+    }
 
-    let (socket, _) = tokio_tungstenite::connect_async(request)
-        .await
-        .change_context(Error)
-        .attach("connecting to relay")?;
-    let (mut sink, mut stream) = socket.split();
+    // A throwaway node: fresh key, empty store, gone at exit.
+    let dir = std::env::temp_dir().join(format!("pendant-replay-{}", ulid::Ulid::new()));
+    std::fs::create_dir_all(&dir).change_context(Error)?;
+    let device = DeviceId::new();
+    let node = Node::start(NodeConfig {
+        key_path: dir.join("node_key"),
+        store_path: dir.join("node.redb"),
+        device,
+        tokens: vec![info.token.clone()],
+        relay: target.relay.clone().map(|url| RelayTarget {
+            url,
+            token: info.token.clone(),
+        }),
+        bind_port: None,
+        role: Role::Device,
+    })
+    .await
+    .change_context(Error)
+    .attach("starting node")?;
+    node.set_peers(peers).await;
 
+    let mut link = node.local_link();
     let mut docs = MemDocs {
         workspace: WorkspaceDoc::new(),
         notes: HashMap::new(),
     };
-    let mut session = pendant_core::ClientSession::new(DeviceId::new(), args.token.clone());
+    let mut session = pendant_core::ClientSession::new(device, info.token.clone());
 
-    // Handshake, then pull the workspace before touching it.
-    send_all(&mut sink, session.connect()).await?;
-    wait_ready(&mut session, &mut stream, &mut sink, &mut docs).await?;
+    // Handshake with our node, then wait for the target to answer.
+    send_all(&link, session.connect())?;
+    wait_ready(&mut session, &mut link, &mut docs).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let connected = node
+            .peers()
+            .iter()
+            .any(|p| p.id == Some(target.id) && matches!(p.state, PeerState::Connected { .. }));
+        if connected {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            return Err(crate::errors::Report::new(Error)
+                .attach(format!("target never connected: {:?}", node.peers())));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let have = docs.workspace.version();
-    send_all(&mut sink, session.subscribe(DocKey::WORKSPACE, have)).await?;
-    wait_synced(
-        &mut session,
-        &mut stream,
-        &mut sink,
-        &mut docs,
-        DocKey::WORKSPACE,
-    )
-    .await?;
+    send_all(&link, session.subscribe(DocKey::WORKSPACE, have))?;
+    wait_synced(&mut session, &mut link, &mut docs, DocKey::WORKSPACE).await?;
 
     // Create the target note + sketch and announce it via the workspace.
     let note_id = NoteId::new();
@@ -127,8 +149,8 @@ async fn replay(args: ReplayArgs) -> Result<()> {
     let note_key = DocKey::from(note_id);
 
     // Subscribing uploads the whole doc as SubscribeAck backfill.
-    send_all(&mut sink, session.subscribe(note_key, Vec::new())).await?;
-    wait_synced(&mut session, &mut stream, &mut sink, &mut docs, note_key).await?;
+    send_all(&link, session.subscribe(note_key, Vec::new()))?;
+    wait_synced(&mut session, &mut link, &mut docs, note_key).await?;
 
     let ws_before = docs.workspace.version();
     docs.workspace
@@ -143,11 +165,7 @@ async fn replay(args: ReplayArgs) -> Result<()> {
         .workspace
         .export_updates_since(&ws_before)
         .change_context(Error)?;
-    send_all(
-        &mut sink,
-        session.local_update(DocKey::WORKSPACE, ws_payload),
-    )
-    .await?;
+    send_all(&link, session.local_update(DocKey::WORKSPACE, ws_payload))?;
 
     writeln!(
         std::io::stdout(),
@@ -156,35 +174,28 @@ async fn replay(args: ReplayArgs) -> Result<()> {
     .change_context(Error)?;
 
     for i in 0..args.strokes {
-        stream_stroke(
-            &mut session,
-            &mut sink,
-            &mut docs,
-            note_id,
-            note_key,
-            sketch,
-            i,
-        )
-        .await?;
+        stream_stroke(&mut session, &link, &mut docs, note_id, note_key, sketch, i).await?;
         tokio::time::sleep(PAUSE_BETWEEN).await;
     }
 
     writeln!(std::io::stdout(), "replayed {} strokes", args.strokes).change_context(Error)?;
+    // Give the last commit a moment to leave before tearing down.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    node.shutdown().await.change_context(Error)?;
+    let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
 
-type Sink = futures::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    WsMessage,
->;
-type Stream = futures::stream::SplitStream<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
->;
-
-async fn send_all(sink: &mut Sink, effects: Vec<ClientEffect>) -> Result<()> {
+fn send_all(link: &LocalLink, effects: Vec<ClientEffect>) -> Result<()> {
     for effect in effects {
         match effect {
-            ClientEffect::Send(msg) => send_msg(sink, &msg).await?,
+            ClientEffect::Send(msg) => {
+                let frame = msg
+                    .encode()
+                    .change_context(Error)
+                    .attach("encoding frame")?;
+                link.send(frame);
+            }
             ClientEffect::Fatal(err) => {
                 return Err(crate::errors::Report::new(Error).attach(format!("session: {err}")));
             }
@@ -194,43 +205,26 @@ async fn send_all(sink: &mut Sink, effects: Vec<ClientEffect>) -> Result<()> {
     Ok(())
 }
 
-async fn send_msg(sink: &mut Sink, msg: &ClientMsg) -> Result<()> {
-    let frame = msg
-        .encode()
-        .change_context(Error)
-        .attach("encoding frame")?;
-    sink.send(WsMessage::Binary(frame.into()))
-        .await
-        .change_context(Error)
-        .attach("socket send")
-}
-
 /// Pump incoming frames until the predicate effect shows up (5s deadline).
 async fn pump_until(
     session: &mut pendant_core::ClientSession,
-    stream: &mut Stream,
-    sink: &mut Sink,
+    link: &mut LocalLink,
     docs: &mut MemDocs,
     mut done: impl FnMut(&ClientEffect) -> bool,
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let msg = tokio::time::timeout_at(deadline, stream.next())
+        let frame = tokio::time::timeout_at(deadline, link.from_node.recv())
             .await
             .change_context(Error)
-            .attach("timed out waiting for server")?;
-        let Some(Ok(WsMessage::Binary(bytes))) = msg else {
-            match msg {
-                Some(Ok(_)) => continue,
-                _ => return Err(crate::errors::Report::new(Error).attach("socket closed")),
-            }
-        };
-        let server_msg = pendant_core::ServerMsg::decode(&bytes)
+            .attach("timed out waiting for the node")?
+            .ok_or_else(|| crate::errors::Report::new(Error).attach("link closed"))?;
+        let server_msg = pendant_core::ServerMsg::decode(&frame)
             .change_context(Error)
-            .attach("decoding server frame")?;
+            .attach("decoding frame")?;
         let effects = session.handle(server_msg, docs);
         let hit = effects.iter().any(&mut done);
-        send_all(sink, effects).await?;
+        send_all(link, effects)?;
         if hit {
             return Ok(());
         }
@@ -239,11 +233,10 @@ async fn pump_until(
 
 async fn wait_ready(
     session: &mut pendant_core::ClientSession,
-    stream: &mut Stream,
-    sink: &mut Sink,
+    link: &mut LocalLink,
     docs: &mut MemDocs,
 ) -> Result<()> {
-    pump_until(session, stream, sink, docs, |e| {
+    pump_until(session, link, docs, |e| {
         matches!(e, ClientEffect::Connected)
     })
     .await
@@ -251,15 +244,13 @@ async fn wait_ready(
 
 async fn wait_synced(
     session: &mut pendant_core::ClientSession,
-    stream: &mut Stream,
-    sink: &mut Sink,
+    link: &mut LocalLink,
     docs: &mut MemDocs,
     doc: DocKey,
 ) -> Result<()> {
     pump_until(
         session,
-        stream,
-        sink,
+        link,
         docs,
         |e| matches!(e, ClientEffect::DocSynced(d) if *d == doc),
     )
@@ -286,7 +277,7 @@ fn sample_stroke(index: usize) -> Vec<StrokePoint> {
 
 async fn stream_stroke(
     session: &mut pendant_core::ClientSession,
-    sink: &mut Sink,
+    link: &LocalLink,
     docs: &mut MemDocs,
     note_id: NoteId,
     note_key: DocKey,
@@ -308,7 +299,7 @@ async fn stream_stroke(
     }
     .encode()
     .change_context(Error)?;
-    send_all(sink, session.ephemeral(note_key, begin)).await?;
+    send_all(link, session.ephemeral(note_key, begin))?;
 
     // Pace batches in real time: 8 samples per ~66ms tick.
     for (i, batch) in points.chunks(BATCH_EVERY).enumerate() {
@@ -317,14 +308,14 @@ async fn stream_stroke(
             .change_context(Error)?
             .encode()
             .change_context(Error)?;
-        send_all(sink, session.ephemeral(note_key, payload)).await?;
+        send_all(link, session.ephemeral(note_key, payload))?;
     }
 
     let end = WetInk::end(stroke_id, now_ms(), &[])
         .change_context(Error)?
         .encode()
         .change_context(Error)?;
-    send_all(sink, session.ephemeral(note_key, end)).await?;
+    send_all(link, session.ephemeral(note_key, end))?;
 
     // Pen-up: commit the authoritative stroke.
     let note = docs.notes.get(&note_id).expect("note created above");
@@ -344,7 +335,7 @@ async fn stream_stroke(
     )
     .change_context(Error)?;
     let payload = note.export_updates_since(&before).change_context(Error)?;
-    send_all(sink, session.local_update(note_key, payload)).await?;
+    send_all(link, session.local_update(note_key, payload))?;
     writeln!(
         std::io::stdout(),
         "stroke {} committed ({stroke_id})",

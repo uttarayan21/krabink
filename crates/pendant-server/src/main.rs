@@ -1,77 +1,37 @@
-mod errors;
-
 use std::path::PathBuf;
 
 use clap::Parser;
-use errors::{Error, Result, ResultExt};
-use pendant_core::Store;
-use pendant_server::AppState;
+use pendant_server::config::Overrides;
+use pendant_server::errors::{Error, Result, ResultExt};
+use pendant_server::{Config, relay, replica};
 
 #[derive(Debug, clap::Parser)]
-#[clap(version, about = "pendant sync relay")]
+#[clap(version, about = "pendant cloud server: relay + replica")]
 struct Cli {
-    /// TOML config file (listen, db, tokens). Flags below override it.
+    /// TOML config file. Flags below override it.
     #[clap(long)]
     config: Option<PathBuf>,
-    /// Address to listen on.
+    /// Plain HTTP on 127.0.0.1:3340, no TLS, replica on: LAN development.
+    #[clap(long)]
+    dev: bool,
+    /// Relay HTTP listener.
     #[clap(long)]
     listen: Option<std::net::SocketAddr>,
-    /// redb database file.
+    /// Relay QUIC (address discovery) listener; needs TLS.
     #[clap(long)]
-    db: Option<PathBuf>,
-    /// Accepted bearer token (repeatable).
+    quic_listen: Option<std::net::SocketAddr>,
+    /// URL devices reach the relay at.
+    #[clap(long)]
+    public_url: Option<String>,
+    /// Accepted workspace token (repeatable).
     #[clap(long = "token")]
     tokens: Vec<String>,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct FileConfig {
-    listen: Option<std::net::SocketAddr>,
-    db: Option<PathBuf>,
-    #[serde(default)]
-    tokens: Vec<String>,
-}
-
-struct Config {
-    listen: std::net::SocketAddr,
-    db: PathBuf,
-    tokens: Vec<String>,
-}
-
-impl Config {
-    fn resolve(cli: Cli) -> Result<Self> {
-        let file = match &cli.config {
-            Some(path) => {
-                let raw = std::fs::read_to_string(path)
-                    .change_context(Error)
-                    .attach_with(|| format!("reading config {}", path.display()))?;
-                toml::from_str::<FileConfig>(&raw)
-                    .change_context(Error)
-                    .attach("parsing config")?
-            }
-            None => FileConfig::default(),
-        };
-        let tokens = if cli.tokens.is_empty() {
-            file.tokens
-        } else {
-            cli.tokens
-        };
-        if tokens.is_empty() {
-            return Err(errors::Report::new(Error)
-                .attach("no tokens configured; pass --token or set tokens = [...] in the config"));
-        }
-        Ok(Self {
-            listen: cli
-                .listen
-                .or(file.listen)
-                .unwrap_or_else(|| "127.0.0.1:8722".parse().expect("valid literal")),
-            db: cli
-                .db
-                .or(file.db)
-                .unwrap_or_else(|| "pendant-server.redb".into()),
-            tokens,
-        })
-    }
+    /// Replica store file.
+    #[clap(long)]
+    replica_db: Option<PathBuf>,
+    /// Relay only, no replica.
+    #[clap(long)]
+    no_replica: bool,
 }
 
 #[tokio::main]
@@ -82,33 +42,51 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let config = Config::resolve(Cli::parse())?;
-    let store = Store::open(&config.db)
-        .change_context(Error)
-        .attach_with(|| format!("opening store {}", config.db.display()))?;
+    let cli = Cli::parse();
+    let config = Config::load(
+        cli.config.as_deref(),
+        Overrides {
+            dev: cli.dev,
+            http_listen: cli.listen,
+            quic_listen: cli.quic_listen,
+            public_url: cli.public_url,
+            tokens: cli.tokens,
+            replica_db: cli.replica_db,
+            no_replica: cli.no_replica,
+        },
+    )?;
 
-    let state = AppState::new(store, config.tokens);
+    let server = relay::spawn(config.relay.clone(), config.tokens.clone()).await?;
+    tracing::info!(url = %config.public_url, http = ?server.http_addr(), https = ?server.https_addr(), quic = ?server.quic_addr(), "relay up");
 
-    let maintenance = tokio::spawn(state.clone().maintenance());
+    let replica = match &config.replica {
+        Some(cfg) => {
+            let node =
+                replica::start(cfg, config.public_url.clone(), config.tokens.clone()).await?;
+            tracing::info!(id = %node.id(), db = %cfg.db.display(), "replica up");
+            println!("relay:   {}", config.public_url);
+            println!("replica: {}", node.id());
+            println!("token:   {}", config.tokens[0]);
+            Some(node)
+        }
+        None => None,
+    };
 
-    let listener = tokio::net::TcpListener::bind(config.listen)
+    tokio::signal::ctrl_c()
         .await
         .change_context(Error)
-        .attach_with(|| format!("binding {}", config.listen))?;
-    tracing::info!(listen = %config.listen, "pendant-server up");
-
-    axum::serve(listener, state.router())
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .attach("waiting for ctrl-c")?;
+    tracing::info!("shutting down");
+    if let Some(node) = replica {
+        node.shutdown()
+            .await
+            .change_context(Error)
+            .attach("replica shutdown")?;
+    }
+    server
+        .shutdown()
         .await
-        .change_context(Error)?;
-
-    maintenance.abort();
-    // Final durable checkpoint before exit.
-    state
-        .checkpoint()
         .change_context(Error)
-        .attach("final checkpoint")?;
+        .attach("relay shutdown")?;
     Ok(())
 }

@@ -48,7 +48,7 @@ targets:
         NSLocalNetworkUsageDescription: >-
           Pendant looks for your paired desktop on the local network to sync
           directly with it.
-        NSBonjourServices: [_pendant._tcp]
+        NSBonjourServices: [_pendant._udp]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.darksailor.pendant

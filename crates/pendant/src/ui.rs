@@ -80,18 +80,15 @@ fn editor_ui(
     mut subscribes: MessageWriter<SubscribeNeeded>,
     mut settings: ResMut<Settings>,
     transport: Res<SyncTransport>,
-    relay: Res<crate::relay::EmbeddedRelay>,
+    sync: Res<crate::node::SyncNode>,
     mut adopted: MessageWriter<crate::settings::PairAdopted>,
     follow: Res<FollowLatest>,
-    paired: Option<Res<crate::discovery::PairedDesktop>>,
-    finder: Res<crate::discovery::RelayFinder>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     let view = crate::settings::SettingsView {
-        links: transport.links(),
-        mdns_name: relay.mdns_name.clone(),
-        paired_relay: paired.map(|p| p.relay_id.clone()),
-        discovered: finder.last_found.clone(),
+        peers: sync.node.peers(),
+        relay: sync.node.relay_health(),
+        mdns_name: sync.mdns_name().map(str::to_string),
         this_device: transport.device(),
         devices: docs.workspace.devices(),
         now_ms: crate::docs::now_ms(),
@@ -247,11 +244,17 @@ fn editor_ui(
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(title).heading().color(theme::TEXT));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let all_up = view
-                        .links
+                    let remote: Vec<_> = view
+                        .peers
                         .iter()
-                        .all(|l| l.status == crate::sync::SyncStatus::Connected);
-                    let (color, label) = if all_up {
+                        .filter(|p| p.kind != pendant_local::PeerKind::Local)
+                        .collect();
+                    let all_up = remote
+                        .iter()
+                        .all(|p| matches!(p.state, pendant_local::PeerState::Connected { .. }));
+                    let (color, label) = if remote.is_empty() {
+                        (theme::MUTED, "no peers")
+                    } else if all_up {
                         (theme::SUCCESS, "live sync")
                     } else {
                         (theme::WARN, "sync connecting…")

@@ -936,8 +936,10 @@ mod tests {
         );
         let indices: Vec<u32> = mesh
             .indices
-            .chunks_exact(4)
-            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
             .collect();
         assert!(indices.iter().all(|&i| i < mesh.vertex_count));
         assert_eq!(mesh.style.color, 0xff);

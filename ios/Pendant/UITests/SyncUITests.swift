@@ -4,8 +4,8 @@
 //   [harness runs probe --expect … --append " +rust"]
 //   phase2: reopen the note, assert the probe's edit shows (relay → sim)
 //
-// Server/token come from PENDANT_TEST_SERVER / PENDANT_TEST_TOKEN env vars
-// passed through `xcodebuild test`.
+// The pairing URI comes from the PENDANT_TEST_PAIR env var (what
+// `pendant-server --dev` prints) passed through `xcodebuild test`.
 
 import XCTest
 
@@ -14,8 +14,7 @@ final class SyncUITests: XCTestCase {
         let app = XCUIApplication()
         let env = ProcessInfo.processInfo.environment
         app.launchArguments = [
-            "-serverURL", env["PENDANT_TEST_SERVER"] ?? "ws://127.0.0.1:8722/ws",
-            "-token", env["PENDANT_TEST_TOKEN"] ?? "demo",
+            "-pairURI", env["PENDANT_TEST_PAIR"] ?? "",
         ]
         app.launch()
         return app

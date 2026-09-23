@@ -1,7 +1,7 @@
 //! UniFFI surface exposing pendant-core to Swift.
 //!
-//! Swift-facing objects: [`Core`] (store + note registry + background sync)
-//! and [`NoteSession`] (one open note). Events arrive through the foreign
+//! Swift-facing objects: [`Core`] (store + note registry + the device's
+//! sync node) and [`NoteSession`] (one open note). Events arrive through the foreign
 //! traits [`CoreListener`] and [`NoteListener`]; implementations hop to
 //! `@MainActor` on the Swift side.
 
@@ -20,6 +20,7 @@ pub use brush::{
 };
 pub use engine::{Core, CoreListener, NoteListener, NoteSession, PendantError};
 pub use types::{
-    Binding, BrushInfo, Element, NoteInfo, Point2, PointKind, Recognition, Shape, ShapeElement,
-    Stroke, StrokePoint, SyncState, Tilt, Tool,
+    Binding, BrushInfo, DeviceInfo, Element, NoteInfo, PairInfo, PeerInfo, PeerKind, Point2,
+    PointKind, Recognition, Route, Shape, ShapeElement, Stroke, StrokePoint, SyncState, Tilt, Tool,
+    build_pair_uri, parse_pair_uri,
 };
