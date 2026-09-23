@@ -8,6 +8,11 @@
 //! and is dropped once the authoritative stroke lands (or after a timeout).
 //! Draw order is z order: committed element `k` sits at `k / 100`, remote
 //! wet stroke `j` at `990 + j / 100`, and the ink pipeline writes depth.
+//!
+//! Peers' pens show as pointers above everything: the tip's footprint at
+//! reduced alpha (the same hover dab the iPad draws locally) inside a ring
+//! coloured per device. Pointers arrive on the ephemeral channel too and
+//! vanish when withdrawn or after a short silence.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -15,14 +20,15 @@ use std::sync::{Arc, Mutex};
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::RenderLayers;
 use bevy::camera::{ImageRenderTarget, RenderTarget, ScalingMode};
+use bevy::color::{Hsla, Srgba};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureUsages;
 use bevy::render::storage::ShaderBuffer;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, EguiUserTextures, egui};
 use pendant_core::{
-    BrushSpec, DEFAULT_TOLERANCE, DocKey, Element, Ink, InkStyle, Rgba, SKETCH_URI_PREFIX,
-    SketchId, StrokeEnd, StrokeId, StrokePoint, Tool, WetInk,
+    BrushSpec, DEFAULT_TOLERANCE, DeviceId, DocKey, Element, Ink, InkMesh, InkStyle, Rgba,
+    SKETCH_URI_PREFIX, SketchId, StrokeEnd, StrokeId, StrokePoint, Tool, WetInk,
 };
 
 use crate::docs::{Docs, now_ms};
@@ -45,14 +51,31 @@ const ZOOM: f32 = 1.0;
 const Z_STEP: f32 = 0.01;
 /// Remote wet strokes sit above every committed element.
 const WET_Z_BASE: f32 = 990.0;
-/// Wet z slots wrap here so they stay under the camera's far plane.
-const WET_Z_SLOTS: u16 = 1000;
+/// Wet z slots wrap here so they stay under the pointers and the camera's
+/// far plane (1000).
+const WET_Z_SLOTS: u16 = 900;
+/// Remote pointers sit above every wet stroke: the tip's footprint, then
+/// the ring around it.
+const POINTER_DAB_Z: f32 = 999.2;
+const POINTER_RING_Z: f32 = 999.4;
+/// A pointer that stops updating is dropped after this long.
+const POINTER_TTL_MS: u64 = 1_500;
+/// Alpha of the pointer's footprint relative to the ink's own, hovering
+/// and drawing.
+const POINTER_HOVER_ALPHA: f32 = 0.35;
+const POINTER_DOWN_ALPHA: f32 = 0.7;
+/// The ring: line width in canvas units, and its radius floor around a
+/// thin tool.
+const POINTER_RING_WIDTH: f32 = 1.5;
+const POINTER_RING_MIN_RADIUS: f32 = 6.0;
 
 /// An ephemeral frame relayed by the server (raised by the sync layer).
 #[derive(Message)]
 pub struct WetInkFrame {
     pub doc: DocKey,
     pub payload: Vec<u8>,
+    /// The device that sent it (pointers are keyed by sender).
+    pub from: DeviceId,
 }
 
 /// Texture table shared with the egui loader: uri → (texture, size).
@@ -97,6 +120,103 @@ impl WetStroke {
     }
 }
 
+/// One drawable piece of a remote pointer (the footprint or the ring),
+/// kept across updates so a move re-uploads the mesh and nothing else.
+#[derive(Default)]
+struct PointerPart {
+    drawn: Option<InkEntity>,
+    mesh: Option<Handle<Mesh>>,
+    style: Option<InkStyle>,
+}
+
+impl PointerPart {
+    /// Show `ink` at `z` on the scene's layer, or nothing.
+    fn set(
+        &mut self,
+        commands: &mut Commands,
+        scene: &mut SketchScene,
+        meshes: &mut Assets<Mesh>,
+        ink_assets: &InkAssets,
+        ink: Option<(Mesh, InkStyle)>,
+        z: f32,
+    ) {
+        let Some((mesh, style)) = ink else {
+            self.clear(commands, Some(scene));
+            return;
+        };
+        let handle = match &self.mesh {
+            Some(handle) => {
+                if let Err(err) = meshes.insert(handle, mesh) {
+                    tracing::error!(%err, "pointer mesh update failed");
+                }
+                handle.clone()
+            }
+            None => {
+                let handle = meshes.add(mesh);
+                self.mesh = Some(handle.clone());
+                handle
+            }
+        };
+        let style_changed = self.style.as_ref() != Some(&style);
+        match self.drawn {
+            Some(_) if !style_changed => {}
+            Some(drawn) => {
+                // Tool or colour changed: restyle the entity in place.
+                scene.palette.remove(drawn.slot);
+                let slot = scene.palette.insert(&style, ink_assets);
+                let (tag, material) = scene.palette.components(slot);
+                commands.entity(drawn.entity).insert((tag, material));
+                self.drawn = Some(InkEntity {
+                    entity: drawn.entity,
+                    slot,
+                });
+            }
+            None => {
+                let slot = scene.palette.insert(&style, ink_assets);
+                let (tag, material) = scene.palette.components(slot);
+                let entity = commands
+                    .spawn((
+                        Mesh2d(handle),
+                        material,
+                        tag,
+                        Transform::from_xyz(0.0, 0.0, z),
+                        RenderLayers::layer(scene.layer),
+                    ))
+                    .id();
+                self.drawn = Some(InkEntity { entity, slot });
+            }
+        }
+        self.style = Some(style);
+    }
+
+    /// Despawn; `scene` is `None` only when the sketch itself is gone.
+    fn clear(&mut self, commands: &mut Commands, scene: Option<&mut SketchScene>) {
+        if let Some(drawn) = self.drawn.take() {
+            commands.entity(drawn.entity).despawn();
+            if let Some(scene) = scene {
+                scene.palette.remove(drawn.slot);
+            }
+        }
+        self.mesh = None;
+        self.style = None;
+    }
+}
+
+/// What a pointer draws this update: each part `None` to hide it.
+struct PointerLook {
+    dab: Option<(Mesh, InkStyle)>,
+    ring: Option<(Mesh, InkStyle)>,
+}
+
+/// A peer's pen on one sketch.
+struct RemotePointer {
+    sketch: SketchId,
+    dab: PointerPart,
+    ring: PointerPart,
+    /// Local clock at the last update; dropped after [`POINTER_TTL_MS`].
+    seen_ms: u64,
+}
+
 /// The off-screen image a sketch renders into and the camera drawing it.
 struct SceneTarget {
     image: Handle<Image>,
@@ -122,6 +242,8 @@ struct SketchScene {
 struct SketchScenes {
     scenes: HashMap<SketchId, SketchScene>,
     wet: HashMap<StrokeId, WetStroke>,
+    /// One pointer per peer device, on whichever sketch its pen is over.
+    pointers: HashMap<DeviceId, RemotePointer>,
     next_layer: usize,
 }
 
@@ -132,6 +254,59 @@ impl SketchScenes {
             return;
         };
         despawn_wet(commands, &mut self.scenes, wet);
+    }
+
+    /// Move `from`'s pointer to `sketch` and redraw it as `look`.
+    fn update_pointer(
+        &mut self,
+        commands: &mut Commands,
+        meshes: &mut Assets<Mesh>,
+        ink_assets: &InkAssets,
+        from: DeviceId,
+        sketch: SketchId,
+        look: PointerLook,
+    ) {
+        let pointer = self.pointers.entry(from).or_insert_with(|| RemotePointer {
+            sketch,
+            dab: PointerPart::default(),
+            ring: PointerPart::default(),
+            seen_ms: 0,
+        });
+        if pointer.sketch != sketch {
+            let old = self.scenes.get_mut(&pointer.sketch);
+            pointer.dab.clear(commands, old);
+            let old = self.scenes.get_mut(&pointer.sketch);
+            pointer.ring.clear(commands, old);
+            pointer.sketch = sketch;
+        }
+        let Some(scene) = self.scenes.get_mut(&sketch) else {
+            return; // sketch not on screen; nothing to draw into
+        };
+        pointer
+            .dab
+            .set(commands, scene, meshes, ink_assets, look.dab, POINTER_DAB_Z);
+        pointer.ring.set(
+            commands,
+            scene,
+            meshes,
+            ink_assets,
+            look.ring,
+            POINTER_RING_Z,
+        );
+        pointer.seen_ms = now_ms();
+    }
+
+    /// Drop `from`'s pointer and free its style slots.
+    fn despawn_pointer(&mut self, commands: &mut Commands, from: DeviceId) {
+        let Some(mut pointer) = self.pointers.remove(&from) else {
+            return;
+        };
+        pointer
+            .dab
+            .clear(commands, self.scenes.get_mut(&pointer.sketch));
+        pointer
+            .ring
+            .clear(commands, self.scenes.get_mut(&pointer.sketch));
     }
 }
 
@@ -472,7 +647,11 @@ fn target_extent(content_max: f32) -> u32 {
 /// allocates a zero-vertex mesh but still tries to upload it, logging a
 /// "Use-after-free" error every frame the mesh is extracted.
 fn ink_mesh(ink: &Ink<'_>, points: &[StrokePoint], end: StrokeEnd) -> Option<(Mesh, InkStyle)> {
-    let ink = ink.mesh(points, end, DEFAULT_TOLERANCE);
+    bevy_mesh(ink.mesh(points, end, DEFAULT_TOLERANCE))
+}
+
+/// A tessellated ink mesh as a bevy mesh (canvas y down → world y up).
+fn bevy_mesh(ink: InkMesh) -> Option<(Mesh, InkStyle)> {
     if ink.is_empty() {
         return None;
     }
@@ -492,6 +671,61 @@ fn ink_mesh(ink: &Ink<'_>, points: &[StrokePoint], end: StrokeEnd) -> Option<(Me
     .with_inserted_attribute(ATTRIBUTE_INK_OPACITY, opacity)
     .with_inserted_indices(Indices::U32(ink.indices));
     Some((mesh, ink.style))
+}
+
+// ---- remote pointers ----
+
+/// The footprint the peer's tip would leave at (`x`, `y`): the iPad's own
+/// hover dab, faint while hovering and stronger while drawing.
+fn pointer_dab(
+    tool: Tool,
+    color: Rgba,
+    base_width: f32,
+    x: f32,
+    y: f32,
+    tilt: Option<pendant_core::Tilt>,
+    down: bool,
+) -> Option<(Mesh, InkStyle)> {
+    let scale = if down {
+        POINTER_DOWN_ALPHA
+    } else {
+        POINTER_HOVER_ALPHA
+    };
+    let [r, g, b, a] = color.0;
+    let alpha = (f32::from(a) * scale).round().clamp(0.0, 255.0) as u8;
+    let ink = Ink::preset(tool, Rgba([r, g, b, alpha]), base_width);
+    bevy_mesh(ink.hover_dab(x, y, tilt, DEFAULT_TOLERANCE))
+}
+
+/// The ring around a pointer, in the sender's device colour: a closed
+/// monoline circle through the same ink pipeline as everything else.
+fn pointer_ring(from: DeviceId, x: f32, y: f32, radius: f32) -> Option<(Mesh, InkStyle)> {
+    const SEGMENTS: u32 = 48;
+    let points: Vec<StrokePoint> = (0..=SEGMENTS)
+        .map(|i| {
+            let angle = std::f32::consts::TAU * i as f32 / SEGMENTS as f32;
+            StrokePoint {
+                x: x + radius * angle.cos(),
+                y: y + radius * angle.sin(),
+                force: 0.5,
+                t_ms: i * 4,
+                tilt: None,
+                size: None,
+            }
+        })
+        .collect();
+    let ink = Ink::preset(Tool::Monoline, device_color(from), POINTER_RING_WIDTH);
+    bevy_mesh(ink.mesh(&points, StrokeEnd::Complete, DEFAULT_TOLERANCE))
+}
+
+/// A stable, readable-on-dark-paper colour per device: the hue hashed
+/// from its id.
+fn device_color(device: DeviceId) -> Rgba {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    device.to_string().hash(&mut hasher);
+    let hue = (hasher.finish() % 360) as f32;
+    Rgba(Srgba::from(Hsla::new(hue, 0.7, 0.65, 0.9)).to_u8_array())
 }
 
 // ---- wet ink ----
@@ -633,7 +867,48 @@ fn apply_wet_ink(
             }
             // No stroke is coming (ruler drag, tool fiddling): drop it now.
             WetInk::Cancel { stroke } => scenes.despawn_wet(&mut commands, stroke),
+            WetInk::Pointer {
+                sketch,
+                x,
+                y,
+                tilt,
+                tool,
+                color,
+                base_width,
+                down,
+                ..
+            } => {
+                let dab =
+                    tool.and_then(|tool| pointer_dab(tool, color, base_width, x, y, tilt, down));
+                // The eraser's ring is its reach; a tool's hugs the tip.
+                let radius = match tool {
+                    Some(_) => (base_width * 0.75).max(POINTER_RING_MIN_RADIUS),
+                    None => base_width / 2.0,
+                };
+                let ring = pointer_ring(frame.from, x, y, radius);
+                scenes.update_pointer(
+                    &mut commands,
+                    &mut meshes,
+                    &ink_assets,
+                    frame.from,
+                    sketch,
+                    PointerLook { dab, ring },
+                );
+            }
+            WetInk::PointerGone { .. } => scenes.despawn_pointer(&mut commands, frame.from),
         }
+    }
+
+    // Drop pointers whose sender went quiet (a lost `PointerGone`).
+    let now = now_ms();
+    let stale: Vec<DeviceId> = scenes
+        .pointers
+        .iter()
+        .filter(|(_, p)| p.seen_ms + POINTER_TTL_MS <= now)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in stale {
+        scenes.despawn_pointer(&mut commands, id);
     }
 
     // Expire ended wet strokes whose commit never arrived.

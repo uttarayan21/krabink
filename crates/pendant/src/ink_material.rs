@@ -376,14 +376,11 @@ pub struct InkPalette {
     /// rewritten in place rather than reallocated on most edits.
     capacity: usize,
     dirty: bool,
-    /// Frames left to re-touch the materials: a reallocated buffer only
-    /// reaches their bind groups once they are prepared again, and the
-    /// material prepare is not ordered after the buffer's.
-    refresh: u8,
 }
 
 impl InkPalette {
-    const REFRESH_FRAMES: u8 = 2;
+    /// Slots a fresh palette holds before its first reallocation.
+    const INITIAL_CAPACITY: usize = 64;
 
     pub fn new(
         buffers: &mut Assets<ShaderBuffer>,
@@ -391,7 +388,7 @@ impl InkPalette {
         params: InkParams,
         assets: &InkAssets,
     ) -> Self {
-        let capacity = 1;
+        let capacity = Self::INITIAL_CAPACITY;
         let mut buffer = ShaderBuffer::default();
         buffer.set_data(vec![StrokeStyle::default(); capacity]);
         let buffer = buffers.add(buffer);
@@ -411,7 +408,6 @@ impl InkPalette {
             free: Vec::new(),
             capacity,
             dirty: false,
-            refresh: 0,
         }
     }
 
@@ -467,24 +463,30 @@ impl InkPalette {
         buffers: &mut Assets<ShaderBuffer>,
         materials: &mut Assets<InkMaterial>,
     ) {
-        if self.dirty {
-            self.dirty = false;
-            let needed = self.styles.len().max(1);
-            if needed > self.capacity {
-                self.capacity = needed.next_power_of_two();
-                self.refresh = Self::REFRESH_FRAMES;
-            }
-            if let Some(mut buffer) = buffers.get_mut(&self.buffer) {
-                let mut padded = self.styles.clone();
-                padded.resize(self.capacity, StrokeStyle::default());
-                buffer.set_data(padded);
-            }
+        if !self.dirty {
+            return;
         }
-        if self.refresh > 0 {
-            self.refresh -= 1;
-            self.materials.iter().for_each(|handle| {
-                materials.get_mut(handle);
-            });
+        self.dirty = false;
+        let needed = self.styles.len().max(1);
+        let mut padded = self.styles.clone();
+        if needed > self.capacity {
+            // A resized buffer is a new GPU resource, and the materials'
+            // bind groups keep the old one: swap in a fresh asset so they
+            // are rebuilt against it.
+            self.capacity = needed.next_power_of_two();
+            padded.resize(self.capacity, StrokeStyle::default());
+            let mut buffer = ShaderBuffer::default();
+            buffer.set_data(padded);
+            self.buffer = buffers.add(buffer);
+            for handle in &self.materials {
+                if let Some(mut material) = materials.get_mut(handle) {
+                    material.styles = self.buffer.clone();
+                }
+            }
+        } else if let Some(mut buffer) = buffers.get_mut(&self.buffer) {
+            // Same size: bevy writes the existing GPU buffer in place.
+            padded.resize(self.capacity, StrokeStyle::default());
+            buffer.set_data(padded);
         }
     }
 }

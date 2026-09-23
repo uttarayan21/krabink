@@ -65,6 +65,10 @@ pub enum SubCommand {
         /// How many strokes to draw.
         #[clap(long, default_value_t = 3)]
         strokes: usize,
+        /// Hover a pen pointer over each stroke's start before drawing it,
+        /// and keep it on the tip while drawing.
+        #[clap(long)]
+        pointer: bool,
     },
 }
 

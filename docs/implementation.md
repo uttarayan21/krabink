@@ -95,6 +95,11 @@ Ephemeral payloads are opaque to the protocol; wet ink is one of them.
   spec}` → `Points{seq, sent_ms, chunks}`* → `End{tail}` or `Cancel`. The
   points are the modelled stage-1 points, so a receiver runs the identical
   fold and the commit replaces the provisional ink without a visible change.
+  `Pointer{sketch, x, y, tilt, tool, color, base_width, down}` /
+  `PointerGone{sketch}` share the lane: where the sender's pen is (hovering
+  or drawing; `tool == None` is the eraser), throttled to ~30 Hz on the
+  iPad, keyed by the `from` device on receipt. Variants are append-only;
+  older receivers log-and-drop what they cannot decode.
 
 ### 3.4 Ink pipeline (`brush/`, `geom/`)
 
@@ -235,8 +240,11 @@ Bevy app with egui UI. Modules:
 - `sketch.rs`: each sketch is an off-screen Bevy scene (own render layer and
   camera) rendered into an `Image` and handed to egui through a
   `pendant://` texture loader. Committed elements are ink meshes at z
-  `k/100`; remote wet strokes at `990 + j/100` are dropped when the commit
-  lands or on timeout.
+  `k/100`; remote wet strokes at `990 + j/100` (900 slots) are dropped when
+  the commit lands or on timeout. Peers' pens draw above that at 999.2
+  (the tool's hover dab, faint hovering / stronger drawing) and 999.4 (a
+  monoline ring in a per-device hue); a pointer dies on `PointerGone` or
+  after 1.5 s of silence.
 - `lab.rs`: `pendant brush-lab --corpus <file|dir> --presets … --models
   ema,ism --out dir --svg --metrics`, the tuning bench: SVG grids per
   recording through `elements_to_svg` and `metrics.json` from
@@ -251,10 +259,12 @@ Bevy app with egui UI. Modules:
   carries a `MeshTag` index into it plus the custom `ATTRIBUTE_INK_UV` and
   `ATTRIBUTE_INK_OPACITY` vertex attributes. Reversed-Z: accumulate runs
   compare `GreaterEqual`, discard runs `Greater` with depth write. The
-  palette pads to a power of two and re-touches its materials for two
-  frames after growth because `PreparedMaterial2d` does not re-prepare on
-  buffer reallocation. Only the multiply pipeline exists; the desktop paper
-  is white.
+  palette starts at 64 slots and pads to a power of two; same-size uploads
+  rewrite the GPU buffer in place, and growth swaps in a fresh
+  `ShaderBuffer` asset and repoints the materials at it, because a resized
+  buffer is a new GPU resource the existing bind groups never see (touching
+  the materials does not rebuild them). Only the multiply pipeline exists;
+  the desktop paper is white.
 
 ## 6. iPad bridge (`pendant-ffi`)
 

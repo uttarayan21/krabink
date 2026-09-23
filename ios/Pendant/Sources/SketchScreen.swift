@@ -54,6 +54,11 @@ private let settleTimeout: Duration = .milliseconds(200)
 private let forceFullScale: CGFloat = 2
 /// Alpha of the hover preview dab relative to the ink's own.
 private let hoverAlpha: Float = 0.35
+/// Peers see the pen as a pointer: send its position at most this often
+/// (hover events arrive at 120 Hz+) and only once it moved this far on
+/// screen, unless the pen went down or up.
+private let pointerInterval: CFAbsoluteTime = 1.0 / 30
+private let pointerMinMove: CGFloat = 1.5
 /// `-fakeEstimates 1`: finger samples pretend to be estimates that the
 /// model revises 60 ms after pen-up, so the settling path (ink held on
 /// screen, points patched, early commit) runs on the simulator.
@@ -265,6 +270,11 @@ final class SketchModel {
     /// The subset of `ids` that are strokes with a custom brush.
     private var customIds: Set<String> = []
     private var penDown = false
+    /// The remote pointer as last sent: when, where (canvas units) and
+    /// whether the pen was down; `pointerSentPos == nil` once withdrawn.
+    private var pointerSentAt: CFAbsoluteTime = 0
+    private var pointerSentPos: (x: Float, y: Float)?
+    private var pointerSentDown = false
     private var pendingRefresh = false
     private var erasing = false
     private var live: LiveStroke?
@@ -328,6 +338,7 @@ final class SketchModel {
     func penBegan(_ sample: RawSample) {
         penDown = true
         renderer?.clearHover()
+        sendPointer(sample, down: true)
         let selection: BrushSelection
         switch picked {
         case .eraser(let eraser):
@@ -368,6 +379,7 @@ final class SketchModel {
     /// is Apple's guess at the next few, drawn as a tail and discarded on
     /// the next event.
     func penMoved(coalesced: [RawSample], predicted: [RawSample]) {
+        if let last = coalesced.last { sendPointer(last, down: true) }
         if erasing, case .eraser(let eraser) = picked {
             let radius = Self.eraserRadius(eraser)
             for sample in coalesced { erase(at: sample, radius: radius) }
@@ -496,6 +508,7 @@ final class SketchModel {
     /// cancelled touch sends Cancel so receivers drop the provisional ink.
     func penEnded(cancelled: Bool) {
         penDown = false
+        pointerLifted()
         defer { flushPendingRefresh() }
         if erasing {
             erasing = false
@@ -616,6 +629,13 @@ final class SketchModel {
     /// and tilt at reduced alpha; `nil` when it leaves. Nothing while the
     /// pen is down or the eraser is selected.
     func hover(_ sample: RawSample?) {
+        // Hover ends at touch-down, right before `penBegan`: withdraw the
+        // remote pointer only when the pen really left.
+        if let sample {
+            sendPointer(sample, down: false)
+        } else if !penDown {
+            pointerGone()
+        }
         guard let renderer else { return }
         guard let sample, !penDown, case .ink(let selection) = picked else {
             renderer.clearHover()
@@ -626,6 +646,59 @@ final class SketchModel {
             mesh: hoverDabMesh(
                 brush: selection.brush, color: (selection.color & ~0xff) | alpha,
                 x: sample.x, y: sample.y, tilt: sample.tilt, tolerance: renderer.tolerance))
+    }
+
+    // MARK: remote pointer
+
+    /// What the pointer draws: the picked tool, or `nil` for the eraser
+    /// with its diameter as the width.
+    private var pointerTool: (tool: Tool?, color: UInt32, width: Float) {
+        switch picked {
+        case .ink(let selection):
+            return (selection.brush.tool, selection.color, selection.brush.baseWidth)
+        case .eraser(let eraser):
+            return (nil, 0, Self.eraserRadius(eraser) * 2)
+        }
+    }
+
+    /// Tell peers where the pen is. A change between hovering and drawing
+    /// goes out at once; otherwise sends are throttled to `pointerInterval`
+    /// and skipped until the pen moved `pointerMinMove` screen points.
+    private func sendPointer(_ sample: RawSample, down: Bool) {
+        let now = CFAbsoluteTimeGetCurrent()
+        if down == pointerSentDown, let last = pointerSentPos {
+            if now - pointerSentAt < pointerInterval { return }
+            let zoom = Float(max(renderer?.viewport.zoom ?? 1, 0.01))
+            if hypot(sample.x - last.x, sample.y - last.y) < Float(pointerMinMove) / zoom { return }
+        }
+        let tool = pointerTool
+        try? session.sendPointer(
+            sketch: sketchId, x: sample.x, y: sample.y, tilt: sample.tilt, tool: tool.tool,
+            color: tool.color, baseWidth: tool.width, down: down)
+        pointerSentAt = now
+        pointerSentPos = (sample.x, sample.y)
+        pointerSentDown = down
+    }
+
+    /// Pen-up without a sample: repeat the last position as hovering so a
+    /// non-hovering Pencil does not leave a "drawing" pointer behind.
+    private func pointerLifted() {
+        guard pointerSentDown, let last = pointerSentPos else { return }
+        let tool = pointerTool
+        try? session.sendPointer(
+            sketch: sketchId, x: last.x, y: last.y, tilt: nil, tool: tool.tool,
+            color: tool.color, baseWidth: tool.width, down: false)
+        pointerSentAt = CFAbsoluteTimeGetCurrent()
+        pointerSentDown = false
+    }
+
+    /// The pen left the canvas (or the screen closed): peers drop the
+    /// pointer now rather than when it goes stale.
+    func pointerGone() {
+        guard pointerSentPos != nil else { return }
+        pointerSentPos = nil
+        pointerSentDown = false
+        try? session.sendPointerGone(sketch: sketchId)
     }
 
     private func flushWet() {
@@ -1050,6 +1123,7 @@ struct SketchScreen: View {
         .background(Theme.bg)
         .preferredColorScheme(.dark)
         .tint(Theme.accent)
+        .onDisappear { model.pointerGone() }
     }
 }
 

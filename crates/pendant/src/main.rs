@@ -41,9 +41,15 @@ fn main() -> Result<()> {
             cli::Cli::completions(shell);
             Ok(())
         }
-        Some(cli::SubCommand::Replay { pair, strokes }) => {
-            replay::run(replay::ReplayArgs { pair, strokes })
-        }
+        Some(cli::SubCommand::Replay {
+            pair,
+            strokes,
+            pointer,
+        }) => replay::run(replay::ReplayArgs {
+            pair,
+            strokes,
+            pointer,
+        }),
         Some(cli::SubCommand::BrushLab {
             corpus,
             presets,

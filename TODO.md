@@ -7,7 +7,9 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
 
 ## Backlog (M7 / ongoing)
 
-- [ ] Presence cursors (who's editing / where, over the ephemeral channel).
+- [ ] Presence cursors: the iPad pen shows as a pointer on the desktop
+      (`WetInk::Pointer`); still open: desktop mouse → iPad, who's editing
+      text, per-device names on the pointer.
 - [ ] Shallow-snapshot GC (compact old CRDT history, bound store growth).
 - [ ] `pendant export` CLI (markdown + SVG assets bundle to disk).
 - [ ] Config UI (relay URL / token) instead of launch args + UserDefaults.

@@ -234,8 +234,8 @@ fn apply_effects(
             ClientEffect::DocSynced(_) => {
                 editor.remote_dirty = true;
             }
-            ClientEffect::Ephemeral { doc, payload, .. } => {
-                wet.write(WetInkFrame { doc, payload });
+            ClientEffect::Ephemeral { doc, payload, from } => {
+                wet.write(WetInkFrame { doc, payload, from });
             }
             ClientEffect::Fatal(err) => {
                 tracing::error!(%err, "sync session failed; reopening link shortly");

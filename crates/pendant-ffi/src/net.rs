@@ -376,6 +376,8 @@ fn dispatch_wet(shared: &Shared, doc: DocKey, payload: &[u8]) {
             }
         }
         WetInk::Cancel { stroke } => listener.wet_cancel(stroke.to_string()),
+        // Remote pointers are rendered on the desktop only for now.
+        WetInk::Pointer { .. } | WetInk::PointerGone { .. } => {}
     }
 }
 

@@ -22,7 +22,7 @@ use crate::brush::{AssetInfo, AssetKind};
 use crate::net::{self, Cmd};
 use crate::types::{
     BrushInfo, DeviceInfo, Element, NoteInfo, PairInfo, PeerInfo, ShapeElement, Stroke,
-    StrokePoint, SyncState, Tool, rgba_from_u32,
+    StrokePoint, SyncState, Tilt, Tool, rgba_from_u32,
 };
 
 /// Errors crossing the FFI boundary. Flattened to message-carrying variants;
@@ -994,6 +994,43 @@ impl NoteSession {
             .parse()
             .map_err(|_| PendantError::MalformedId { id: stroke })?;
         self.send_wet(pcore::WetInk::Cancel { stroke: stroke_id })
+    }
+
+    /// Where the pen is now, hovering (`down == false`) or drawing: peers
+    /// show a pointer there. `tool == None` means the eraser is selected
+    /// and `base_width` is its diameter. Call at a throttled rate; the
+    /// view decides the cadence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_pointer(
+        &self,
+        sketch: String,
+        x: f32,
+        y: f32,
+        tilt: Option<Tilt>,
+        tool: Option<Tool>,
+        color: u32,
+        base_width: f32,
+        down: bool,
+    ) -> Result<()> {
+        let sketch = self.parse_sketch(&sketch)?;
+        self.send_wet(pcore::WetInk::Pointer {
+            sketch,
+            x,
+            y,
+            tilt: tilt.map(Into::into),
+            tool: tool.map(Into::into),
+            color: rgba_from_u32(color),
+            base_width,
+            down,
+            sent_ms: now_ms(),
+        })
+    }
+
+    /// The pen left the sketch: peers drop the pointer at once instead of
+    /// waiting for it to go stale.
+    pub fn send_pointer_gone(&self, sketch: String) -> Result<()> {
+        let sketch = self.parse_sketch(&sketch)?;
+        self.send_wet(pcore::WetInk::PointerGone { sketch })
     }
 
     /// Remove one element (stroke or shape) by id.

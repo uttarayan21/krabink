@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::stroke::{Rgba, StrokePoint, Tool, decode_chunks, encode_chunks};
+use crate::stroke::{Rgba, StrokePoint, Tilt, Tool, decode_chunks, encode_chunks};
 use crate::{Result, SketchId, StrokeId};
 
 /// A wet-ink event. `Begin` → `Points`* → `End`, keyed by the stroke id the
@@ -50,6 +50,29 @@ pub enum WetInk {
     },
     Cancel {
         stroke: StrokeId,
+    },
+    /// Where the sender's pen is right now, hovering or drawing: peers
+    /// draw a pointer there (the tip's footprint plus a ring). Sent at a
+    /// throttled rate; receivers drop a pointer that goes quiet.
+    /// Variants are append-only: postcard tags enums by declaration
+    /// order, and older receivers log-and-drop what they cannot decode.
+    Pointer {
+        sketch: SketchId,
+        x: f32,
+        y: f32,
+        tilt: Option<Tilt>,
+        /// `None` while the eraser is selected: no footprint, ring only.
+        tool: Option<Tool>,
+        color: Rgba,
+        /// The tool's width, or the eraser's diameter.
+        base_width: f32,
+        /// Touching the glass (a wet stroke is streaming) vs hovering.
+        down: bool,
+        sent_ms: u64,
+    },
+    /// The pen left `sketch` (lifted away or the view closed).
+    PointerGone {
+        sketch: SketchId,
     },
 }
 
@@ -92,7 +115,10 @@ impl WetInk {
         match self {
             Self::Points { chunks, .. } => decode_chunks(chunks.iter().map(Vec::as_slice)),
             Self::End { tail, .. } => decode_chunks(tail.iter().map(Vec::as_slice)),
-            Self::Begin { .. } | Self::Cancel { .. } => Ok(Vec::new()),
+            Self::Begin { .. }
+            | Self::Cancel { .. }
+            | Self::Pointer { .. }
+            | Self::PointerGone { .. } => Ok(Vec::new()),
         }
     }
 }
@@ -134,6 +160,45 @@ mod tests {
             .unwrap()
             .is_empty()
         );
+    }
+
+    #[test]
+    fn pointer_roundtrip() {
+        let sketch = crate::SketchId::new();
+        let pointer = WetInk::Pointer {
+            sketch,
+            x: 12.5,
+            y: 40.0,
+            tilt: Some(Tilt {
+                azimuth: 2.0,
+                altitude: 0.9,
+                roll: -0.2,
+            }),
+            tool: Some(Tool::Marker),
+            color: Rgba([10, 20, 30, 255]),
+            base_width: 6.0,
+            down: false,
+            sent_ms: 1_757_000_000_123,
+        };
+        let decoded = WetInk::decode(&pointer.encode().unwrap()).unwrap();
+        assert_eq!(decoded, pointer);
+        assert!(decoded.decode_points().unwrap().is_empty());
+
+        let eraser = WetInk::Pointer {
+            sketch,
+            x: 0.0,
+            y: 0.0,
+            tilt: None,
+            tool: None,
+            color: Rgba([0; 4]),
+            base_width: 24.0,
+            down: true,
+            sent_ms: 0,
+        };
+        assert_eq!(WetInk::decode(&eraser.encode().unwrap()).unwrap(), eraser);
+
+        let gone = WetInk::PointerGone { sketch };
+        assert_eq!(WetInk::decode(&gone.encode().unwrap()).unwrap(), gone);
     }
 
     #[test]

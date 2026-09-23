@@ -28,6 +28,9 @@ pub struct ReplayArgs {
     /// The target's `pendant://pair` URI.
     pub pair: String,
     pub strokes: usize,
+    /// Send pen pointers too: hover to each stroke's start, then ride the
+    /// tip while it draws.
+    pub pointer: bool,
 }
 
 /// In-memory docs for the replay client; nothing touches disk.
@@ -174,8 +177,27 @@ async fn replay(args: ReplayArgs) -> Result<()> {
     .change_context(Error)?;
 
     for i in 0..args.strokes {
-        stream_stroke(&mut session, &link, &mut docs, note_id, note_key, sketch, i).await?;
+        if args.pointer {
+            hover_to(&mut session, &link, note_key, sketch, i).await?;
+        }
+        stream_stroke(
+            &mut session,
+            &link,
+            &mut docs,
+            note_id,
+            note_key,
+            sketch,
+            i,
+            args.pointer,
+        )
+        .await?;
         tokio::time::sleep(PAUSE_BETWEEN).await;
+    }
+    if args.pointer {
+        let gone = WetInk::PointerGone { sketch }
+            .encode()
+            .change_context(Error)?;
+        send_all(&link, session.ephemeral(note_key, gone))?;
     }
 
     writeln!(std::io::stdout(), "replayed {} strokes", args.strokes).change_context(Error)?;
@@ -275,6 +297,57 @@ fn sample_stroke(index: usize) -> Vec<StrokePoint> {
         .collect()
 }
 
+const POINTER_COLOR: Rgba = Rgba([30, 60, 200, 255]);
+const POINTER_WIDTH: f32 = 3.0;
+
+/// A `Pointer` frame for the replay pen at (`x`, `y`).
+fn pointer_frame(sketch: SketchId, x: f32, y: f32, down: bool) -> Result<Vec<u8>> {
+    WetInk::Pointer {
+        sketch,
+        x,
+        y,
+        tilt: None,
+        tool: Some(Tool::Pen),
+        color: POINTER_COLOR,
+        base_width: POINTER_WIDTH,
+        down,
+        sent_ms: now_ms(),
+    }
+    .encode()
+    .change_context(Error)
+}
+
+/// Glide the hovering pointer from the previous stroke's end to this
+/// stroke's start over ~0.5s at the iPad's ~30Hz pointer cadence.
+async fn hover_to(
+    session: &mut pendant_core::ClientSession,
+    link: &LocalLink,
+    note_key: DocKey,
+    sketch: SketchId,
+    index: usize,
+) -> Result<()> {
+    const STEPS: usize = 15;
+    let from = index
+        .checked_sub(1)
+        .and_then(|prev| sample_stroke(prev).last().copied())
+        .map_or((40.0, 40.0), |p| (p.x, p.y));
+    let to = sample_stroke(index)
+        .first()
+        .map_or((40.0, 40.0), |p| (p.x, p.y));
+    for step in 0..=STEPS {
+        let t = step as f32 / STEPS as f32;
+        let x = from.0 + (to.0 - from.0) * t;
+        let y = from.1 + (to.1 - from.1) * t;
+        send_all(
+            link,
+            session.ephemeral(note_key, pointer_frame(sketch, x, y, false)?),
+        )?;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn stream_stroke(
     session: &mut pendant_core::ClientSession,
     link: &LocalLink,
@@ -283,11 +356,12 @@ async fn stream_stroke(
     note_key: DocKey,
     sketch: SketchId,
     index: usize,
+    pointer: bool,
 ) -> Result<()> {
     let stroke_id = StrokeId::new();
     let points = sample_stroke(index);
-    let color = Rgba([30, 60, 200, 255]);
-    let base_width = 3.0;
+    let color = POINTER_COLOR;
+    let base_width = POINTER_WIDTH;
 
     let begin = WetInk::Begin {
         sketch,
@@ -309,6 +383,12 @@ async fn stream_stroke(
             .encode()
             .change_context(Error)?;
         send_all(link, session.ephemeral(note_key, payload))?;
+        if pointer && let Some(tip) = batch.last() {
+            send_all(
+                link,
+                session.ephemeral(note_key, pointer_frame(sketch, tip.x, tip.y, true)?),
+            )?;
+        }
     }
 
     let end = WetInk::end(stroke_id, now_ms(), &[])
