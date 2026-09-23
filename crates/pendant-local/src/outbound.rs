@@ -255,6 +255,10 @@ async fn session_loop(
             next = cmd.recv() => {
                 let effects = match next {
                     None | Some(OutCmd::Close) => return End::Closed,
+                    Some(OutCmd::Unpair) => {
+                        let _ = lanes.send(&session.unpair());
+                        return End::Closed;
+                    }
                     Some(OutCmd::Update { doc, payload }) => session.local_update(doc, payload),
                     Some(OutCmd::Ephemeral { doc, payload }) => session.ephemeral(doc, payload),
                     Some(OutCmd::Subscribe(doc)) => {
@@ -287,12 +291,13 @@ fn apply(
         match effect {
             ClientEffect::Send(msg) => lanes.send(&msg)?,
             ClientEffect::Connected => {
-                hub.set_state(
-                    peer_id,
-                    PeerState::Connected {
+                let device = session.server_device();
+                hub.update_status(peer_id, |s| {
+                    s.state = PeerState::Connected {
                         route: current_route(conn),
-                    },
-                );
+                    };
+                    s.device = device;
+                });
                 for doc in hub.known_docs() {
                     queue.extend(session.subscribe(doc, hub.doc_version(doc)));
                 }
@@ -304,6 +309,17 @@ fn apply(
                 hub.fanout_ephemeral(peer_id, doc, payload, from);
             }
             ClientEffect::Fatal(message) => return Err(End::Fatal(message)),
+            ClientEffect::Unpaired(device) => {
+                let endpoint = hub
+                    .peers
+                    .lock()
+                    .expect("peer registry poisoned")
+                    .peers
+                    .get(&peer_id)
+                    .and_then(|p| p.status.id);
+                hub.notify_unpaired(endpoint, device);
+                return Err(End::Closed);
+            }
         }
     }
     Ok(())

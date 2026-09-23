@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pendant_ffi::{
-    AssetInfo, AssetKind, BrushInfo, Core, CoreListener, Element, NoteInfo, NoteListener, PairInfo,
-    Point2, PointKind, Route, Shape, ShapeElement, Stroke, StrokePoint, SyncState, Tool,
+    AssetInfo, AssetKind, BrushInfo, Core, CoreListener, DeviceInfo, Element, NoteInfo,
+    NoteListener, PairInfo, Point2, PointKind, Route, Shape, ShapeElement, Stroke, StrokePoint,
+    SyncState, Tool,
 };
 
 fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
@@ -97,6 +98,7 @@ struct RecCore {
     notes: Mutex<Vec<NoteInfo>>,
     brushes: Mutex<Vec<BrushInfo>>,
     assets: Mutex<Vec<AssetInfo>>,
+    devices: Mutex<Vec<DeviceInfo>>,
     states: Mutex<Vec<SyncState>>,
 }
 
@@ -111,6 +113,10 @@ impl CoreListener for RecCore {
 
     fn assets_changed(&self, assets: Vec<AssetInfo>) {
         *self.assets.lock().unwrap() = assets;
+    }
+
+    fn devices_changed(&self, devices: Vec<DeviceInfo>) {
+        *self.devices.lock().unwrap() = devices;
     }
 
     fn sync_state(&self, state: SyncState) {
@@ -268,7 +274,9 @@ fn device_rows_converge_both_ways() {
     // Registered straight after construction, before the in-process link
     // has even finished its handshake, like the iPad's init -> adoptPair.
     core_b.register_device("pad".into(), "ipad".into()).unwrap();
-    core_a.register_device("desk".into(), "linux".into()).unwrap();
+    core_a
+        .register_device("desk".into(), "linux".into())
+        .unwrap();
 
     let mut pair = core_a.pair_info();
     pair.addrs = vec![format!("127.0.0.1:{}", core_a.bound_port().unwrap())];
@@ -278,6 +286,101 @@ fn device_rows_converge_both_ways() {
     let has = |core: &Core, id: &str| core.list_devices().iter().any(|d| d.id == id);
     wait_for("B lists A", || has(&core_b, &core_a.device_id()));
     wait_for("A lists B", || has(&core_a, &core_b.device_id()));
+}
+
+/// Renaming is an upsert of our own row: the peer's listener gets the new
+/// name. Unpairing drops our row on the peer and leaves the pairing behind
+/// (own token in the QR, nothing dialled); a re-pair rebuilds it.
+#[test]
+fn rename_propagates_and_unpair_removes_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let core_a = Core::new(dir.path().join("a").to_str().unwrap().into()).unwrap();
+    let core_b = Core::new(dir.path().join("b").to_str().unwrap().into()).unwrap();
+    let rec_a = Arc::new(RecCore::default());
+    core_a.set_listener(rec_a.clone());
+    core_a
+        .register_device("desk".into(), "linux".into())
+        .unwrap();
+
+    let mut pair = core_a.pair_info();
+    pair.addrs = vec![format!("127.0.0.1:{}", core_a.bound_port().unwrap())];
+    core_b.set_pairing(pair.clone()).unwrap();
+    core_b.register_device("pad".into(), "ipad".into()).unwrap();
+    wait_for("B connects to A", || connected(&core_b.sync_state()));
+
+    let name_of = |rec: &RecCore, id: &str| {
+        rec.devices
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|d| d.id == id)
+            .map(|d| d.name.clone())
+    };
+    let b_id = core_b.device_id();
+    wait_for("A's listener sees pad", || {
+        name_of(&rec_a, &b_id).as_deref() == Some("pad")
+    });
+
+    core_b
+        .register_device("kitchen ipad".into(), "ipad".into())
+        .unwrap();
+    wait_for("A's listener sees the rename", || {
+        name_of(&rec_a, &b_id).as_deref() == Some("kitchen ipad")
+    });
+    assert_eq!(
+        core_b.list_devices().len(),
+        2,
+        "rename must not add a row on the renaming device"
+    );
+
+    core_b.unpair().unwrap();
+    wait_for("A drops B's row", || name_of(&rec_a, &b_id).is_none());
+    wait_for("B has nothing to dial", || {
+        core_b.sync_state() == SyncState::Disconnected && core_b.peers().is_empty()
+    });
+    assert_ne!(
+        core_b.pair_info().token,
+        pair.token,
+        "QR falls back to B's own token"
+    );
+    assert!(core_b.list_devices().iter().all(|d| d.id != b_id));
+
+    // Re-pairing works again after leaving.
+    core_b.set_pairing(pair).unwrap();
+    core_b.register_device("pad".into(), "ipad".into()).unwrap();
+    wait_for("B reconnects to A", || connected(&core_b.sync_state()));
+    wait_for("A lists B again", || name_of(&rec_a, &b_id).is_some());
+}
+
+/// remove_device is a mutual, per-peer unpair: the removed peer hears it
+/// over the wire, forgets its pairing, and both device lists drop the row.
+#[test]
+fn remove_device_unpairs_both_ways() {
+    let dir = tempfile::tempdir().unwrap();
+    let core_a = Core::new(dir.path().join("a").to_str().unwrap().into()).unwrap();
+    let core_b = Core::new(dir.path().join("b").to_str().unwrap().into()).unwrap();
+    core_a
+        .register_device("desk".into(), "linux".into())
+        .unwrap();
+
+    let mut pair = core_a.pair_info();
+    pair.addrs = vec![format!("127.0.0.1:{}", core_a.bound_port().unwrap())];
+    core_b.set_pairing(pair).unwrap();
+    core_b.register_device("pad".into(), "ipad".into()).unwrap();
+    wait_for("B connects to A", || connected(&core_b.sync_state()));
+    let has = |core: &Core, id: &str| core.list_devices().iter().any(|d| d.id == id);
+    wait_for("A lists B", || has(&core_a, &core_b.device_id()));
+
+    // A removes B from its list.
+    core_a.remove_device(core_b.device_id()).unwrap();
+
+    // A's list drops B, and B is evicted: it stops connecting.
+    wait_for("A drops B", || !has(&core_a, &core_b.device_id()));
+    wait_for("B is disconnected after eviction", || {
+        core_b.sync_state() == SyncState::Disconnected
+    });
+    // B no longer dials A: reconnect only via a fresh pairing.
+    assert!(core_b.peers().iter().all(|p| !p.connected));
 }
 
 #[test]

@@ -135,6 +135,35 @@ dials them. The in-app "join" paste box does the same live
 that device but carries the workspace's token, relay and replica, so one
 QR opens every path.
 
+### Device registry: names, removal, leaving
+
+The `WorkspaceDoc` carries one `DeviceMeta` row per device (`id`, `name`,
+`platform`, `last_seen_ms`). Each device only ever writes its own row:
+
+- **Register** on every (re)connect: desktop in `sync.rs` on
+  `ClientEffect::Connected`, iPad in `AppModel.registerDevice()` (pair time
+  and every `SyncState.connected`).
+- **Rename** is the same upsert with a new name. The desktop keeps the name
+  in `config.toml` (`device_name`, hostname when unset; `sync.rs::
+  set_local_device_name`, mDNS re-advertised); the iPad in `UserDefaults`
+  (`deviceName`; iOS hides the real device name from apps, so the default
+  is generic). Peers see the change through the normal workspace update:
+  the FFI raises `CoreListener::devices_changed`, the desktop window reads
+  `workspace.devices()` every frame.
+- **Remove** (another device's row) is `remove_device` on either platform:
+  a mutual, per-peer unpair. It drops the row and calls `Node::unpair(device)`,
+  which sends the peer a `ClientMsg`/`ServerMsg::Unpair` over the live
+  connection, then stops dialling it. The removed peer, hearing the unpair
+  for the node its pairing points at, forgets that pairing (FFI
+  `net::watch_unpaired`, desktop `node::poll_unpaired`), so it does not
+  reconnect and re-add its row. `HelloAck` carries the responder's device
+  id so the dialer can match a registry row to its outbound connection.
+- **Leave / unpair** (`Core::unpair`, desktop "Leave workspace"): remove
+  our own row, stop accepting the workspace token, forget the pairing
+  (`pairURI` / `config.toml`), then after `UNPAIR_LINGER` (750 ms, so the
+  removal has been handed to the peers) drop every peer and the relay. The
+  QR falls back to the device's own token; notes already synced stay local.
+
 ## 4. One update, end to end (iPad A stroke reaches iPad B)
 
 ```mermaid

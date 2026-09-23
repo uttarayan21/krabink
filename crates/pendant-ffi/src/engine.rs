@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use pendant_core as pcore;
@@ -60,6 +60,9 @@ pub trait CoreListener: Send + Sync {
     /// newest first. Renderers upload what they lack and redraw strokes
     /// that were waiting for it.
     fn assets_changed(&self, assets: Vec<AssetInfo>);
+    /// The synced device registry changed (a peer joined, was renamed or
+    /// removed); the full list, most recently seen first.
+    fn devices_changed(&self, devices: Vec<DeviceInfo>);
     fn sync_state(&self, state: SyncState);
 }
 
@@ -123,6 +126,9 @@ pub(crate) struct Shared {
     pub online: AtomicBool,
     /// Wakes the sync-state watcher after `suspend`/`connect`/`set_pairing`.
     pub poke: tokio::sync::Notify,
+    /// Bumped by every `set_pairing`/`unpair`; the delayed teardown after
+    /// an unpair checks it so a quick re-pair is not torn down.
+    pub pairing_gen: AtomicU64,
 }
 
 impl Shared {
@@ -150,6 +156,10 @@ impl Shared {
         }
     }
 }
+
+/// How long an unpair keeps the old peers up so the registry removal
+/// reaches them before their connections are dropped.
+const UNPAIR_LINGER: std::time::Duration = std::time::Duration::from_millis(750);
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -289,9 +299,11 @@ impl Core {
             cmd: tx,
             online: AtomicBool::new(true),
             poke: tokio::sync::Notify::new(),
+            pairing_gen: AtomicU64::new(0),
         });
         runtime.spawn(net::run(Arc::downgrade(&shared), node.clone(), rx));
         runtime.spawn(net::watch_status(Arc::downgrade(&shared), node.clone()));
+        runtime.spawn(net::watch_unpaired(Arc::downgrade(&shared), node.clone()));
         Ok(Arc::new(Self {
             shared,
             node,
@@ -407,12 +419,65 @@ impl Core {
             })
             .transpose()?;
         self.node.add_token(info.token.clone());
-        self.shared.lock_state().pairing = Some(info);
+        let previous = self.shared.lock_state().pairing.replace(info);
+        self.shared.pairing_gen.fetch_add(1, Ordering::AcqRel);
+        if let Some(previous) = previous
+            && previous.token != self.shared.token
+            && previous.token != self.pair_token()
+        {
+            self.node.remove_token(&previous.token);
+        }
         self.block_on(async {
             self.node.set_relay(relay).await.map_err(Self::internal)?;
             self.node.set_peers(targets).await;
             Ok::<(), PendantError>(())
         })?;
+        self.shared.poke.notify_one();
+        Ok(())
+    }
+
+    /// Leave the adopted workspace: drop this device's row from the synced
+    /// registry, stop accepting the workspace token, forget its relay and
+    /// stop dialling its peers. Notes already synced stay in the local
+    /// store; the QR falls back to this device's own token. Peers are
+    /// dropped shortly after the removal has been handed to them, so the
+    /// row disappears on the other devices too (best effort: a peer that
+    /// is offline learns it from the replica or the next device it meets).
+    pub fn unpair(&self) -> Result<()> {
+        let Some(previous) = self.shared.lock_state().pairing.take() else {
+            return Ok(());
+        };
+        let generation = self.shared.pairing_gen.fetch_add(1, Ordering::AcqRel) + 1;
+        let payload = {
+            let mut state = self.shared.lock_state();
+            commit_workspace(&mut state, |ws| ws.remove_device(self.shared.device))?
+        };
+        if let Some(payload) = payload {
+            let _ = self.shared.cmd.send(Cmd::Update {
+                doc: DocKey::WORKSPACE,
+                payload,
+            });
+        }
+        if previous.token != self.shared.token {
+            self.node.remove_token(&previous.token);
+        }
+        let node = self.node.clone();
+        let shared = Arc::downgrade(&self.shared);
+        self.runtime.spawn(async move {
+            tokio::time::sleep(UNPAIR_LINGER).await;
+            // A re-pair in the meantime owns the peer list now.
+            let Some(shared) = shared.upgrade() else {
+                return;
+            };
+            if shared.pairing_gen.load(Ordering::Acquire) != generation {
+                return;
+            }
+            node.set_peers(Vec::new()).await;
+            if let Err(err) = node.set_relay(None).await {
+                tracing::warn!(%err, "dropping relay after unpair failed");
+            }
+            shared.poke.notify_one();
+        });
         self.shared.poke.notify_one();
         Ok(())
     }
@@ -526,7 +591,8 @@ impl Core {
     }
 
     /// Upsert this device into the synced registry. The app shell calls it
-    /// with a user-facing name whenever it (re)connects to a workspace.
+    /// with a user-facing name whenever it (re)connects to a workspace and
+    /// again when the user renames the device; every peer's list follows.
     pub fn register_device(&self, name: String, platform: String) -> Result<()> {
         let meta = pcore::DeviceMeta {
             id: self.shared.device,
@@ -547,7 +613,6 @@ impl Core {
         Ok(())
     }
 
-    /// Every device that ever joined this workspace, most recent first.
     /// Forget a device in the synced registry (every peer's list loses the
     /// row). Not revocation: it re-registers if it reconnects with a valid
     /// token.
@@ -563,9 +628,13 @@ impl Core {
                 payload,
             });
         }
+        // Sever the live link to that device both ways: it hears the unpair
+        // over the wire, drops us, and forgets the pairing on its side.
+        self.block_on(self.node.unpair(device));
         Ok(())
     }
 
+    /// Every device that ever joined this workspace, most recent first.
     pub fn list_devices(&self) -> Vec<DeviceInfo> {
         let state = self.shared.lock_state();
         state

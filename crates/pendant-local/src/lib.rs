@@ -28,6 +28,7 @@ mod serve;
 pub mod testing;
 
 pub use docs::{IdleDocs, ServerDocs};
+pub use hub::Unpaired;
 pub use identity::load_or_create_secret_key;
 pub use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
 pub use local::LocalLink;

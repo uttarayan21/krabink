@@ -168,6 +168,12 @@ impl Node {
         self.0.hub.add_token(token);
     }
 
+    /// Stop accepting `token` in `Hello`; pair with [`Node::set_peers`] to
+    /// drop the connections that used it.
+    pub fn remove_token(&self, token: &str) {
+        self.0.hub.remove_token(token);
+    }
+
     /// A direct address for `peer` learned out of band (mDNS); used on the
     /// next dial attempt.
     pub fn add_addr_hint(&self, peer: EndpointId, addr: SocketAddr) {
@@ -182,6 +188,44 @@ impl Node {
 
     pub fn watch_peers(&self) -> watch::Receiver<Vec<PeerStatus>> {
         self.0.hub.watch_status()
+    }
+
+    /// Stream of peers that unpaired from us over the wire. The app clears
+    /// its pairing when the endpoint matches.
+    pub fn watch_unpaired(&self) -> tokio::sync::broadcast::Receiver<crate::hub::Unpaired> {
+        self.0.hub.watch_unpaired()
+    }
+
+    /// Unpair from the peer with CRDT `device`: tell it over the wire, drop
+    /// the connection, and stop dialing it. The peer forgets us in turn.
+    pub async fn unpair(&self, device: DeviceId) {
+        let found = self.0.hub.peers_for_device(device);
+        let mut endpoints = Vec::new();
+        for (peer_id, endpoint, inbound) in found {
+            let ep = self.0.hub.send_unpair(peer_id);
+            endpoints.extend(ep.or(endpoint));
+            if inbound {
+                // Inbound peers have no dial to cancel; drop the row so it
+                // does not linger after the remote disconnects.
+                self.0.hub.deregister(peer_id);
+            }
+        }
+        if endpoints.is_empty() {
+            return;
+        }
+        // Stop dialing the unpaired endpoints and forget them as targets.
+        self.0
+            .targets
+            .lock()
+            .expect("targets poisoned")
+            .retain(|t| !endpoints.contains(&t.id));
+        if let Some(net) = &mut *self.0.net.lock().await {
+            for id in &endpoints {
+                if let Some(dial) = net.dials.remove(id) {
+                    let _ = dial.cmd.send(OutCmd::Close);
+                }
+            }
+        }
     }
 
     pub fn relay_health(&self) -> RelayHealth {

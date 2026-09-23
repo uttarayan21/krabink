@@ -13,6 +13,9 @@ use crate::errors::{Error, Report, Result, ResultExt};
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct FileConfig {
+    /// How this desktop shows up in every device's registry; hostname
+    /// when unset.
+    device_name: Option<String>,
     /// Home relay URL.
     relay: Option<String>,
     /// Workspace token adopted from a pairing URI.
@@ -33,6 +36,8 @@ struct PeerFile {
 
 /// Everything the app needs to start.
 pub struct RuntimeConfig {
+    /// User-facing name for the synced device registry (and mDNS).
+    pub device_name: String,
     pub store_path: PathBuf,
     /// Separate redb for the node's mirror of every doc.
     pub node_store_path: PathBuf,
@@ -97,6 +102,10 @@ impl RuntimeConfig {
             .collect();
 
         Ok(Self {
+            device_name: file
+                .device_name
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(default_device_name),
             store_path: data_dir.join("pendant.redb"),
             node_store_path: data_dir.join("node.redb"),
             node_key_path: data_dir.join("node_key"),
@@ -166,26 +175,55 @@ pub fn adopt_pair(uri: &str) -> Result<()> {
     Ok(())
 }
 
-/// Write the pairing coordinates to config.toml; returns the path written.
-/// Shared by the CLI and the in-app join flow.
+/// Write the pairing coordinates to config.toml (keeping the device
+/// name); returns the path written. Shared by the CLI and the in-app join
+/// flow.
 pub fn persist_pair(info: &PairInfo) -> Result<std::path::PathBuf> {
+    update_config(|file| {
+        file.relay = info.relay.clone();
+        file.token = Some(info.token.clone());
+        file.replica = info.replica.clone();
+        file.peers = vec![PeerFile {
+            node: info.node.clone(),
+            addrs: info.addrs.clone(),
+        }];
+    })
+}
+
+/// Forget the adopted workspace in config.toml: the next launch runs on
+/// this desktop's own token, no relay, nothing to dial.
+pub fn persist_unpair() -> Result<std::path::PathBuf> {
+    update_config(|file| {
+        file.relay = None;
+        file.token = None;
+        file.replica = None;
+        file.peers.clear();
+    })
+}
+
+/// Remember the user-chosen device name across launches.
+pub fn persist_device_name(name: &str) -> Result<std::path::PathBuf> {
+    let name = name.trim();
+    update_config(|file| file.device_name = (!name.is_empty()).then(|| name.to_string()))
+}
+
+/// The machine's hostname: what a desktop is called until renamed.
+pub fn default_device_name() -> String {
+    gethostname::gethostname().to_string_lossy().into_owned()
+}
+
+/// Read-modify-write config.toml; returns the path written.
+fn update_config(edit: impl FnOnce(&mut FileConfig)) -> Result<std::path::PathBuf> {
     let dirs = directories::ProjectDirs::from("dev", "darksailor", "pendant")
         .ok_or_else(|| Report::new(Error).attach("no home directory"))?;
     let config_dir = dirs.config_dir();
     std::fs::create_dir_all(config_dir)
         .change_context(Error)
         .attach_with(|| format!("creating {}", config_dir.display()))?;
+    let mut file = read_config(config_dir)?;
+    edit(&mut file);
     let path = config_dir.join("config.toml");
-    let raw = toml::to_string_pretty(&FileConfig {
-        relay: info.relay.clone(),
-        token: Some(info.token.clone()),
-        replica: info.replica.clone(),
-        peers: vec![PeerFile {
-            node: info.node.clone(),
-            addrs: info.addrs.clone(),
-        }],
-    })
-    .change_context(Error)?;
+    let raw = toml::to_string_pretty(&file).change_context(Error)?;
     std::fs::write(&path, raw)
         .change_context(Error)
         .attach_with(|| format!("writing {}", path.display()))?;

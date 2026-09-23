@@ -36,7 +36,7 @@ impl PeerIo {
 /// Runs until the peer's incoming channel closes or the session asks to
 /// disconnect. Deregisters the peer from the hub on the way out.
 pub(crate) async fn serve_peer(hub: Arc<Hub>, peer_id: u64, mut io: PeerIo) {
-    let mut session = ServerSession::new(hub.tokens());
+    let mut session = ServerSession::new(hub.tokens(), hub.device);
 
     while let Some(frame) = io.incoming.recv().await {
         let msg = match ClientMsg::decode(&frame) {
@@ -73,6 +73,18 @@ pub(crate) async fn serve_peer(hub: Arc<Hub>, peer_id: u64, mut io: PeerIo) {
                 ServerEffect::Disconnect { code, message } => {
                     tracing::info!(peer_id, ?code, message, "disconnecting peer");
                     io.send(&ServerMsg::Error { code, message });
+                    disconnect = true;
+                }
+                ServerEffect::Unpaired { device } => {
+                    tracing::info!(peer_id, %device, "peer unpaired from us");
+                    let endpoint = hub
+                        .peers
+                        .lock()
+                        .expect("peer registry poisoned")
+                        .peers
+                        .get(&peer_id)
+                        .and_then(|p| p.status.id);
+                    hub.notify_unpaired(endpoint, device);
                     disconnect = true;
                 }
             }

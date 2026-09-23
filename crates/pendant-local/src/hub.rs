@@ -24,6 +24,8 @@ pub(crate) enum OutCmd {
     },
     /// A doc appeared locally; subscribe to it on this peer too.
     Subscribe(DocKey),
+    /// Tell the peer we are unpairing, then end the dial loop for good.
+    Unpair,
     Close,
 }
 
@@ -57,6 +59,16 @@ pub(crate) struct Hub {
     /// Direct address hints learned out of band (mDNS), by peer.
     pub hints: Mutex<HashMap<EndpointId, BTreeSet<SocketAddr>>>,
     status: watch::Sender<Vec<PeerStatus>>,
+    /// A peer unpaired from us: (its endpoint, its device id). The app
+    /// listens and clears the pairing if it matches.
+    unpaired: tokio::sync::broadcast::Sender<Unpaired>,
+}
+
+/// A peer told us it unpaired from us.
+#[derive(Debug, Clone, Copy)]
+pub struct Unpaired {
+    pub endpoint: Option<EndpointId>,
+    pub device: DeviceId,
 }
 
 impl Hub {
@@ -68,6 +80,7 @@ impl Hub {
             tokens: RwLock::new(tokens),
             hints: Mutex::new(HashMap::new()),
             status: watch::Sender::new(Vec::new()),
+            unpaired: tokio::sync::broadcast::channel(16).0,
         })
     }
 
@@ -83,12 +96,71 @@ impl Hub {
         }
     }
 
+    /// Stop accepting `token` (after leaving a workspace). Existing
+    /// connections are the caller's to drop.
+    pub fn remove_token(&self, token: &str) {
+        self.tokens
+            .write()
+            .expect("token list poisoned")
+            .retain(|t| t != token);
+    }
+
     pub fn watch_status(&self) -> watch::Receiver<Vec<PeerStatus>> {
         self.status.subscribe()
     }
 
     pub fn statuses(&self) -> Vec<PeerStatus> {
         self.status.borrow().clone()
+    }
+
+    /// Stream of peers that unpaired from us.
+    pub fn watch_unpaired(&self) -> tokio::sync::broadcast::Receiver<Unpaired> {
+        self.unpaired.subscribe()
+    }
+
+    /// A peer unpaired from us (told over the wire): tell the app so it can
+    /// forget the pairing.
+    pub fn notify_unpaired(&self, endpoint: Option<EndpointId>, device: DeviceId) {
+        let _ = self.unpaired.send(Unpaired { endpoint, device });
+    }
+
+    /// Look up which registered peers claim `device` (inbound and outbound).
+    /// Returns `(peer_id, endpoint, is_inbound)`.
+    pub fn peers_for_device(&self, device: DeviceId) -> Vec<(u64, Option<EndpointId>, bool)> {
+        let peers = self.peers.lock().expect("peer registry poisoned");
+        peers
+            .peers
+            .iter()
+            .filter(|(_, p)| p.status.device == Some(device))
+            .map(|(id, p)| {
+                let inbound = matches!(p.sink, PeerSink::Inbound { .. });
+                (*id, p.status.id, inbound)
+            })
+            .collect()
+    }
+
+    /// Send an unpair notice to a peer: an inbound peer gets a raw
+    /// `ServerMsg::Unpair` on its docs lane; an outbound dial loop is told
+    /// to send `ClientMsg::Unpair` and stop. Returns the peer's endpoint.
+    pub fn send_unpair(&self, peer_id: u64) -> Option<EndpointId> {
+        let peers = self.peers.lock().expect("peer registry poisoned");
+        let peer = peers.peers.get(&peer_id)?;
+        let endpoint = peer.status.id;
+        match &peer.sink {
+            PeerSink::Inbound { docs, .. } => {
+                if let Ok(frame) = (ServerMsg::Unpair {
+                    device: self.device,
+                })
+                .encode()
+                {
+                    let _ = docs.send(frame);
+                }
+            }
+            PeerSink::Outbound { cmd } => {
+                let _ = cmd.send(OutCmd::Unpair);
+            }
+        }
+        endpoint
     }
 
     fn publish(&self, peers: &Registry) {

@@ -66,6 +66,7 @@ fn main() -> Result<()> {
 
 fn run_app(args: cli::Cli) -> Result<()> {
     let config = RuntimeConfig::resolve(args.data_dir, args.relay, args.token)?;
+    sync::set_local_device_name(config.device_name.clone());
     let store = Store::open(&config.store_path)
         .change_context(Error)
         .attach_with(|| format!("opening store {}", config.store_path.display()))?;
@@ -141,7 +142,10 @@ fn run_app(args: cli::Cli) -> Result<()> {
     .insert_resource(Runtime(runtime))
     .insert_resource(sync_node)
     .insert_resource(transport)
-    .insert_resource(settings::Settings::new(pair))
+    .insert_resource(settings::Settings::new(
+        pair,
+        config.workspace_token.clone(),
+    ))
     .insert_resource(crate::ui::FollowLatest(args.follow_latest))
     .add_systems(Startup, setup)
     .run();

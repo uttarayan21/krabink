@@ -43,11 +43,20 @@ pub enum ClientMsg {
         doc: DocKey,
         payload: Vec<u8>,
     },
+    /// "The device you know as `device` is unpairing from you." The peer
+    /// drops this connection and forgets it; sync between the two ends.
+    Unpair {
+        device: DeviceId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerMsg {
-    HelloAck,
+    /// `device` is the responder's own CRDT device id, so the dialer can
+    /// map this connection to a registry row (e.g. to unpair it later).
+    HelloAck {
+        device: DeviceId,
+    },
     DocList {
         docs: Vec<DocKey>,
     },
@@ -71,6 +80,10 @@ pub enum ServerMsg {
     Error {
         code: ErrorCode,
         message: String,
+    },
+    /// Server-initiated counterpart of [`ClientMsg::Unpair`].
+    Unpair {
+        device: DeviceId,
     },
 }
 
@@ -169,6 +182,9 @@ pub enum ClientEffect {
     },
     /// The server rejected us; reconnecting without change is pointless.
     Fatal(String),
+    /// The peer (device id) unpaired from us; drop it and, if it was our
+    /// pairing, forget the pairing.
+    Unpaired(DeviceId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +205,8 @@ pub struct ClientSession {
     token: String,
     state: ClientState,
     subscribed: HashSet<DocKey>,
+    /// The peer's device id, learned from `HelloAck`.
+    server_device: Option<DeviceId>,
 }
 
 impl ClientSession {
@@ -198,11 +216,25 @@ impl ClientSession {
             token,
             state: ClientState::Idle,
             subscribed: HashSet::new(),
+            server_device: None,
         }
     }
 
     pub fn device(&self) -> DeviceId {
         self.device
+    }
+
+    /// The peer's device id once the handshake finished.
+    pub fn server_device(&self) -> Option<DeviceId> {
+        self.server_device
+    }
+
+    /// Tell the peer we are unpairing from it. The caller then drops the
+    /// transport; the peer drops us on its side.
+    pub fn unpair(&self) -> ClientMsg {
+        ClientMsg::Unpair {
+            device: self.device,
+        }
     }
 
     pub fn is_ready(&self) -> bool {
@@ -251,8 +283,9 @@ impl ClientSession {
 
     pub fn handle(&mut self, msg: ServerMsg, docs: &mut impl ClientDocs) -> Vec<ClientEffect> {
         match msg {
-            ServerMsg::HelloAck => {
+            ServerMsg::HelloAck { device } => {
                 self.state = ClientState::Ready;
+                self.server_device = Some(device);
                 vec![ClientEffect::Connected]
             }
             ServerMsg::SubscribeAck {
@@ -292,6 +325,7 @@ impl ClientSession {
                 vec![ClientEffect::Ephemeral { doc, payload, from }]
             }
             ServerMsg::DocList { .. } => Vec::new(),
+            ServerMsg::Unpair { device } => vec![ClientEffect::Unpaired(device)],
             ServerMsg::Error { code, message } => {
                 vec![ClientEffect::Fatal(format!(
                     "server error {code:?}: {message}"
@@ -311,19 +345,24 @@ pub enum ServerEffect {
     Broadcast { doc: DocKey, msg: ServerMsg },
     /// Protocol violation; close the transport.
     Disconnect { code: ErrorCode, message: String },
+    /// The dialer told us it is unpairing. Drop this peer and forget it.
+    Unpaired { device: DeviceId },
 }
 
 /// Protocol state for one connection on the server. One instance per client.
 pub struct ServerSession {
     tokens: Vec<String>,
+    /// This node's own device id, sent back in `HelloAck`.
+    own: DeviceId,
     device: Option<DeviceId>,
     subscribed: HashSet<DocKey>,
 }
 
 impl ServerSession {
-    pub fn new(tokens: Vec<String>) -> Self {
+    pub fn new(tokens: Vec<String>, own: DeviceId) -> Self {
         Self {
             tokens,
+            own,
             device: None,
             subscribed: HashSet::new(),
         }
@@ -350,7 +389,7 @@ impl ServerSession {
                 ClientMsg::Hello { device, token } => {
                     if self.tokens.contains(&token) {
                         self.device = Some(device);
-                        vec![ServerEffect::Send(ServerMsg::HelloAck)]
+                        vec![ServerEffect::Send(ServerMsg::HelloAck { device: self.own })]
                     } else {
                         vec![ServerEffect::Disconnect {
                             code: ErrorCode::BadToken,
@@ -430,6 +469,7 @@ impl ServerSession {
                     Vec::new() // transient; drop silently
                 }
             }
+            ClientMsg::Unpair { device } => vec![ServerEffect::Unpaired { device }],
         }
     }
 }

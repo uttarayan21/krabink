@@ -15,12 +15,12 @@ use std::time::Duration;
 use pendant_core::{
     ClientDocs, ClientEffect, ClientMsg, ClientSession, DocKey, Flush, ServerMsg, WetInk,
 };
-use pendant_local::{LocalLink, Node, PeerKind, PeerState, Route};
+use pendant_local::{EndpointId, LocalLink, Node, PeerKind, PeerState, Route};
 use tokio::sync::mpsc;
 
 use crate::brush::AssetInfo;
 use crate::engine::{CoreListener, NoteListener, Shared};
-use crate::types::{BrushInfo, NoteInfo, SyncState, rgba_to_u32};
+use crate::types::{BrushInfo, DeviceInfo, NoteInfo, SyncState, rgba_to_u32};
 
 pub(crate) enum Cmd {
     Subscribe(DocKey),
@@ -142,6 +142,9 @@ fn apply_effects(
             }
             ClientEffect::Ephemeral { doc, payload, .. } => dispatch_wet(shared, doc, &payload),
             ClientEffect::Fatal(message) => return Err(End::Fatal(message)),
+            // The app talks only to its own node over the local link, which
+            // never sends an unpair; nothing to do here.
+            ClientEffect::Unpaired(_) => {}
         }
     }
     Ok(())
@@ -192,6 +195,73 @@ pub(crate) async fn watch_status(shared: Weak<Shared>, node: Node) {
             changed = relay.changed() => if changed.is_err() { return },
             _ = shared_poke(&shared) => {}
         }
+    }
+}
+
+/// When a peer tells us it unpaired, and it is the device our pairing
+/// points at, we have been evicted: forget the pairing so we stop dialling
+/// and the UI shows "not paired". Notes already synced stay put.
+pub(crate) async fn watch_unpaired(shared: Weak<Shared>, node: Node) {
+    let mut events = node.watch_unpaired();
+    loop {
+        let event = match events.recv().await {
+            Ok(event) => event,
+            // Lagged: we only care about the latest state, keep going.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        let Some(strong) = shared.upgrade() else {
+            return;
+        };
+        // Is the unpairing peer the node our pairing points at?
+        let paired_to = strong
+            .lock_state()
+            .pairing
+            .as_ref()
+            .and_then(|p| p.node.parse::<EndpointId>().ok());
+        let evicted = matches!((event.endpoint, paired_to), (Some(a), Some(b)) if a == b);
+        if !evicted {
+            continue;
+        }
+        // Drop the pairing and the remover's row; stop dialling.
+        let previous = strong.lock_state().pairing.take();
+        strong
+            .pairing_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let payload = {
+            let mut state = strong.lock_state();
+            crate::engine::commit_workspace(&mut state, |ws| ws.remove_device(event.device)).ok()
+        };
+        if let Some(Some(payload)) = payload {
+            let _ = strong.cmd.send(Cmd::Update {
+                doc: DocKey::WORKSPACE,
+                payload,
+            });
+        }
+        if let Some(previous) = &previous {
+            node.remove_token(&previous.token);
+        }
+        node.set_peers(Vec::new()).await;
+        if let Err(err) = node.set_relay(None).await {
+            tracing::warn!(%err, "dropping relay after eviction failed");
+        }
+        // Push the trimmed device list and refreshed sync state.
+        let (listener, devices) = {
+            let state = strong.lock_state();
+            (
+                state.core_listener.clone(),
+                state
+                    .workspace
+                    .devices()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            )
+        };
+        if let Some(listener) = listener {
+            listener.devices_changed(devices);
+        }
+        strong.poke.notify_one();
     }
 }
 
@@ -315,6 +385,7 @@ enum Notify {
     Notes(Arc<dyn CoreListener>, Vec<NoteInfo>),
     Brushes(Arc<dyn CoreListener>, Vec<BrushInfo>),
     Assets(Arc<dyn CoreListener>, Vec<AssetInfo>),
+    Devices(Arc<dyn CoreListener>, Vec<DeviceInfo>),
     Text(Arc<dyn NoteListener>, String),
     Strokes(Arc<dyn NoteListener>, String),
 }
@@ -325,6 +396,7 @@ impl Notify {
             Self::Notes(listener, notes) => listener.notes_changed(notes),
             Self::Brushes(listener, brushes) => listener.brushes_changed(brushes),
             Self::Assets(listener, assets) => listener.assets_changed(assets),
+            Self::Devices(listener, devices) => listener.devices_changed(devices),
             Self::Text(listener, text) => listener.text_changed(text),
             Self::Strokes(listener, sketch) => listener.strokes_changed(sketch),
         }
@@ -369,7 +441,14 @@ impl ClientDocs for Docs<'_> {
                     .into_iter()
                     .map(|a| a.asset.into())
                     .collect();
-                self.pending.push(Notify::Assets(listener, assets));
+                self.pending.push(Notify::Assets(listener.clone(), assets));
+                let devices = state
+                    .workspace
+                    .devices()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect();
+                self.pending.push(Notify::Devices(listener, devices));
             }
             return Ok(changed);
         }

@@ -1,4 +1,5 @@
-// Settings sheet: sync status, this device, the synced device registry, and
+// Settings sheet: sync status (with the way out of a workspace), this
+// device (renamable), the synced device registry (removable rows), and
 // pairing — show this device's QR for another device to scan, or join a
 // workspace by pasting a `pendant://pair` URI.
 
@@ -8,8 +9,10 @@ import SwiftUI
 struct SettingsScreen: View {
     @Bindable var model: AppModel
     @Environment(\.dismiss) private var dismiss
-    @State private var devices: [DeviceInfo] = []
     @State private var deviceToRemove: DeviceInfo?
+    @State private var confirmUnpair = false
+    @State private var nameEdit = ""
+    @FocusState private var nameFocused: Bool
     @State private var joinURI = ""
     @State private var joinFailed = false
     @State private var showScanner = false
@@ -39,23 +42,57 @@ struct SettingsScreen: View {
                     ForEach(Array(model.peers.enumerated()), id: \.offset) { _, peer in
                         row(peerLabel(peer), peerState(peer))
                     }
+                    if model.paired != nil {
+                        Button(role: .destructive) {
+                            confirmUnpair = true
+                        } label: {
+                            Label("unpair this iPad", systemImage: "xmark.circle")
+                        }
+                        .accessibilityIdentifier("unpair")
+                    }
                 } header: {
                     Caption("Sync")
+                } footer: {
+                    if model.paired != nil {
+                        Text("unpairing removes this iPad from every device's list and stops syncing; notes already here stay")
+                            .foregroundStyle(Theme.muted)
+                    }
                 }
 
                 Section {
-                    row("name", UIDevice.current.name)
+                    HStack {
+                        Text("name")
+                        TextField("device name", text: $nameEdit)
+                            .multilineTextAlignment(.trailing)
+                            .foregroundStyle(Theme.text)
+                            .autocorrectionDisabled()
+                            .submitLabel(.done)
+                            .focused($nameFocused)
+                            .onSubmit(saveName)
+                            .accessibilityIdentifier("deviceName")
+                        if nameEdit.trimmingCharacters(in: .whitespaces) != model.deviceName
+                            && !nameEdit.trimmingCharacters(in: .whitespaces).isEmpty
+                        {
+                            Button("save", action: saveName)
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                .accessibilityIdentifier("saveDeviceName")
+                        }
+                    }
                     row("id", shortId(model.core.deviceId()), mono: true)
                 } header: {
                     Caption("This device")
+                } footer: {
+                    Text("every paired device shows this name in its list")
+                        .foregroundStyle(Theme.muted)
                 }
 
                 Section {
-                    if devices.isEmpty {
+                    if model.devices.isEmpty {
                         Text("no devices in this workspace yet")
                             .foregroundStyle(Theme.muted)
                     }
-                    ForEach(devices, id: \.id) { device in
+                    ForEach(model.devices, id: \.id) { device in
                         HStack(spacing: 12) {
                             Image(systemName: icon(for: device.platform))
                                 .foregroundStyle(Theme.accent)
@@ -75,6 +112,16 @@ struct SettingsScreen: View {
                                     .padding(.horizontal, 8)
                                     .padding(.vertical, 3)
                                     .background(Capsule().fill(Theme.surfaceRaised))
+                            } else {
+                                Button {
+                                    deviceToRemove = device
+                                } label: {
+                                    Image(systemName: "trash")
+                                        .foregroundStyle(Theme.danger)
+                                }
+                                .buttonStyle(.borderless)
+                                .accessibilityLabel("remove \(device.name)")
+                                .accessibilityIdentifier("removeDevice")
                             }
                         }
                         .swipeActions(edge: .trailing) {
@@ -88,8 +135,8 @@ struct SettingsScreen: View {
                 } header: {
                     Caption("Paired devices")
                 } footer: {
-                    if devices.count > 1 {
-                        Text("swipe a device to remove it; it re-appears if it reconnects")
+                    if model.devices.count > 1 {
+                        Text("removing a device forgets it everywhere; it re-appears if it reconnects with the same token")
                             .foregroundStyle(Theme.muted)
                     }
                 }
@@ -148,7 +195,23 @@ struct SettingsScreen: View {
                         .accessibilityIdentifier("settingsDone")
                 }
             }
-            .onAppear(perform: refresh)
+            .onAppear {
+                nameEdit = model.deviceName
+                refresh()
+            }
+            .confirmationDialog(
+                "Unpair this iPad?",
+                isPresented: $confirmUnpair,
+                titleVisibility: .visible
+            ) {
+                Button("Unpair", role: .destructive) {
+                    model.unpair()
+                    refresh()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Removes this iPad from every device's list and stops syncing. Notes already here stay. Scan a pairing code to join again.")
+            }
             .confirmationDialog(
                 "Remove \(deviceToRemove?.name ?? "device")?",
                 isPresented: Binding(
@@ -198,8 +261,13 @@ struct SettingsScreen: View {
     }
 
     private func refresh() {
-        devices = model.devices()
         model.refreshPeers()
+    }
+
+    private func saveName() {
+        model.rename(nameEdit)
+        nameEdit = model.deviceName
+        nameFocused = false
     }
 
     private func peerLabel(_ peer: PeerInfo) -> String {

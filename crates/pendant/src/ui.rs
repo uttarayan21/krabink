@@ -80,7 +80,8 @@ fn editor_ui(
     mut subscribes: MessageWriter<SubscribeNeeded>,
     mut settings: ResMut<Settings>,
     transport: Res<SyncTransport>,
-    sync: Res<crate::node::SyncNode>,
+    mut sync: ResMut<crate::node::SyncNode>,
+    runtime: Res<crate::Runtime>,
     mut adopted: MessageWriter<crate::settings::PairAdopted>,
     follow: Res<FollowLatest>,
 ) -> Result {
@@ -97,16 +98,69 @@ fn editor_ui(
         Some(crate::settings::SettingsAction::Join(info)) => {
             adopted.write(crate::settings::PairAdopted(info));
         }
-        Some(crate::settings::SettingsAction::RemoveDevice(id)) => match docs.remove_device(id) {
-            Ok(payload) if !payload.is_empty() => {
-                commits.write(LocalCommit {
-                    doc: DocKey::WORKSPACE,
-                    payload,
-                });
+        Some(crate::settings::SettingsAction::RemoveDevice(id)) => {
+            // Sever the live link both ways: the peer hears the unpair and
+            // forgets this desktop; we drop its row from the registry.
+            sync.unpair(&runtime.0, id);
+            match docs.remove_device(id) {
+                Ok(payload) if !payload.is_empty() => {
+                    commits.write(LocalCommit {
+                        doc: DocKey::WORKSPACE,
+                        payload,
+                    });
+                }
+                Ok(_) => {}
+                Err(err) => tracing::error!(%err, %id, "removing device failed"),
             }
-            Ok(_) => {}
-            Err(err) => tracing::error!(%err, %id, "removing device failed"),
-        },
+        }
+        Some(crate::settings::SettingsAction::Rename(name)) => {
+            crate::sync::set_local_device_name(name.clone());
+            if let Err(err) = crate::config::persist_device_name(&name) {
+                tracing::error!(%err, "persisting device name failed");
+            }
+            sync.readvertise(&runtime.0, &name);
+            match docs.register_device(transport.device(), &name, crate::sync::LOCAL_PLATFORM) {
+                Ok(payload) if !payload.is_empty() => {
+                    commits.write(LocalCommit {
+                        doc: DocKey::WORKSPACE,
+                        payload,
+                    });
+                }
+                Ok(_) => {}
+                Err(err) => tracing::error!(%err, "renaming device failed"),
+            }
+        }
+        Some(crate::settings::SettingsAction::Unpair) => {
+            // Our row goes first so the removal rides the connections we
+            // are about to drop; the node tears them down after a grace.
+            match docs.remove_device(transport.device()) {
+                Ok(payload) if !payload.is_empty() => {
+                    commits.write(LocalCommit {
+                        doc: DocKey::WORKSPACE,
+                        payload,
+                    });
+                }
+                Ok(_) => {}
+                Err(err) => tracing::error!(%err, "removing own device row failed"),
+            }
+            if let Err(err) = crate::config::persist_unpair() {
+                tracing::error!(%err, "persisting unpair failed");
+            }
+            let own = settings.unpaired_info();
+            let node = sync.node.clone();
+            let old_token = std::mem::replace(&mut settings.info.token, own.token.clone());
+            if old_token != own.token {
+                node.remove_token(&old_token);
+            }
+            runtime.0.spawn(async move {
+                tokio::time::sleep(crate::settings::UNPAIR_LINGER).await;
+                node.set_peers(Vec::new()).await;
+                if let Err(err) = node.set_relay(None).await {
+                    tracing::warn!(%err, "dropping relay after leaving failed");
+                }
+            });
+            settings.adopt(own);
+        }
         None => {}
     }
 

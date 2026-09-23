@@ -14,6 +14,12 @@ final class AppModel {
     var syncState = "not paired"
     /// Every peer the node knows, refreshed on each sync-state change.
     var peers: [PeerInfo] = []
+    /// The synced device registry (every device in the workspace, most
+    /// recently seen first); pushed by the core whenever a peer changes it.
+    var devices: [DeviceInfo] = []
+    /// How this iPad shows up in every device's list. iOS hides the real
+    /// device name from apps, so the default is generic until renamed.
+    private(set) var deviceName: String
     /// The workspace adopted from a pairing URI; nil until paired.
     private(set) var paired: PairInfo?
     private var discovery: PeerDiscovery?
@@ -28,7 +34,9 @@ final class AppModel {
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("pendant").path
         core = try! Core(dataDir: dir)
+        deviceName = UserDefaults.standard.string(forKey: "deviceName") ?? UIDevice.current.name
         notes = core.listNotes()
+        devices = core.listDevices()
         core.setListener(listener: CoreEvents(model: self))
         BrushLibrary.shared.attach(core)
         InkAssets.shared.setShared(core.listAssets())
@@ -69,9 +77,52 @@ final class AppModel {
         syncState = "connecting"
         applyDiscovery(info)
         // Announce this device in the synced registry so peers can list it.
-        try? core.registerDevice(
-            name: UIDevice.current.name, platform: UIDevice.current.model)
+        registerDevice()
         return true
+    }
+
+    /// Upsert our row (name, platform, last seen) in the synced registry.
+    /// Called on pair, on every (re)connect and after a rename, so a row a
+    /// peer removed comes back and a new name reaches everyone.
+    func registerDevice() {
+        try? core.registerDevice(name: deviceName, platform: UIDevice.current.model)
+        devices = core.listDevices()
+    }
+
+    /// Rename this iPad everywhere. Blank names are ignored.
+    func rename(_ name: String) {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != deviceName else { return }
+        deviceName = name
+        UserDefaults.standard.set(name, forKey: "deviceName")
+        registerDevice()
+    }
+
+    /// Leave the workspace: our row disappears from every device's list,
+    /// the pairing is forgotten (also for the next launch) and the node
+    /// stops dialling. Notes already synced stay on this iPad.
+    func unpair() {
+        try? core.unpair()
+        forgetPairing()
+        syncState = "not paired"
+    }
+
+    /// The paired desktop removed this iPad: the core has already dropped
+    /// the pairing (its QR token is back to our own), so forget it here too
+    /// or the next launch would re-adopt the persisted URI.
+    func reconcilePairing() {
+        guard let paired, core.pairInfo().token != paired.token else { return }
+        forgetPairing()
+        syncState = "removed by the desktop"
+    }
+
+    private func forgetPairing() {
+        UserDefaults.standard.removeObject(forKey: "pairURI")
+        discovery?.stop()
+        discovery = nil
+        paired = nil
+        devices = core.listDevices()
+        refreshPeers()
     }
 
     /// What this device shows as a QR: its own node plus the adopted
@@ -108,14 +159,11 @@ final class AppModel {
         notes = core.listNotes()
     }
 
-    func devices() -> [DeviceInfo] {
-        core.listDevices()
-    }
-
     /// Forget a paired device everywhere. It comes back if it reconnects
     /// with the same token; this is housekeeping, not revocation.
     func removeDevice(id: String) {
         try? core.removeDevice(id: id)
+        devices = core.listDevices()
     }
 
     /// Foreground: bring the node back online and redial every peer.
@@ -308,11 +356,25 @@ private final class CoreEvents: CoreListener {
         Task { @MainActor in InkAssets.shared.setShared(assets) }
     }
 
+    func devicesChanged(devices: [DeviceInfo]) {
+        Task { @MainActor [weak model] in
+            guard let model else { return }
+            model.devices = devices
+            model.reconcilePairing()
+        }
+    }
+
     func syncState(state: SyncState) {
         Task { @MainActor [weak model] in
             guard let model else { return }
+            model.reconcilePairing()
             model.syncState = Self.label(state, paired: model.paired != nil)
             model.refreshPeers()
+            // Fresh connection: refresh our row (last seen, current name;
+            // back if a peer removed it).
+            if case .connected = state, model.paired != nil {
+                model.registerDevice()
+            }
         }
     }
 

@@ -77,8 +77,10 @@ impl Net {
         let idx = self.clients.len();
         self.clients
             .push((ClientSession::new(DeviceId::new(), TOKEN.into()), docs));
-        self.server_sessions
-            .push(Some(ServerSession::new(vec![TOKEN.into()])));
+        self.server_sessions.push(Some(ServerSession::new(
+            vec![TOKEN.into()],
+            DeviceId::new(),
+        )));
         let effects = self.clients[idx].0.connect();
         self.run_client_effects(idx, effects);
         self.pump();
@@ -92,7 +94,7 @@ impl Net {
 
     /// Reconnect: fresh sessions both sides, then resubscribe to `doc`.
     fn reconnect(&mut self, idx: usize, doc: DocKey) {
-        self.server_sessions[idx] = Some(ServerSession::new(vec![TOKEN.into()]));
+        self.server_sessions[idx] = Some(ServerSession::new(vec![TOKEN.into()], DeviceId::new()));
         let (client, _) = &mut self.clients[idx];
         *client = ClientSession::new(client.device(), TOKEN.into());
         let effects = client.connect();
@@ -130,7 +132,8 @@ impl Net {
                 ClientEffect::Fatal(err) => panic!("client {idx} fatal: {err}"),
                 ClientEffect::Connected
                 | ClientEffect::DocSynced(_)
-                | ClientEffect::Ephemeral { .. } => {}
+                | ClientEffect::Ephemeral { .. }
+                | ClientEffect::Unpaired(_) => {}
             }
         }
     }
@@ -162,6 +165,7 @@ impl Net {
                         ServerEffect::Disconnect { code, message } => {
                             panic!("server disconnected client {idx}: {code:?} {message}")
                         }
+                        ServerEffect::Unpaired { .. } => {}
                     }
                 }
                 continue;
@@ -263,7 +267,7 @@ fn bad_token_and_pre_hello_messages_disconnect() {
     let id = NoteId::new();
     let mut docs = Docs::with_note(id);
 
-    let mut session = ServerSession::new(vec![TOKEN.into()]);
+    let mut session = ServerSession::new(vec![TOKEN.into()], DeviceId::new());
     let effects = session.handle(
         ClientMsg::Hello {
             device: DeviceId::new(),
@@ -276,7 +280,7 @@ fn bad_token_and_pre_hello_messages_disconnect() {
         [ServerEffect::Disconnect { .. }]
     ));
 
-    let mut session = ServerSession::new(vec![TOKEN.into()]);
+    let mut session = ServerSession::new(vec![TOKEN.into()], DeviceId::new());
     let effects = session.handle(ClientMsg::ListDocs, &mut docs);
     assert!(matches!(
         effects.as_slice(),

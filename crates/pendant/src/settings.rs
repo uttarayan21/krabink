@@ -14,6 +14,10 @@ use crate::theme;
 /// Quiet-zone border around the QR matrix, in modules (spec minimum is 4).
 const QUIET_ZONE: usize = 4;
 
+/// After "Leave workspace" the peers stay up this long so the registry
+/// removal reaches them before their connections are dropped.
+pub const UNPAIR_LINGER: std::time::Duration = std::time::Duration::from_millis(750);
+
 /// Raised when the user joined a workspace from the pairing window; the
 /// handler persists it and repoints the node.
 #[derive(Message)]
@@ -89,6 +93,10 @@ pub enum SettingsAction {
     Join(PairInfo),
     /// Forget a device (by id) in the synced registry.
     RemoveDevice(DeviceId),
+    /// Call this desktop something else, everywhere.
+    Rename(String),
+    /// Leave the adopted workspace (our row goes, peers are dropped).
+    Unpair,
 }
 
 /// Read-only snapshot the window renders each frame; gathered by the
@@ -108,22 +116,49 @@ pub struct Settings {
     /// replica (when configured) and our direct addresses.
     pub info: PairInfo,
     pub open: bool,
+    /// This install's own token: what the QR carries when no workspace is
+    /// adopted, and how we tell "paired" from "on our own".
+    own_token: String,
     texture: Option<egui::TextureHandle>,
     join_uri: String,
     join_error: bool,
+    /// The device-name field's buffer (saved explicitly, not per keystroke).
+    name_edit: String,
     /// Device id whose "remove" was clicked once; second click confirms.
     pending_remove: Option<DeviceId>,
+    /// "Leave workspace" was clicked once; second click confirms.
+    pending_unpair: bool,
 }
 
 impl Settings {
-    pub fn new(info: PairInfo) -> Self {
+    pub fn new(info: PairInfo, own_token: String) -> Self {
         Self {
             info,
             open: false,
+            own_token,
             texture: None,
             join_uri: String::new(),
             join_error: false,
+            name_edit: local_device_name(),
             pending_remove: None,
+            pending_unpair: false,
+        }
+    }
+
+    /// Adopted a workspace token (as opposed to running on our own)?
+    fn paired(&self) -> bool {
+        self.info.token != self.own_token
+    }
+
+    /// Back to our own token, no relay, no replica: what the QR shows
+    /// after leaving a workspace.
+    pub fn unpaired_info(&self) -> PairInfo {
+        PairInfo {
+            node: self.info.node.clone(),
+            token: self.own_token.clone(),
+            relay: None,
+            addrs: self.info.addrs.clone(),
+            replica: None,
         }
     }
 
@@ -135,12 +170,14 @@ impl Settings {
         }
     }
 
-    /// Repoint at a newly joined workspace (drops the stale QR texture).
-    fn adopt(&mut self, info: PairInfo) {
+    /// Repoint at a newly joined (or just left) workspace; drops the stale
+    /// QR texture.
+    pub fn adopt(&mut self, info: PairInfo) {
         self.info = info;
         self.texture = None;
         self.join_uri.clear();
         self.join_error = false;
+        self.pending_unpair = false;
     }
 
     fn qr_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
@@ -161,6 +198,7 @@ impl Settings {
     pub fn window(&mut self, ctx: &egui::Context, view: &SettingsView) -> Option<SettingsAction> {
         if !self.open {
             self.pending_remove = None;
+            self.pending_unpair = false;
             return None;
         }
         let texture = self.qr_texture(ctx);
@@ -181,7 +219,9 @@ impl Settings {
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.add_space(6.0);
-                        self.sync_section(ui, view);
+                        if let Some(asked) = self.sync_section(ui, view) {
+                            action = Some(asked);
+                        }
                         if let Some(id) = self.devices_section(ui, view) {
                             action = Some(SettingsAction::RemoveDevice(id));
                         }
@@ -195,7 +235,12 @@ impl Settings {
         action
     }
 
-    fn sync_section(&self, ui: &mut egui::Ui, view: &SettingsView) {
+    /// Peers, relay, this device (with its editable name) and, when a
+    /// workspace is adopted, the way out of it.
+    fn sync_section(&mut self, ui: &mut egui::Ui, view: &SettingsView) -> Option<SettingsAction> {
+        let mut action = None;
+        let paired = self.paired();
+        let mut pending_unpair = self.pending_unpair;
         theme::section(ui, "Sync", |ui| {
             let peers: Vec<&PeerStatus> = view
                 .peers
@@ -281,15 +326,53 @@ impl Settings {
                     .color(theme::WARN),
                 );
             }
+            if paired {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if pending_unpair {
+                        if ui.add(theme::danger_button("confirm leave")).clicked() {
+                            action = Some(SettingsAction::Unpair);
+                        }
+                        if ui.small_button("cancel").clicked() {
+                            pending_unpair = false;
+                        }
+                        ui.weak("Drops this desktop from every device's list and stops syncing.");
+                    } else if ui.button("Leave workspace").clicked() {
+                        pending_unpair = true;
+                    }
+                });
+                ui.weak(
+                    "Notes already synced stay on this desktop; the QR goes back to its own token.",
+                );
+            }
         });
+        self.pending_unpair = pending_unpair && action.is_none();
 
+        let current_name = local_device_name();
         theme::section(ui, "This device", |ui| {
             egui::Grid::new("this-device")
                 .num_columns(2)
                 .spacing([24.0, 8.0])
                 .show(ui, |ui| {
                     ui.weak("name");
-                    ui.label(local_device_name());
+                    ui.horizontal(|ui| {
+                        let edit = ui.add(
+                            egui::TextEdit::singleline(&mut self.name_edit)
+                                .hint_text(crate::config::default_device_name())
+                                .desired_width(200.0),
+                        );
+                        let proposed = self.name_edit.trim();
+                        let changed = !proposed.is_empty() && proposed != current_name;
+                        let submitted =
+                            edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if ui
+                            .add_enabled(changed, theme::primary_button("Save"))
+                            .clicked()
+                            || (submitted && changed)
+                        {
+                            action = Some(SettingsAction::Rename(proposed.to_string()));
+                        }
+                    });
                     ui.end_row();
                     ui.weak("platform");
                     ui.label(LOCAL_PLATFORM);
@@ -303,7 +386,9 @@ impl Settings {
                     ui.monospace(egui::RichText::new(&self.info.node).color(theme::MUTED));
                     ui.end_row();
                 });
+            ui.weak("Every paired device shows this name in its list.");
         });
+        action
     }
 
     /// Returns the id of a device the user confirmed removing.

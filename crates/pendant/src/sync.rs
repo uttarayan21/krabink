@@ -62,9 +62,22 @@ impl SyncTransport {
     }
 }
 
-/// How this machine announces itself in the synced device registry.
+/// The name this machine announces in the synced device registry (and
+/// mDNS): from config, changed from the settings window.
+static DEVICE_NAME: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
 pub fn local_device_name() -> String {
-    gethostname::gethostname().to_string_lossy().into_owned()
+    DEVICE_NAME
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_else(crate::config::default_device_name)
+}
+
+pub fn set_local_device_name(name: String) {
+    *DEVICE_NAME
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(name);
 }
 
 pub const LOCAL_PLATFORM: &str = std::env::consts::OS;
@@ -229,6 +242,9 @@ fn apply_effects(
                 transport.session = None;
                 transport.reopen_at = Some(std::time::Instant::now() + REOPEN_AFTER);
             }
+            // The desktop app talks only to its own node over the local
+            // link, which never sends an unpair.
+            ClientEffect::Unpaired(_) => {}
         }
     }
 }
