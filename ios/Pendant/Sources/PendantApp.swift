@@ -12,21 +12,18 @@ struct PendantApp: App {
         WindowGroup {
             // `-spike 1` launch argument shows the iM2 PencilKit spike
             // screen instead of the real app; `-brushLab 1` the brush lab.
+            // Dev tooling only: store (Release) builds ship without them.
+            #if DEBUG
             if UserDefaults.standard.bool(forKey: "spike") {
                 SpikeScreen()
             } else if UserDefaults.standard.bool(forKey: "brushLab") {
                 BrushLabScreen()
             } else {
-                ContentView(model: model)
-                    .onOpenURL { url in
-                        // Scanned pairing QR / deep link: adopt server+token.
-                        _ = model.adoptPair(uri: url.absoluteString)
-                    }
-                    // Dark-only, like the desktop: the sketch paper is
-                    // pinned dark on both, so the chrome around it is too.
-                    .preferredColorScheme(.dark)
-                    .tint(Theme.accent)
+                mainView
             }
+            #else
+            mainView
+            #endif
         }
         .onChange(of: scenePhase) { _, phase in
             // iOS tears down sockets on background; reconnect on foreground.
@@ -36,6 +33,18 @@ struct PendantApp: App {
             default: break
             }
         }
+    }
+
+    private var mainView: some View {
+        ContentView(model: model)
+            .onOpenURL { url in
+                // Scanned pairing QR / deep link: adopt server+token.
+                _ = model.adoptPair(uri: url.absoluteString)
+            }
+            // Dark-only, like the desktop: the sketch paper is
+            // pinned dark on both, so the chrome around it is too.
+            .preferredColorScheme(.dark)
+            .tint(Theme.accent)
     }
 }
 

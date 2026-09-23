@@ -3,3 +3,5 @@ Pendant.xcodeproj/
 Info.plist
 build/
 build-device/
+build-archive/
+*.xcarchive

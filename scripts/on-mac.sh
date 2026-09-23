@@ -13,7 +13,8 @@
 #   PENDANT_MAC_DIR   remote checkout, relative to the remote $HOME
 #                     (default: Porject/pendant-<worktree dir name>, or
 #                     Porject/pendant when the checkout is named pendant)
-#   PENDANT_IPAD_ID, PENDANT_TEAM, PENDANT_SIM_ID  forwarded to the script
+#   PENDANT_IPAD_ID, PENDANT_TEAM, PENDANT_SIM_ID and the PENDANT_* release
+#                     variables of archive-ios.sh are forwarded to the script
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
@@ -49,7 +50,10 @@ rsync -az --delete \
   "$root/" "$host:$dir/"
 
 env=""
-for var in PENDANT_IPAD_ID PENDANT_TEAM PENDANT_SIM_ID; do
+for var in PENDANT_IPAD_ID PENDANT_TEAM PENDANT_SIM_ID PENDANT_CONFIGURATION \
+  PENDANT_BUILD_NUMBER PENDANT_MARKETING_VERSION \
+  PENDANT_EXPORT_METHOD PENDANT_EXPORT_DESTINATION \
+  PENDANT_ASC_KEY_PATH PENDANT_ASC_KEY_ID PENDANT_ASC_ISSUER_ID; do
   if [[ -n "${!var:-}" ]]; then env+=" $var=$(printf %q "${!var}")"; fi
 done
 args=""

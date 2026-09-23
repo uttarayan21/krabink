@@ -9,6 +9,9 @@
     "build-ios-core": {
       "command": "scripts/build-ios-core.sh"
     },
+    "archive-ios": {
+      "command": "scripts/archive-ios.sh"
+    },
     "run-desktop": {
       "command": "scripts/run-desktop.sh"
     }

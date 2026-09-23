@@ -5,6 +5,8 @@
 #
 #   PENDANT_SIM_ID   simulator UDID to target (default: generic simulator,
 #                    which needs no booted device)
+#   PENDANT_CONFIGURATION  Debug (default) or Release, to check the store
+#                    build (iPad-only, dev screens compiled out)
 set -euo pipefail
 
 if [[ "$(uname)" != "Darwin" ]]; then
@@ -32,7 +34,7 @@ set -o pipefail
 xcodebuild \
   -project "$app_dir/Pendant.xcodeproj" \
   -scheme Pendant \
-  -configuration Debug \
+  -configuration "${PENDANT_CONFIGURATION:-Debug}" \
   -destination "$destination" \
   -derivedDataPath "$app_dir/build" \
   CODE_SIGNING_ALLOWED=NO \
