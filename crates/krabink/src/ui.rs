@@ -1,16 +1,36 @@
-//! Editor UI: library sidebar, markdown text editor bound to the CRDT via
-//! prefix/suffix diffing, and a live preview pane.
+//! Editor UI: library sidebar and one styled markdown editor bound to the
+//! CRDT via prefix/suffix diffing. The source is styled in place (headings
+//! large, markers dimmed, lists indented, code monospace); there is no
+//! separate preview. The note's page ink renders under the text: each frame
+//! the editor publishes a [`PageLayout`] (where every anchored element's
+//! line sits in the galley, and which part of the galley is on screen) and
+//! paints the off-screen page texture the sketch module renders from it.
+
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, egui};
-use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
-use krabink_core::{DocKey, NoteId};
+use egui::text::{ByteIndex, CCursor, LayoutJob, LayoutSection, TextFormat};
+use krabink_core::{Anchor, DocKey, ElementId, NoteDoc, NoteId, StyleKind, StyleRun, style_runs};
 
 use crate::docs::Docs;
 use crate::settings::Settings;
+use crate::sketch::PageTexture;
 use crate::sync::SyncTransport;
 use crate::sync::{LocalCommit, SubscribeNeeded};
 use crate::theme::{self, Palette, Theme};
+
+/// Body font size. Anchor space is defined at this size on every platform
+/// (the iPad pins its text view to 16 pt too), so ink lines up.
+pub const BODY_SIZE: f32 = 16.0;
+/// Heading scale per level, 1..=6.
+const HEADING_SCALE: [f32; 6] = [1.6, 1.4, 1.25, 1.1, 1.0, 1.0];
+/// Indent per list nesting level.
+const LIST_INDENT: f32 = 18.0;
+/// Scroll room below the last line, as a fraction of the viewport, so ink
+/// drawn under it stays reachable (the iPad insets its text view alike).
+const TAIL_FRACTION: f32 = 0.6;
 
 /// When set, the newest note auto-opens as the library changes (replay rig).
 #[derive(Resource, Default)]
@@ -25,10 +45,104 @@ pub struct EditorState {
     last: String,
     /// Set by the sync layer when remote changes may have landed.
     pub remote_dirty: bool,
+    /// Style runs of the buffer, reparsed only when the text changes.
+    styled: StyledCache,
 }
 
 #[derive(Default)]
-struct MarkdownCache(CommonMarkCache);
+struct StyledCache {
+    for_text: String,
+    runs: Vec<StyleRun>,
+}
+
+impl StyledCache {
+    fn runs_for(&mut self, text: &str) -> &[StyleRun] {
+        if self.for_text != text {
+            self.runs = style_runs(text);
+            self.for_text = text.to_owned();
+        }
+        &self.runs
+    }
+}
+
+/// Where the open note's text sits this frame, for the page ink scene.
+/// Points are in galley space: the galley's top-left is the origin, y grows
+/// down, one unit is one logical point.
+#[derive(Resource)]
+pub struct PageLayout {
+    pub note: Option<NoteId>,
+    /// `NoteDoc::version` the origins were resolved against.
+    doc_version: Vec<u8>,
+    galley_size: egui::Vec2,
+    /// The laid-out text, for resolving anchors that are not committed
+    /// elements (wet strokes, pointers).
+    pub galley: Option<Arc<egui::Galley>>,
+    /// Anchor-space origin of every committed page element.
+    pub origins: HashMap<ElementId, egui::Vec2>,
+    /// The part of the galley that is on screen.
+    pub window: egui::Rect,
+    /// Pixels per point of the egui context.
+    pub scale: f32,
+    /// Bumped whenever `origins` or the galley geometry changed.
+    pub generation: u64,
+}
+
+impl Default for PageLayout {
+    fn default() -> Self {
+        Self {
+            note: None,
+            doc_version: Vec::new(),
+            galley_size: egui::Vec2::ZERO,
+            galley: None,
+            origins: HashMap::new(),
+            window: egui::Rect::ZERO,
+            scale: 1.0,
+            generation: 0,
+        }
+    }
+}
+
+impl PageLayout {
+    /// Publish this frame's galley; re-resolve the anchors when the doc or
+    /// the text geometry changed.
+    fn update(
+        &mut self,
+        id: NoteId,
+        note: &NoteDoc,
+        galley: Arc<egui::Galley>,
+        window: egui::Rect,
+        scale: f32,
+    ) {
+        let version = note.version();
+        let size = galley.size();
+        if self.note != Some(id) || self.doc_version != version || self.galley_size != size {
+            self.note = Some(id);
+            self.doc_version = version;
+            self.galley_size = size;
+            self.origins = note
+                .page_elements()
+                .iter()
+                .map(|el| (el.element.id(), resolve_origin(&galley, note, &el.anchor)))
+                .collect();
+            self.generation += 1;
+        }
+        self.galley = Some(galley);
+        self.window = window;
+        self.scale = scale;
+    }
+}
+
+/// Anchor-space origin of `anchor` in galley space: the top of the row its
+/// line starts on. Unresolvable anchors sit below the last row.
+pub fn resolve_origin(galley: &egui::Galley, note: &NoteDoc, anchor: &Anchor) -> egui::Vec2 {
+    match note.resolve_anchor(anchor) {
+        Some(index) => {
+            let row = galley.pos_from_cursor(CCursor::new(index));
+            egui::vec2(0.0, row.min.y)
+        }
+        None => egui::vec2(0.0, galley.rect.max.y),
+    }
+}
 
 pub struct EditorUiPlugin;
 
@@ -36,7 +150,7 @@ impl Plugin for EditorUiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<EditorState>()
             .init_resource::<FollowLatest>()
-            .init_non_send::<MarkdownCache>()
+            .init_resource::<PageLayout>()
             // Theme first so the very first frame already renders styled.
             .add_systems(EguiPrimaryContextPass, editor_ui.after(theme::apply));
     }
@@ -75,7 +189,8 @@ fn editor_ui(
     mut contexts: EguiContexts,
     mut docs: ResMut<Docs>,
     mut editor: ResMut<EditorState>,
-    mut markdown: NonSendMut<MarkdownCache>,
+    mut layout: ResMut<PageLayout>,
+    page_texture: Res<PageTexture>,
     mut commits: MessageWriter<LocalCommit>,
     mut subscribes: MessageWriter<SubscribeNeeded>,
     mut settings: ResMut<Settings>,
@@ -87,6 +202,7 @@ fn editor_ui(
     mut theme: ResMut<Theme>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
+    let scale = ctx.pixels_per_point();
     // Copied out: the resource is only written back on a theme action, so
     // change detection stays quiet on ordinary frames.
     let palette = *theme.palette();
@@ -337,68 +453,95 @@ fn editor_ui(
             });
             ui.add_space(12.0);
 
-            let pane_height = ui.available_height();
-            ui.columns(2, |columns| {
-                let response = pane(&mut columns[0], &palette, "Markdown", pane_height, |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt("editor")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.add_sized(
-                                ui.available_size(),
-                                egui::TextEdit::multiline(&mut editor.buffer)
-                                    .code_editor()
-                                    .frame(egui::Frame::NONE)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("Start writing…"),
-                            )
-                        })
-                        .inner
-                });
-
-                if response.changed() {
-                    let (buffer, last) = (editor.buffer.clone(), editor.last.clone());
-                    if let Some((at, del, insert)) = splice_of(&last, &buffer) {
-                        match docs.splice(id, at, del, &insert) {
-                            Ok(payload) => {
-                                editor.last = buffer;
-                                commits.write(LocalCommit {
-                                    doc: DocKey::from(id),
-                                    payload,
-                                });
-                                match docs.refresh_meta(id) {
-                                    Ok(meta) => {
-                                        if let Some(payload) = meta.note {
-                                            commits.write(LocalCommit {
-                                                doc: DocKey::from(id),
-                                                payload,
-                                            });
-                                        }
-                                        if let Some(payload) = meta.workspace {
-                                            commits.write(LocalCommit {
-                                                doc: DocKey::WORKSPACE,
-                                                payload,
-                                            });
-                                        }
-                                    }
-                                    Err(err) => tracing::error!(%err, "meta refresh failed"),
-                                }
-                            }
-                            Err(err) => tracing::error!(%err, "splice failed"),
+            let editor_height = ui.available_height();
+            let (output, inner_rect) = pane(ui, &palette, editor_height, |ui| {
+                let scroll = egui::ScrollArea::vertical()
+                    .id_salt("editor")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Reserved before the text so the page ink lands
+                        // under it; filled in once the galley position is
+                        // known.
+                        let under = ui.painter().add(egui::Shape::Noop);
+                        let available = ui.available_size();
+                        let EditorState { buffer, styled, .. } = &mut *editor;
+                        let mut layouter =
+                            |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+                                let text = text.as_str();
+                                let job =
+                                    layout_job(text, styled.runs_for(text), &palette, wrap_width);
+                                ui.painter().layout_job(job)
+                            };
+                        let output = egui::TextEdit::multiline(buffer)
+                            .layouter(&mut layouter)
+                            .frame(egui::Frame::NONE)
+                            .desired_width(f32::INFINITY)
+                            .min_size(available)
+                            .hint_text("Start writing…")
+                            .show(ui);
+                        ui.add_space(available.y * TAIL_FRACTION);
+                        if let Some(target) = &page_texture.0 {
+                            // Painted in galley space, so a one-frame-old
+                            // window still lands on the right text.
+                            let rect = egui::Rect::from_min_size(
+                                output.galley_pos + target.window_min,
+                                target.size,
+                            );
+                            ui.painter().set(
+                                under,
+                                egui::Shape::image(
+                                    target.texture,
+                                    rect,
+                                    egui::Rect::from_min_max(
+                                        egui::Pos2::ZERO,
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                ),
+                            );
                         }
+                        output
+                    });
+                (scroll.inner, scroll.inner_rect)
+            });
+
+            if output.response.response.changed() {
+                let (buffer, last) = (editor.buffer.clone(), editor.last.clone());
+                if let Some((at, del, insert)) = splice_of(&last, &buffer) {
+                    match docs.splice(id, at, del, &insert) {
+                        Ok(payload) => {
+                            editor.last = buffer;
+                            commits.write(LocalCommit {
+                                doc: DocKey::from(id),
+                                payload,
+                            });
+                            match docs.refresh_meta(id) {
+                                Ok(meta) => {
+                                    if let Some(payload) = meta.note {
+                                        commits.write(LocalCommit {
+                                            doc: DocKey::from(id),
+                                            payload,
+                                        });
+                                    }
+                                    if let Some(payload) = meta.workspace {
+                                        commits.write(LocalCommit {
+                                            doc: DocKey::WORKSPACE,
+                                            payload,
+                                        });
+                                    }
+                                }
+                                Err(err) => tracing::error!(%err, "meta refresh failed"),
+                            }
+                        }
+                        Err(err) => tracing::error!(%err, "splice failed"),
                     }
                 }
+            }
 
-                pane(&mut columns[1], &palette, "Preview", pane_height, |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt("preview")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            CommonMarkViewer::new().show(ui, &mut markdown.0, &editor.buffer);
-                        });
-                });
-            });
+            if let Some(note) = docs.note(id) {
+                let window = inner_rect.translate(-output.galley_pos.to_vec2());
+                layout.update(id, note, output.galley, window, scale);
+            }
         });
 
     Ok(())
@@ -478,11 +621,10 @@ fn note_row(ui: &mut egui::Ui, palette: &Palette, title: &str, selected: bool) -
     response
 }
 
-/// Titled card filling `height`, used for the editor and preview columns.
+/// Paper card filling `height`: the editor's frame.
 fn pane<R>(
     ui: &mut egui::Ui,
     palette: &Palette,
-    title: &str,
     height: f32,
     body: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
@@ -492,8 +634,6 @@ fn pane<R>(
         .show(ui, |ui| {
             ui.set_min_height(height - 26.0);
             ui.set_width(ui.available_width());
-            palette.caption(ui, title);
-            ui.add_space(6.0);
             body(ui)
         })
         .inner
@@ -565,4 +705,263 @@ fn open_note(docs: &mut Docs, editor: &mut EditorState, id: NoteId) {
     editor.open = Some(id);
     editor.buffer = text.clone();
     editor.last = text;
+}
+
+// ---- styled source ----
+
+/// How one character renders; runs paint over a per-char array of these,
+/// outer runs first, so inner runs win.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CharStyle {
+    size: f32,
+    mono: bool,
+    italics: bool,
+    underline: bool,
+    strikethrough: bool,
+    color: Role,
+    background: bool,
+    /// Left indent of the line this char starts, if it starts one.
+    indent: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Body,
+    Strong,
+    Muted,
+    Accent,
+}
+
+impl CharStyle {
+    const BODY: Self = Self {
+        size: BODY_SIZE,
+        mono: false,
+        italics: false,
+        underline: false,
+        strikethrough: false,
+        color: Role::Body,
+        background: false,
+        indent: 0.0,
+    };
+
+    fn apply(&mut self, kind: StyleKind) {
+        match kind {
+            StyleKind::Heading { level } => {
+                let scale = HEADING_SCALE[usize::from(level.clamp(1, 6)) - 1];
+                self.size = BODY_SIZE * scale;
+                self.color = Role::Strong;
+            }
+            StyleKind::Strong => self.color = Role::Strong,
+            StyleKind::Emphasis => self.italics = true,
+            StyleKind::Strikethrough => self.strikethrough = true,
+            StyleKind::CodeSpan | StyleKind::CodeBlock => {
+                self.mono = true;
+                self.background = true;
+            }
+            StyleKind::ListItem { depth, .. } => self.indent = f32::from(depth) * LIST_INDENT,
+            StyleKind::BlockQuote => {
+                self.italics = true;
+                self.indent += LIST_INDENT;
+            }
+            StyleKind::Link => {
+                self.color = Role::Accent;
+                self.underline = true;
+            }
+            StyleKind::Marker | StyleKind::ThematicBreak => {
+                self.color = Role::Muted;
+                self.underline = false;
+            }
+        }
+    }
+
+    fn format(&self, palette: &Palette) -> TextFormat {
+        let family = if self.mono {
+            egui::FontFamily::Monospace
+        } else {
+            egui::FontFamily::Proportional
+        };
+        // No bundled bold face: strong text is full-strength ink, body
+        // text slightly softened.
+        let color = match self.color {
+            Role::Body => palette.text.gamma_multiply(0.85),
+            Role::Strong => palette.text,
+            Role::Muted => palette.muted,
+            Role::Accent => palette.accent,
+        };
+        let line = |on: bool| {
+            if on {
+                egui::Stroke::new(1.0, color)
+            } else {
+                egui::Stroke::NONE
+            }
+        };
+        TextFormat {
+            font_id: egui::FontId::new(self.size, family),
+            color,
+            background: if self.background {
+                palette.surface_raised
+            } else {
+                egui::Color32::TRANSPARENT
+            },
+            italics: self.italics,
+            underline: line(self.underline),
+            strikethrough: line(self.strikethrough),
+            ..TextFormat::default()
+        }
+    }
+}
+
+/// Per-char styles of `text` under `runs` (scalar offsets, clamped).
+fn char_styles(text: &str, runs: &[StyleRun]) -> Vec<CharStyle> {
+    let mut styles = vec![CharStyle::BODY; text.chars().count()];
+    for run in runs {
+        let end = run.end.min(styles.len());
+        for style in &mut styles[run.start.min(end)..end] {
+            style.apply(run.kind);
+        }
+    }
+    styles
+}
+
+/// The styled galley job: one section per maximal run of equally styled
+/// chars, split at newlines so every line of an indented block indents.
+fn layout_job(text: &str, runs: &[StyleRun], palette: &Palette, wrap_width: f32) -> LayoutJob {
+    let styles = char_styles(text, runs);
+    let mut job = LayoutJob {
+        text: text.to_owned(),
+        ..LayoutJob::default()
+    };
+    job.wrap.max_width = wrap_width;
+
+    let mut section_start = 0usize; // byte
+    let mut section_style: Option<CharStyle> = None;
+    let mut line_start = true;
+    let push =
+        |job: &mut LayoutJob, start: usize, end: usize, style: CharStyle, at_line_start: bool| {
+            job.sections.push(LayoutSection {
+                leading_space: if at_line_start { style.indent } else { 0.0 },
+                byte_range: ByteIndex(start)..ByteIndex(end),
+                format: style.format(palette),
+            });
+        };
+    let mut section_at_line_start = true;
+    for ((byte, ch), style) in text.char_indices().zip(&styles) {
+        let split = section_style.is_some_and(|s| s != *style) || (line_start && byte > 0);
+        if split {
+            if let Some(s) = section_style {
+                push(&mut job, section_start, byte, s, section_at_line_start);
+            }
+            section_start = byte;
+            section_at_line_start = line_start;
+        }
+        section_style = Some(*style);
+        line_start = ch == '\n';
+    }
+    if let Some(s) = section_style {
+        push(
+            &mut job,
+            section_start,
+            text.len(),
+            s,
+            section_at_line_start,
+        );
+    }
+    if job.sections.is_empty() {
+        push(&mut job, 0, 0, CharStyle::BODY, true);
+    }
+    job
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn palette() -> Palette {
+        *Theme::new(theme::Flavor::Latte).palette()
+    }
+
+    fn sections(text: &str) -> Vec<(std::ops::Range<usize>, f32, f32)> {
+        let job = layout_job(text, &style_runs(text), &palette(), 400.0);
+        job.sections
+            .iter()
+            .map(|s| {
+                (
+                    s.byte_range.start.0..s.byte_range.end.0,
+                    s.format.font_id.size,
+                    s.leading_space,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn splice_detects_middle_change() {
+        assert_eq!(splice_of("abc", "aXc"), Some((1, 1, "X".into())));
+        assert_eq!(splice_of("abc", "abc"), None);
+    }
+
+    #[test]
+    fn heading_scales_and_marker_dims() {
+        let text = "# Hi\nbody";
+        let job = layout_job(text, &style_runs(text), &palette(), 400.0);
+        let marker = &job.sections[0];
+        assert_eq!(marker.byte_range, ByteIndex(0)..ByteIndex(1));
+        assert_eq!(marker.format.color, palette().muted);
+        assert_eq!(marker.format.font_id.size, BODY_SIZE * HEADING_SCALE[0]);
+        let body = job.sections.last().unwrap();
+        assert_eq!(body.byte_range, ByteIndex(5)..ByteIndex(9));
+        assert_eq!(body.format.font_id.size, BODY_SIZE);
+    }
+
+    #[test]
+    fn every_list_line_indents() {
+        let text = "- a\n- b\n";
+        let got = sections(text);
+        let line_starts: Vec<_> = got
+            .iter()
+            .filter(|(r, _, _)| r.start == 0 || r.start == 4)
+            .collect();
+        assert_eq!(line_starts.len(), 2);
+        assert!(line_starts.iter().all(|(_, _, lead)| *lead == LIST_INDENT));
+        // The marker's section is the only one carrying the indent.
+        assert!(got.iter().filter(|(_, _, lead)| *lead > 0.0).count() == 2);
+    }
+
+    #[test]
+    fn sections_cover_text_in_order_with_multibyte() {
+        let text = "héllo **wörld** `c`\n> q\n";
+        let job = layout_job(text, &style_runs(text), &palette(), 400.0);
+        let mut at = 0;
+        for s in &job.sections {
+            assert_eq!(s.byte_range.start.0, at);
+            assert!(text.is_char_boundary(s.byte_range.end.0));
+            at = s.byte_range.end.0;
+        }
+        assert_eq!(at, text.len());
+        // Backticks are markers inside the span: three sections, all mono.
+        let mono: String = job
+            .sections
+            .iter()
+            .filter(|s| s.format.font_id.family == egui::FontFamily::Monospace)
+            .map(|s| &text[s.byte_range.start.0..s.byte_range.end.0])
+            .collect();
+        assert_eq!(mono, "`c`");
+    }
+
+    #[test]
+    fn empty_text_has_one_section() {
+        assert_eq!(sections("").len(), 1);
+    }
+
+    #[test]
+    fn out_of_range_runs_are_clamped() {
+        let runs = [StyleRun {
+            start: 2,
+            end: 99,
+            kind: StyleKind::Strong,
+        }];
+        let styles = char_styles("abc", &runs);
+        assert_eq!(styles.len(), 3);
+        assert_eq!(styles[2].color, Role::Strong);
+    }
 }

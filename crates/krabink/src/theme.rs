@@ -169,9 +169,9 @@ impl Palette {
         self.accent.gamma_multiply(0.28)
     }
 
-    /// Sketch paper: what a sketch's render target clears to, so ink sits
-    /// inline on the preview card with no visible frame. The iPad pins its
-    /// canvas to the same colour (`UIColor.paper` in InkRenderer.swift).
+    /// Paper: what the page ink render target clears to, so ink sits under
+    /// the editor's text with no visible frame. The iPad pins its canvas to
+    /// the same colour (`UIColor.paper` in InkRenderer.swift).
     pub const fn paper(&self) -> Color32 {
         self.surface
     }
@@ -281,7 +281,7 @@ impl Palette {
             offset: [0, 6],
             blur: 16,
             spread: 0,
-            color: Color32::from_black_alpha(shadow * 3 / 4),
+            color: Color32::from_black_alpha(shadow / 4 * 3),
         };
         v.menu_corner_radius = CornerRadius::same(WINDOW_RADIUS);
 

@@ -3,7 +3,7 @@ name = "krabink"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Desktop client for krabink: markdown notes with live-synced sketches"
+description = "Desktop client for krabink: markdown notes with live-synced page ink"
 
 # The bin links all of bevy; running it as a test harness SIGSEGVs under
 # nextest's --list and it contains no tests - logic lives in krabink-core.
@@ -30,7 +30,6 @@ thiserror.workspace = true
 tracing.workspace = true
 bevy = { version = "0.19", features = ["wayland"] }
 bevy_egui.workspace = true
-egui_commonmark.workspace = true
 directories.workspace = true
 gethostname = "0.5"
 qrcode = { version = "0.14", default-features = false }

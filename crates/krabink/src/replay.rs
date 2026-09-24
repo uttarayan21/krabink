@@ -1,15 +1,16 @@
 //! `krabink replay`: a headless node that pairs with a target, creates a
-//! note with a sketch and streams synthetic 120Hz pen strokes to it — wet
-//! ink over the ephemeral lane, authoritative strokes committed to the
-//! CRDT at pen-up. This is the latency test rig for the desktop renderer.
+//! note and streams synthetic 120Hz pen strokes onto its page (anchored to
+//! one source line) — wet ink over the ephemeral lane, authoritative
+//! strokes committed to the CRDT at pen-up. This is the latency test rig
+//! for the desktop renderer.
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::time::Duration;
 
 use krabink_core::{
-    ClientDocs, ClientEffect, DeviceId, DocKey, NoteDoc, NoteId, NoteMeta, PairInfo, PointKind,
-    Rgba, SKETCH_URI_PREFIX, SketchId, Stroke, StrokeId, StrokePoint, Tool, WetInk, WorkspaceDoc,
+    Anchor, ClientDocs, ClientEffect, DeviceId, DocKey, NoteDoc, NoteId, NoteMeta, PairInfo,
+    PointKind, Rgba, Stroke, StrokeId, StrokePoint, Tool, WetInk, WorkspaceDoc,
 };
 use krabink_local::{
     LocalLink, Node, NodeConfig, PeerKind, PeerState, PeerTarget, RelayTarget, Role,
@@ -137,17 +138,15 @@ async fn replay(args: ReplayArgs) -> Result<()> {
     send_all(&link, session.subscribe(DocKey::WORKSPACE, have))?;
     wait_synced(&mut session, &mut link, &mut docs, DocKey::WORKSPACE).await?;
 
-    // Create the target note + sketch and announce it via the workspace.
+    // Create the target note and announce it via the workspace; the ink
+    // anchors to the "live ink below:" line.
     let note_id = NoteId::new();
     let note = NoteDoc::new(note_id);
     note.set_title("replay").change_context(Error)?;
-    let sketch = note.create_sketch(now_ms()).change_context(Error)?;
-    note.splice_text(
-        0,
-        0,
-        &format!("# replay\n\nlive ink below:\n\n![ink]({SKETCH_URI_PREFIX}{sketch})\n"),
-    )
-    .change_context(Error)?;
+    let text = "# replay\n\nlive ink below:\n";
+    note.splice_text(0, 0, text).change_context(Error)?;
+    let line = text.find("live").expect("ascii text");
+    let anchor = note.anchor_at(line).change_context(Error)?;
     docs.notes.insert(note_id, note);
     let note_key = DocKey::from(note_id);
 
@@ -172,13 +171,13 @@ async fn replay(args: ReplayArgs) -> Result<()> {
 
     writeln!(
         std::io::stdout(),
-        "replay note {note_id} / sketch {sketch}; open it in the desktop app (or run with --follow-latest)"
+        "replay note {note_id}; open it in the desktop app (or run with --follow-latest)"
     )
     .change_context(Error)?;
 
     for i in 0..args.strokes {
         if args.pointer {
-            hover_to(&mut session, &link, note_key, sketch, i).await?;
+            hover_to(&mut session, &link, note_key, &anchor, i).await?;
         }
         stream_stroke(
             &mut session,
@@ -186,7 +185,7 @@ async fn replay(args: ReplayArgs) -> Result<()> {
             &mut docs,
             note_id,
             note_key,
-            sketch,
+            &anchor,
             i,
             args.pointer,
         )
@@ -194,9 +193,7 @@ async fn replay(args: ReplayArgs) -> Result<()> {
         tokio::time::sleep(PAUSE_BETWEEN).await;
     }
     if args.pointer {
-        let gone = WetInk::PointerGone { sketch }
-            .encode()
-            .change_context(Error)?;
+        let gone = WetInk::PointerAnchoredGone.encode().change_context(Error)?;
         send_all(&link, session.ephemeral(note_key, gone))?;
     }
 
@@ -300,10 +297,10 @@ fn sample_stroke(index: usize) -> Vec<StrokePoint> {
 const POINTER_COLOR: Rgba = Rgba([30, 60, 200, 255]);
 const POINTER_WIDTH: f32 = 3.0;
 
-/// A `Pointer` frame for the replay pen at (`x`, `y`).
-fn pointer_frame(sketch: SketchId, x: f32, y: f32, down: bool) -> Result<Vec<u8>> {
-    WetInk::Pointer {
-        sketch,
+/// A pointer frame for the replay pen at (`x`, `y`) in `anchor`'s space.
+fn pointer_frame(anchor: &Anchor, x: f32, y: f32, down: bool) -> Result<Vec<u8>> {
+    WetInk::PointerAnchored {
+        anchor: anchor.0.clone(),
         x,
         y,
         tilt: None,
@@ -323,7 +320,7 @@ async fn hover_to(
     session: &mut krabink_core::ClientSession,
     link: &LocalLink,
     note_key: DocKey,
-    sketch: SketchId,
+    anchor: &Anchor,
     index: usize,
 ) -> Result<()> {
     const STEPS: usize = 15;
@@ -340,7 +337,7 @@ async fn hover_to(
         let y = from.1 + (to.1 - from.1) * t;
         send_all(
             link,
-            session.ephemeral(note_key, pointer_frame(sketch, x, y, false)?),
+            session.ephemeral(note_key, pointer_frame(anchor, x, y, false)?),
         )?;
         tokio::time::sleep(Duration::from_millis(33)).await;
     }
@@ -354,7 +351,7 @@ async fn stream_stroke(
     docs: &mut MemDocs,
     note_id: NoteId,
     note_key: DocKey,
-    sketch: SketchId,
+    anchor: &Anchor,
     index: usize,
     pointer: bool,
 ) -> Result<()> {
@@ -363,9 +360,9 @@ async fn stream_stroke(
     let color = POINTER_COLOR;
     let base_width = POINTER_WIDTH;
 
-    let begin = WetInk::Begin {
-        sketch,
+    let begin = WetInk::BeginAnchored {
         stroke: stroke_id,
+        anchor: anchor.0.clone(),
         tool: Tool::Pen,
         color,
         base_width,
@@ -386,7 +383,7 @@ async fn stream_stroke(
         if pointer && let Some(tip) = batch.last() {
             send_all(
                 link,
-                session.ephemeral(note_key, pointer_frame(sketch, tip.x, tip.y, true)?),
+                session.ephemeral(note_key, pointer_frame(anchor, tip.x, tip.y, true)?),
             )?;
         }
     }
@@ -400,8 +397,7 @@ async fn stream_stroke(
     // Pen-up: commit the authoritative stroke.
     let note = docs.notes.get(&note_id).expect("note created above");
     let before = note.version();
-    note.add_stroke(
-        sketch,
+    note.add_page_stroke(
         &Stroke {
             id: stroke_id,
             tool: Tool::Pen,
@@ -412,6 +408,7 @@ async fn stream_stroke(
             points,
             created_ms: now_ms(),
         },
+        anchor,
     )
     .change_context(Error)?;
     let payload = note.export_updates_since(&before).change_context(Error)?;

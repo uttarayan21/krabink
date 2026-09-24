@@ -1,7 +1,9 @@
-//! Sketch rendering: each sketch in the open note gets an off-screen bevy
-//! scene (own render layer + camera) rendered into an `Image`; that image is
-//! exposed to egui through a custom `krabink://` texture loader so the
-//! markdown preview embeds it inline.
+//! Page ink rendering: the open note's page layer (strokes anchored to
+//! source lines) renders in an off-screen bevy scene (own render layer +
+//! camera) into an `Image` that the editor paints under its text. The
+//! scene covers the part of the galley on screen plus some overscan, and
+//! the camera follows the scroll; every element sits at its line's origin
+//! from the editor's [`PageLayout`], so ink moves with the text.
 //!
 //! Committed CRDT strokes become ink meshes drawn with [`InkMaterial`];
 //! wet ink from the ephemeral channel renders as provisional meshes on top
@@ -13,9 +15,12 @@
 //! reduced alpha (the same hover dab the iPad draws locally) inside a ring
 //! coloured per device. Pointers arrive on the ephemeral channel too and
 //! vanish when withdrawn or after a short silence.
+//!
+//! The paper is opaque: the highlighter multiplies with what is under it,
+//! so the texture clears to the paper colour and the text is painted over
+//! it rather than the ink over the text.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::RenderLayers;
@@ -25,10 +30,10 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureUsages;
 use bevy::render::storage::ShaderBuffer;
-use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, EguiUserTextures, egui};
+use bevy_egui::{EguiTextureHandle, EguiUserTextures, egui};
 use krabink_core::{
-    BrushSpec, DEFAULT_TOLERANCE, DeviceId, DocKey, Element, Ink, InkMesh, InkStyle, Rgba,
-    SKETCH_URI_PREFIX, SketchId, StrokeEnd, StrokeId, StrokePoint, Tool, WetInk,
+    Anchor, BrushSpec, DEFAULT_TOLERANCE, DeviceId, DocKey, ElementId, Ink, InkMesh, InkStyle,
+    NoteDoc, NoteId, Rgba, StrokeEnd, StrokeId, StrokePoint, Tool, WetInk,
 };
 
 use crate::docs::{Docs, now_ms};
@@ -38,16 +43,19 @@ use crate::ink_material::{
     InkSlot,
 };
 use crate::theme::{Palette, Theme};
-use crate::ui::EditorState;
+use crate::ui::{EditorState, PageLayout, resolve_origin};
 
 /// Wet ink lingers this long after `End` if the committed stroke never shows.
 const WET_TTL_MS: u64 = 5_000;
-/// Render-target size bounds (pixels; 1 canvas unit = 1 pixel, which is
-/// why [`DEFAULT_TOLERANCE`] is the right cap/join flattening tolerance).
+/// Render-target size bounds in points (the texture is `scale` times
+/// bigger in pixels).
 const MIN_TARGET: u32 = 256;
-const MAX_TARGET: u32 = 2048;
-/// 1 canvas unit = 1 pixel: grain renders at full strength.
-const ZOOM: f32 = 1.0;
+const MAX_TARGET: u32 = 4096;
+/// Extra galley above and below the visible window in the target, so a
+/// scroll shows rendered ink while the camera catches up.
+const OVERSCAN: f32 = 256.0;
+/// The off-screen scene's render layer (0 is the main window).
+const LAYER: usize = 1;
 /// z spacing between consecutive strokes.
 const Z_STEP: f32 = 0.01;
 /// Remote wet strokes sit above every committed element.
@@ -79,27 +87,39 @@ pub struct WetInkFrame {
     pub from: DeviceId,
 }
 
-/// Texture table shared with the egui loader: uri → (texture, size).
-#[derive(Resource, Clone, Default)]
-pub struct SketchTextures(Arc<Mutex<HashMap<String, (egui::TextureId, egui::Vec2)>>>);
+/// The rendered page texture, for the editor to paint under its text.
+#[derive(Debug, Clone, Copy)]
+pub struct PageTarget {
+    pub texture: egui::TextureId,
+    /// Size in points.
+    pub size: egui::Vec2,
+    /// Galley-space top-left of the rendered region.
+    pub window_min: egui::Vec2,
+}
 
-/// A spawned ink entity and the palette slot it draws with.
+#[derive(Resource, Default)]
+pub struct PageTexture(pub Option<PageTarget>);
+
+/// A spawned ink entity, the palette slot it draws with and its z.
 #[derive(Debug, Clone, Copy)]
 struct InkEntity {
     entity: Entity,
     slot: InkSlot,
+    z: f32,
 }
 
 struct WetStroke {
-    sketch: SketchId,
+    anchor: Anchor,
+    /// Resolved when the entity spawns; refreshed on every layout change.
+    origin: Option<Vec2>,
     /// Spawned on the first batch with drawable geometry.
     drawn: Option<InkEntity>,
     mesh: Option<Handle<Mesh>>,
-    layer: usize,
     tool: Tool,
     color: Rgba,
     base_width: f32,
-    /// A custom brush's spec from `Begin`; `None` draws the tool's preset.
+    /// A custom brush's spec from `BeginAnchored`; `None` draws the tool's
+    /// preset.
     spec: Option<BrushSpec>,
     points: Vec<StrokePoint>,
     last_seq: u32,
@@ -131,15 +151,15 @@ struct PointerPart {
 }
 
 impl PointerPart {
-    /// Show `ink` at `z` on the scene's layer, or nothing.
+    /// Show `ink` placed by `at` (its line's origin and z), or nothing.
     fn set(
         &mut self,
         commands: &mut Commands,
-        scene: &mut SketchScene,
+        scene: &mut PageScene,
         meshes: &mut Assets<Mesh>,
         ink_assets: &InkAssets,
         ink: Option<(Mesh, InkStyle)>,
-        z: f32,
+        at: Transform,
     ) {
         let Some((mesh, style)) = ink else {
             self.clear(commands, Some(scene));
@@ -160,16 +180,19 @@ impl PointerPart {
         };
         let style_changed = self.style.as_ref() != Some(&style);
         match self.drawn {
-            Some(_) if !style_changed => {}
+            Some(drawn) if !style_changed => {
+                commands.entity(drawn.entity).insert(at);
+            }
             Some(drawn) => {
                 // Tool or colour changed: restyle the entity in place.
                 scene.palette.remove(drawn.slot);
                 let slot = scene.palette.insert(&style, ink_assets);
                 let (tag, material) = scene.palette.components(slot);
-                commands.entity(drawn.entity).insert((tag, material));
+                commands.entity(drawn.entity).insert((tag, material, at));
                 self.drawn = Some(InkEntity {
                     entity: drawn.entity,
                     slot,
+                    z: at.translation.z,
                 });
             }
             None => {
@@ -180,18 +203,22 @@ impl PointerPart {
                         Mesh2d(handle),
                         material,
                         tag,
-                        Transform::from_xyz(0.0, 0.0, z),
-                        RenderLayers::layer(scene.layer),
+                        at,
+                        RenderLayers::layer(LAYER),
                     ))
                     .id();
-                self.drawn = Some(InkEntity { entity, slot });
+                self.drawn = Some(InkEntity {
+                    entity,
+                    slot,
+                    z: at.translation.z,
+                });
             }
         }
         self.style = Some(style);
     }
 
-    /// Despawn; `scene` is `None` only when the sketch itself is gone.
-    fn clear(&mut self, commands: &mut Commands, scene: Option<&mut SketchScene>) {
+    /// Despawn; `scene` is `None` only when the scene itself is gone.
+    fn clear(&mut self, commands: &mut Commands, scene: Option<&mut PageScene>) {
         if let Some(drawn) = self.drawn.take() {
             commands.entity(drawn.entity).despawn();
             if let Some(scene) = scene {
@@ -201,6 +228,13 @@ impl PointerPart {
         self.mesh = None;
         self.style = None;
     }
+
+    /// Move the entity to a new line origin.
+    fn replace(&self, commands: &mut Commands, origin: Vec2) {
+        if let Some(drawn) = self.drawn {
+            commands.entity(drawn.entity).insert(place(origin, drawn.z));
+        }
+    }
 }
 
 /// What a pointer draws this update: each part `None` to hide it.
@@ -209,30 +243,38 @@ struct PointerLook {
     ring: Option<(Mesh, InkStyle)>,
 }
 
-/// A peer's pen on one sketch.
+/// A peer's pen over the page, in the anchor space of `anchor`.
 struct RemotePointer {
-    sketch: SketchId,
+    anchor: Anchor,
     dab: PointerPart,
     ring: PointerPart,
     /// Local clock at the last update; dropped after [`POINTER_TTL_MS`].
     seen_ms: u64,
 }
 
-/// The off-screen image a sketch renders into and the camera drawing it.
+/// The off-screen image the page renders into and the camera drawing it.
 struct SceneTarget {
     image: Handle<Image>,
+    texture: egui::TextureId,
     camera: Entity,
-    size: UVec2,
+    size_px: UVec2,
+    size_pts: Vec2,
+    /// Galley-space top-left of the rendered region.
+    window_min: Vec2,
 }
 
-struct SketchScene {
-    layer: usize,
+struct PageScene {
+    note: NoteId,
+    /// Pixels per point the target and the grain were built for.
+    scale: f32,
     target: SceneTarget,
     palette: InkPalette,
     /// The `InkAssets` generation the strokes were styled against.
     assets_generation: u32,
+    /// The `PageLayout` generation the elements were placed against.
+    layout_generation: Option<u64>,
     /// Committed element id → ink entity (`None` for elements with no ink).
-    strokes: HashMap<StrokeId, Option<InkEntity>>,
+    strokes: HashMap<ElementId, Option<InkEntity>>,
     /// Committed elements spawned so far; the next one's z slot.
     committed: u16,
     /// Next remote wet stroke's z slot.
@@ -240,59 +282,62 @@ struct SketchScene {
 }
 
 #[derive(Resource, Default)]
-struct SketchScenes {
-    scenes: HashMap<SketchId, SketchScene>,
+struct PageScenes {
+    scene: Option<PageScene>,
     wet: HashMap<StrokeId, WetStroke>,
-    /// One pointer per peer device, on whichever sketch its pen is over.
+    /// One pointer per peer device.
     pointers: HashMap<DeviceId, RemotePointer>,
-    next_layer: usize,
 }
 
-impl SketchScenes {
+impl PageScenes {
     /// Drop a wet stroke's entity and free its style slot.
     fn despawn_wet(&mut self, commands: &mut Commands, id: StrokeId) {
         let Some(wet) = self.wet.remove(&id) else {
             return;
         };
-        despawn_wet(commands, &mut self.scenes, wet);
+        despawn_wet(commands, self.scene.as_mut(), wet);
     }
 
-    /// Move `from`'s pointer to `sketch` and redraw it as `look`.
+    /// Redraw `from`'s pointer as `look`, placed at `origin` (its line).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "every ECS handle a pointer needs, threaded from one system"
+    )]
     fn update_pointer(
         &mut self,
         commands: &mut Commands,
         meshes: &mut Assets<Mesh>,
         ink_assets: &InkAssets,
         from: DeviceId,
-        sketch: SketchId,
+        anchor: Anchor,
+        origin: Vec2,
         look: PointerLook,
     ) {
+        let Some(scene) = self.scene.as_mut() else {
+            return; // page not on screen; nothing to draw into
+        };
         let pointer = self.pointers.entry(from).or_insert_with(|| RemotePointer {
-            sketch,
+            anchor: anchor.clone(),
             dab: PointerPart::default(),
             ring: PointerPart::default(),
             seen_ms: 0,
         });
-        if pointer.sketch != sketch {
-            let old = self.scenes.get_mut(&pointer.sketch);
-            pointer.dab.clear(commands, old);
-            let old = self.scenes.get_mut(&pointer.sketch);
-            pointer.ring.clear(commands, old);
-            pointer.sketch = sketch;
-        }
-        let Some(scene) = self.scenes.get_mut(&sketch) else {
-            return; // sketch not on screen; nothing to draw into
-        };
-        pointer
-            .dab
-            .set(commands, scene, meshes, ink_assets, look.dab, POINTER_DAB_Z);
+        pointer.anchor = anchor;
+        pointer.dab.set(
+            commands,
+            scene,
+            meshes,
+            ink_assets,
+            look.dab,
+            place(origin, POINTER_DAB_Z),
+        );
         pointer.ring.set(
             commands,
             scene,
             meshes,
             ink_assets,
             look.ring,
-            POINTER_RING_Z,
+            place(origin, POINTER_RING_Z),
         );
         pointer.seen_ms = now_ms();
     }
@@ -302,23 +347,35 @@ impl SketchScenes {
         let Some(mut pointer) = self.pointers.remove(&from) else {
             return;
         };
-        pointer
-            .dab
-            .clear(commands, self.scenes.get_mut(&pointer.sketch));
-        pointer
-            .ring
-            .clear(commands, self.scenes.get_mut(&pointer.sketch));
+        pointer.dab.clear(commands, self.scene.as_mut());
+        pointer.ring.clear(commands, self.scene.as_mut());
+    }
+
+    /// Despawn everything: the scene is rebuilt for another note or scale.
+    fn teardown(&mut self, commands: &mut Commands, egui_textures: &mut EguiUserTextures) {
+        for (_, wet) in self.wet.drain() {
+            if let Some(drawn) = wet.drawn {
+                commands.entity(drawn.entity).despawn();
+            }
+        }
+        for (_, mut pointer) in self.pointers.drain() {
+            pointer.dab.clear(commands, None);
+            pointer.ring.clear(commands, None);
+        }
+        if let Some(scene) = self.scene.take() {
+            for drawn in scene.strokes.into_values().flatten() {
+                commands.entity(drawn.entity).despawn();
+            }
+            commands.entity(scene.target.camera).despawn();
+            egui_textures.remove_image(scene.target.image.id());
+        }
     }
 }
 
-fn despawn_wet(
-    commands: &mut Commands,
-    scenes: &mut HashMap<SketchId, SketchScene>,
-    wet: WetStroke,
-) {
+fn despawn_wet(commands: &mut Commands, scene: Option<&mut PageScene>, wet: WetStroke) {
     if let Some(drawn) = wet.drawn {
         commands.entity(drawn.entity).despawn();
-        if let Some(scene) = scenes.get_mut(&wet.sketch) {
+        if let Some(scene) = scene {
             scene.palette.remove(drawn.slot);
         }
     }
@@ -336,8 +393,8 @@ impl Plugin for SketchPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(InkMaterialPlugin)
             .add_message::<WetInkFrame>()
-            .init_resource::<SketchScenes>()
-            .init_resource::<SketchTextures>()
+            .init_resource::<PageScenes>()
+            .init_resource::<PageTexture>()
             .init_resource::<WetLatency>()
             .add_systems(PreStartup, init_ink_assets)
             .add_systems(
@@ -345,67 +402,62 @@ impl Plugin for SketchPlugin {
                 (
                     sync_assets,
                     apply_theme,
-                    sync_sketch_scenes,
+                    sync_page_scene,
                     apply_wet_ink,
                     flush_palettes,
                 )
                     .chain(),
-            )
-            .add_systems(EguiPrimaryContextPass, install_loader);
+            );
     }
 }
 
-// ---- egui loader ----
+// ---- placement ----
 
-struct KrabinkTextureLoader {
-    textures: SketchTextures,
+/// The transform putting anchor-space geometry at its line's origin
+/// (galley space, y down) in the scene (y up).
+fn place(origin: Vec2, z: f32) -> Transform {
+    Transform::from_xyz(origin.x, -origin.y, z)
 }
 
-impl egui::load::TextureLoader for KrabinkTextureLoader {
-    fn id(&self) -> &'static str {
-        "krabink-sketch-loader"
-    }
-
-    fn load(
-        &self,
-        _ctx: &egui::Context,
-        uri: &str,
-        _texture_options: egui::TextureOptions,
-        _size_hint: egui::SizeHint,
-    ) -> egui::load::TextureLoadResult {
-        if !uri.starts_with(SKETCH_URI_PREFIX) {
-            return Err(egui::load::LoadError::NotSupported);
-        }
-        let table = self.textures.0.lock().expect("sketch texture table");
-        match table.get(uri) {
-            Some((id, size)) => Ok(egui::load::TexturePoll::Ready {
-                texture: egui::load::SizedTexture::new(*id, *size),
-            }),
-            None => Ok(egui::load::TexturePoll::Pending { size: None }),
-        }
-    }
-
-    fn forget(&self, _uri: &str) {}
-    fn forget_all(&self) {}
-    fn byte_size(&self) -> usize {
-        0
-    }
+fn to_bevy(v: egui::Vec2) -> Vec2 {
+    Vec2::new(v.x, v.y)
 }
 
-fn install_loader(
-    mut contexts: EguiContexts,
-    textures: Res<SketchTextures>,
-    mut installed: Local<bool>,
-) -> Result {
-    if !*installed {
-        contexts
-            .ctx_mut()?
-            .add_texture_loader(Arc::new(KrabinkTextureLoader {
-                textures: textures.clone(),
-            }));
-        *installed = true;
-    }
-    Ok(())
+fn to_egui(v: Vec2) -> egui::Vec2 {
+    egui::vec2(v.x, v.y)
+}
+
+/// Where `anchor`'s line sits, in galley space.
+fn origin_of(galley: &egui::Galley, note: &NoteDoc, anchor: &Anchor) -> Vec2 {
+    to_bevy(resolve_origin(galley, note, anchor))
+}
+
+/// The render target region for a visible galley `window`: the window
+/// plus [`OVERSCAN`] above and below, rounded up to 64 points and clamped.
+/// Returns (galley-space top-left, size in points).
+fn target_region(window_min: Vec2, window_size: Vec2) -> (Vec2, Vec2) {
+    let size = Vec2::new(
+        target_extent(window_size.x) as f32,
+        target_extent(window_size.y + 2.0 * OVERSCAN) as f32,
+    );
+    (Vec2::new(window_min.x, window_min.y - OVERSCAN), size)
+}
+
+fn target_extent(len: f32) -> u32 {
+    (len.max(0.0).ceil() as u32)
+        .next_multiple_of(64)
+        .clamp(MIN_TARGET, MAX_TARGET)
+}
+
+/// The camera looking at the region, centred on it. Galley y grows down
+/// and meshes negate y, so the region `[min, min + size]` is the world
+/// rect `[min.x, min.x + w] x [-(min.y + h), -min.y]`.
+fn camera_transform(window_min: Vec2, size_pts: Vec2) -> Transform {
+    Transform::from_xyz(
+        window_min.x + size_pts.x / 2.0,
+        -(window_min.y + size_pts.y / 2.0),
+        0.0,
+    )
 }
 
 // ---- scene / stroke sync ----
@@ -414,12 +466,13 @@ fn install_loader(
     clippy::too_many_arguments,
     reason = "bevy system; each param is a distinct ECS resource"
 )]
-fn sync_sketch_scenes(
+fn sync_page_scene(
     mut commands: Commands,
     docs: Res<Docs>,
     editor: Res<EditorState>,
-    mut scenes: ResMut<SketchScenes>,
-    textures: Res<SketchTextures>,
+    layout: Res<PageLayout>,
+    mut scenes: ResMut<PageScenes>,
+    mut page_texture: ResMut<PageTexture>,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<InkMaterial>>,
@@ -428,146 +481,188 @@ fn sync_sketch_scenes(
     ink_assets: Res<InkAssets>,
     theme: Res<Theme>,
 ) {
-    let Some(note_id) = editor.open else { return };
-    let Some(note) = docs.note(note_id) else {
+    let Some(note_id) = editor.open else {
+        return;
+    };
+    if layout.note != Some(note_id) {
+        return; // the editor has not laid this note out yet
+    }
+    let (Some(note), Some(galley)) = (docs.note(note_id), layout.galley.as_ref()) else {
         return;
     };
 
-    for sketch in note.sketch_ids() {
-        let elements = match note.elements(sketch) {
-            Ok(elements) => elements,
-            Err(err) => {
-                tracing::error!(%err, %sketch, "reading elements failed");
-                continue;
-            }
-        };
-        // Strokes and shapes alike render their outline.
-        let outlines: Vec<(&Element, Vec<StrokePoint>)> =
-            elements.iter().map(|el| (el, el.outline())).collect();
+    // Meshes, slots and z are per note; the target size and the grain
+    // per pixel density. Either change rebuilds the scene.
+    if scenes
+        .scene
+        .as_ref()
+        .is_some_and(|s| s.note != note_id || s.scale != layout.scale)
+    {
+        scenes.teardown(&mut commands, &mut egui_textures);
+    }
 
-        // Content bounds decide the render-target size.
-        let max = outlines
-            .iter()
-            .flat_map(|(_, pts)| pts)
-            .fold((0.0f32, 0.0f32), |(mx, my), p| (mx.max(p.x), my.max(p.y)));
-        let desired = UVec2::new(target_extent(max.0), target_extent(max.1));
+    let (window_min, size_pts) = target_region(
+        to_bevy(layout.window.min.to_vec2()),
+        to_bevy(layout.window.size()),
+    );
+    let size_px = (size_pts * layout.scale).round().as_uvec2();
 
-        let scenes = &mut *scenes;
-        if !scenes.scenes.contains_key(&sketch) {
-            scenes.next_layer += 1; // layer 0 = main window
-            let layer = scenes.next_layer;
-            let target = new_target(
-                &mut commands,
-                &mut images,
-                &mut egui_textures,
-                &textures,
-                sketch,
-                layer,
-                desired,
-                theme.palette(),
-            );
-            let palette = InkPalette::new(
-                &mut buffers,
-                &mut materials,
-                InkParams::new(ZOOM),
-                &ink_assets,
-                theme.palette().paper_tone(),
-            );
-            scenes.scenes.insert(
-                sketch,
-                SketchScene {
-                    layer,
-                    target,
-                    palette,
-                    assets_generation: ink_assets.generation,
-                    strokes: HashMap::new(),
-                    committed: 0,
-                    wet_serial: 0,
-                },
-            );
+    let PageScenes {
+        scene,
+        wet,
+        pointers,
+    } = &mut *scenes;
+    let scene = scene.get_or_insert_with(|| {
+        let target = new_target(
+            &mut commands,
+            &mut images,
+            &mut egui_textures,
+            size_px,
+            size_pts,
+            window_min,
+            theme.palette(),
+        );
+        let palette = InkPalette::new(
+            &mut buffers,
+            &mut materials,
+            // Canvas units per pixel: grain renders at full strength at
+            // 1x and stays crisp on HiDPI.
+            InkParams::new(1.0 / layout.scale),
+            &ink_assets,
+            theme.palette().paper_tone(),
+        );
+        PageScene {
+            note: note_id,
+            scale: layout.scale,
+            target,
+            palette,
+            assets_generation: ink_assets.generation,
+            layout_generation: None,
+            strokes: HashMap::new(),
+            committed: 0,
+            wet_serial: 0,
         }
-        let scene = scenes.scenes.get_mut(&sketch).expect("inserted above");
+    });
 
-        if scene.target.size != desired {
-            commands.entity(scene.target.camera).despawn();
-            egui_textures.remove_image(scene.target.image.id());
-            scene.target = new_target(
-                &mut commands,
-                &mut images,
-                &mut egui_textures,
-                &textures,
-                sketch,
-                scene.layer,
-                desired,
-                theme.palette(),
-            );
-        }
+    if scene.target.size_px != size_px {
+        commands.entity(scene.target.camera).despawn();
+        egui_textures.remove_image(scene.target.image.id());
+        scene.target = new_target(
+            &mut commands,
+            &mut images,
+            &mut egui_textures,
+            size_px,
+            size_pts,
+            window_min,
+            theme.palette(),
+        );
+    } else if scene.target.window_min != window_min {
+        // Scrolled: the camera follows the window.
+        commands
+            .entity(scene.target.camera)
+            .insert(camera_transform(window_min, size_pts));
+        scene.target.window_min = window_min;
+    }
+    page_texture.0 = Some(PageTarget {
+        texture: scene.target.texture,
+        size: to_egui(scene.target.size_pts),
+        window_min: to_egui(scene.target.window_min),
+    });
 
-        // New texture arrays: every stroke's layers may have moved, so
-        // restyle them all by respawning.
-        if scene.assets_generation != ink_assets.generation {
-            scene.assets_generation = ink_assets.generation;
-            scene.palette.set_assets(&mut materials, &ink_assets);
-            for drawn in scene.strokes.drain().filter_map(|(_, d)| d) {
-                commands.entity(drawn.entity).despawn();
-                scene.palette.remove(drawn.slot);
-            }
+    // New texture arrays: every stroke's layers may have moved, so
+    // restyle them all by respawning.
+    if scene.assets_generation != ink_assets.generation {
+        scene.assets_generation = ink_assets.generation;
+        scene.palette.set_assets(&mut materials, &ink_assets);
+        for drawn in scene.strokes.drain().filter_map(|(_, d)| d) {
+            commands.entity(drawn.entity).despawn();
+            scene.palette.remove(drawn.slot);
         }
+        scene.layout_generation = None;
+    }
 
-        // Diff committed elements.
-        let mut stale: HashMap<_, _> = scene.strokes.clone();
-        for (element, outline) in &outlines {
-            let id = element.id();
-            if stale.remove(&id).is_some() {
-                continue;
-            }
-            let drawn =
-                ink_mesh(&element.ink(), outline, StrokeEnd::Complete).map(|(mesh, style)| {
-                    let slot = scene.palette.insert(&style, &ink_assets);
-                    let z = committed_z(scene.committed);
-                    scene.committed = scene.committed.saturating_add(1);
-                    let (tag, material) = scene.palette.components(slot);
-                    let entity = commands
-                        .spawn((
-                            Mesh2d(meshes.add(mesh)),
-                            material,
-                            tag,
-                            Transform::from_xyz(0.0, 0.0, z),
-                            RenderLayers::layer(scene.layer),
-                        ))
-                        .id();
-                    InkEntity { entity, slot }
-                });
-            scene.strokes.insert(id, drawn);
-            // A committed element (stroke or snapped shape) replaces its
-            // wet-ink preview.
-            if let Some(wet) = scenes.wet.remove(&id)
-                && let Some(drawn) = wet.drawn
-            {
-                commands.entity(drawn.entity).despawn();
-                scene.palette.remove(drawn.slot);
-            }
-        }
-        for (id, drawn) in stale {
+    if scene.layout_generation == Some(layout.generation) {
+        return; // nothing moved and nothing changed
+    }
+    scene.layout_generation = Some(layout.generation);
+    let tolerance = DEFAULT_TOLERANCE / layout.scale;
+
+    // Diff committed elements; re-place the ones that stay.
+    let mut stale: HashMap<_, _> = scene.strokes.clone();
+    for el in note.page_elements() {
+        let id = el.element.id();
+        let origin = layout
+            .origins
+            .get(&id)
+            .map(|o| to_bevy(*o))
+            .unwrap_or_else(|| origin_of(galley, note, &el.anchor));
+        if let Some(drawn) = stale.remove(&id) {
             if let Some(drawn) = drawn {
-                commands.entity(drawn.entity).despawn();
-                scene.palette.remove(drawn.slot);
+                commands.entity(drawn.entity).insert(place(origin, drawn.z));
             }
-            scene.strokes.remove(&id);
+            continue;
         }
+        let outline = el.element.outline();
+        let drawn = ink_mesh(&el.element.ink(), &outline, StrokeEnd::Complete, tolerance).map(
+            |(mesh, style)| {
+                let slot = scene.palette.insert(&style, &ink_assets);
+                let z = committed_z(scene.committed);
+                scene.committed = scene.committed.saturating_add(1);
+                let (tag, material) = scene.palette.components(slot);
+                let entity = commands
+                    .spawn((
+                        Mesh2d(meshes.add(mesh)),
+                        material,
+                        tag,
+                        place(origin, z),
+                        RenderLayers::layer(LAYER),
+                    ))
+                    .id();
+                InkEntity { entity, slot, z }
+            },
+        );
+        scene.strokes.insert(id, drawn);
+        // A committed element (stroke or snapped shape) replaces its
+        // wet-ink preview.
+        if let Some(wet) = wet.remove(&id)
+            && let Some(drawn) = wet.drawn
+        {
+            commands.entity(drawn.entity).despawn();
+            scene.palette.remove(drawn.slot);
+        }
+    }
+    for (id, drawn) in stale {
+        if let Some(drawn) = drawn {
+            commands.entity(drawn.entity).despawn();
+            scene.palette.remove(drawn.slot);
+        }
+        scene.strokes.remove(&id);
+    }
+
+    // Wet strokes and pointers follow their lines too.
+    for wet in wet.values_mut() {
+        let origin = origin_of(galley, note, &wet.anchor);
+        wet.origin = Some(origin);
+        if let Some(drawn) = wet.drawn {
+            commands.entity(drawn.entity).insert(place(origin, drawn.z));
+        }
+    }
+    for pointer in pointers.values() {
+        let origin = origin_of(galley, note, &pointer.anchor);
+        pointer.dab.replace(&mut commands, origin);
+        pointer.ring.replace(&mut commands, origin);
     }
 }
 
-/// Upload every sketch's style edits after the frame's diffs.
+/// Upload the page's style edits after the frame's diffs.
 fn flush_palettes(
-    mut scenes: ResMut<SketchScenes>,
+    mut scenes: ResMut<PageScenes>,
     mut materials: ResMut<Assets<InkMaterial>>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
 ) {
-    scenes
-        .scenes
-        .values_mut()
-        .for_each(|scene| scene.palette.flush(&mut buffers, &mut materials));
+    if let Some(scene) = scenes.scene.as_mut() {
+        scene.palette.flush(&mut buffers, &mut materials);
+    }
 }
 
 /// z of the `k`th committed element; saturates far below the wet band.
@@ -580,11 +675,11 @@ fn wet_z(j: u16) -> f32 {
     WET_Z_BASE + f32::from(j) * Z_STEP
 }
 
-/// The theme changed: every sketch's paper takes the new colour and the
-/// highlighter re-specialises for its tone.
+/// The theme changed: the paper takes the new colour and the highlighter
+/// re-specialises for its tone.
 fn apply_theme(
     theme: Res<Theme>,
-    scenes: Res<SketchScenes>,
+    scenes: Res<PageScenes>,
     mut cameras: Query<&mut Camera>,
     mut materials: ResMut<Assets<InkMaterial>>,
 ) {
@@ -592,7 +687,7 @@ fn apply_theme(
         return;
     }
     let palette = theme.palette();
-    for scene in scenes.scenes.values() {
+    if let Some(scene) = scenes.scene.as_ref() {
         if let Ok(mut camera) = cameras.get_mut(scene.target.camera) {
             camera.clear_color = ClearColorConfig::Custom(palette.paper_color());
         }
@@ -602,24 +697,19 @@ fn apply_theme(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "every ECS handle a render target needs, threaded from one system"
-)]
 fn new_target(
     commands: &mut Commands,
     images: &mut Assets<Image>,
     egui_textures: &mut EguiUserTextures,
-    table: &SketchTextures,
-    sketch: SketchId,
-    layer: usize,
-    size: UVec2,
+    size_px: UVec2,
+    size_pts: Vec2,
+    window_min: Vec2,
     palette: &Palette,
 ) -> SceneTarget {
     let mut image = Image::new_fill(
         bevy::render::render_resource::Extent3d {
-            width: size.x,
-            height: size.y,
+            width: size_px.x.max(1),
+            height: size_px.y.max(1),
             depth_or_array_layers: 1,
         },
         bevy::render::render_resource::TextureDimension::D2,
@@ -629,15 +719,8 @@ fn new_target(
     );
     image.texture_descriptor.usage |= TextureUsages::RENDER_ATTACHMENT;
     let image = images.add(image);
+    let texture = egui_textures.add_image(EguiTextureHandle::Strong(image.clone()));
 
-    let texture_id = egui_textures.add_image(EguiTextureHandle::Strong(image.clone()));
-    table.0.lock().expect("sketch texture table").insert(
-        format!("{SKETCH_URI_PREFIX}{sketch}"),
-        (texture_id, egui::Vec2::new(size.x as f32, size.y as f32)),
-    );
-
-    // Canvas y grows down; meshes negate y, so the visible rect is
-    // [0, w] x [-h, 0], centred below.
     let camera = commands
         .spawn((
             Camera2d,
@@ -652,35 +735,38 @@ fn new_target(
             Msaa::Sample4,
             Projection::Orthographic(OrthographicProjection {
                 scaling_mode: ScalingMode::Fixed {
-                    width: size.x as f32,
-                    height: size.y as f32,
+                    width: size_pts.x,
+                    height: size_pts.y,
                 },
                 ..OrthographicProjection::default_2d()
             }),
-            Transform::from_xyz(size.x as f32 / 2.0, -(size.y as f32) / 2.0, 0.0),
-            RenderLayers::layer(layer),
+            camera_transform(window_min, size_pts),
+            RenderLayers::layer(LAYER),
         ))
         .id();
 
     SceneTarget {
         image,
+        texture,
         camera,
-        size,
+        size_px,
+        size_pts,
+        window_min,
     }
 }
 
-fn target_extent(content_max: f32) -> u32 {
-    let padded = (content_max + 64.0).ceil() as u32;
-    padded.next_multiple_of(64).clamp(MIN_TARGET, MAX_TARGET)
-}
-
-/// Canvas-space stroke mesh → bevy mesh (y flipped into bevy's y-up space)
+/// Anchor-space stroke mesh → bevy mesh (y flipped into bevy's y-up space)
 /// plus the style it draws with.
 /// `None` when there is nothing to draw: bevy's mesh allocator never
 /// allocates a zero-vertex mesh but still tries to upload it, logging a
 /// "Use-after-free" error every frame the mesh is extracted.
-fn ink_mesh(ink: &Ink<'_>, points: &[StrokePoint], end: StrokeEnd) -> Option<(Mesh, InkStyle)> {
-    bevy_mesh(ink.mesh(points, end, DEFAULT_TOLERANCE))
+fn ink_mesh(
+    ink: &Ink<'_>,
+    points: &[StrokePoint],
+    end: StrokeEnd,
+    tolerance: f32,
+) -> Option<(Mesh, InkStyle)> {
+    bevy_mesh(ink.mesh(points, end, tolerance))
 }
 
 /// A tessellated ink mesh as a bevy mesh (canvas y down → world y up).
@@ -763,16 +849,30 @@ fn device_color(device: DeviceId) -> Rgba {
 
 // ---- wet ink ----
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "bevy system; each param is a distinct ECS resource"
+)]
 fn apply_wet_ink(
     mut commands: Commands,
     mut frames: MessageReader<WetInkFrame>,
+    docs: Res<Docs>,
     editor: Res<EditorState>,
-    mut scenes: ResMut<SketchScenes>,
+    layout: Res<PageLayout>,
+    mut scenes: ResMut<PageScenes>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut latency: ResMut<WetLatency>,
     ink_assets: Res<InkAssets>,
 ) {
     let open_doc = editor.open.map(DocKey::from);
+    // The page on screen, if the editor has laid it out.
+    let page = match (editor.open, layout.galley.as_ref()) {
+        (Some(id), Some(galley)) if layout.note == Some(id) => {
+            docs.note(id).map(|note| (note, galley.as_ref()))
+        }
+        _ => None,
+    };
+    let tolerance = DEFAULT_TOLERANCE / layout.scale;
 
     for frame in frames.read() {
         if Some(frame.doc) != open_doc {
@@ -786,9 +886,9 @@ fn apply_wet_ink(
             }
         };
         match msg {
-            WetInk::Begin {
-                sketch,
+            WetInk::BeginAnchored {
                 stroke,
+                anchor,
                 tool,
                 color,
                 base_width,
@@ -801,17 +901,17 @@ fn apply_wet_ink(
                         None
                     }
                 });
-                let Some(layer) = scenes.scenes.get(&sketch).map(|s| s.layer) else {
-                    continue; // sketch not on screen yet; CRDT commit will cover it
-                };
+                if scenes.scene.is_none() {
+                    continue; // page not on screen yet; CRDT commit will cover it
+                }
                 scenes.despawn_wet(&mut commands, stroke);
                 scenes.wet.insert(
                     stroke,
                     WetStroke {
-                        sketch,
+                        anchor: Anchor(anchor),
+                        origin: None,
                         drawn: None,
                         mesh: None,
-                        layer,
                         tool,
                         color,
                         base_width,
@@ -845,7 +945,8 @@ fn apply_wet_ink(
                     }
                 }
                 let ink = wet.ink();
-                let Some((mesh, style)) = ink_mesh(&ink, &wet.points, StrokeEnd::Live) else {
+                let Some((mesh, style)) = ink_mesh(&ink, &wet.points, StrokeEnd::Live, tolerance)
+                else {
                     continue; // nothing drawable yet
                 };
                 match &wet.mesh {
@@ -855,9 +956,13 @@ fn apply_wet_ink(
                         }
                     }
                     None => {
-                        let Some(scene) = scenes.scenes.get_mut(&wet.sketch) else {
-                            continue; // sketch went away; the commit will cover it
+                        let (Some(scene), Some((note, galley))) = (scenes.scene.as_mut(), page)
+                        else {
+                            continue; // page went away; the commit will cover it
                         };
+                        let origin = *wet
+                            .origin
+                            .get_or_insert_with(|| origin_of(galley, note, &wet.anchor));
                         let slot = scene.palette.insert(&style, &ink_assets);
                         let z = wet_z(scene.wet_serial);
                         scene.wet_serial = (scene.wet_serial + 1) % WET_Z_SLOTS;
@@ -868,12 +973,12 @@ fn apply_wet_ink(
                                 Mesh2d(handle.clone()),
                                 material,
                                 tag,
-                                Transform::from_xyz(0.0, 0.0, z),
-                                RenderLayers::layer(wet.layer),
+                                place(origin, z),
+                                RenderLayers::layer(LAYER),
                             ))
                             .id();
                         wet.mesh = Some(handle);
-                        wet.drawn = Some(InkEntity { entity, slot });
+                        wet.drawn = Some(InkEntity { entity, slot, z });
                     }
                 }
             }
@@ -889,9 +994,10 @@ fn apply_wet_ink(
                         wet.points.extend(tail);
                     }
                     let ink = wet.ink();
-                    if let (Some(handle), Some((mesh, _))) =
-                        (&wet.mesh, ink_mesh(&ink, &wet.points, StrokeEnd::Complete))
-                        && let Err(err) = meshes.insert(handle, mesh)
+                    if let (Some(handle), Some((mesh, _))) = (
+                        &wet.mesh,
+                        ink_mesh(&ink, &wet.points, StrokeEnd::Complete, tolerance),
+                    ) && let Err(err) = meshes.insert(handle, mesh)
                     {
                         tracing::error!(%err, "wet-ink mesh update failed");
                     }
@@ -900,8 +1006,8 @@ fn apply_wet_ink(
             }
             // No stroke is coming (ruler drag, tool fiddling): drop it now.
             WetInk::Cancel { stroke } => scenes.despawn_wet(&mut commands, stroke),
-            WetInk::Pointer {
-                sketch,
+            WetInk::PointerAnchored {
+                anchor,
                 x,
                 y,
                 tilt,
@@ -911,6 +1017,11 @@ fn apply_wet_ink(
                 down,
                 ..
             } => {
+                let Some((note, galley)) = page else {
+                    continue; // nowhere to place it
+                };
+                let anchor = Anchor(anchor);
+                let origin = origin_of(galley, note, &anchor);
                 let dab =
                     tool.and_then(|tool| pointer_dab(tool, color, base_width, x, y, tilt, down));
                 // The eraser's ring is its reach; a tool's hugs the tip.
@@ -924,15 +1035,17 @@ fn apply_wet_ink(
                     &mut meshes,
                     &ink_assets,
                     frame.from,
-                    sketch,
+                    anchor,
+                    origin,
                     PointerLook { dab, ring },
                 );
             }
-            WetInk::PointerGone { .. } => scenes.despawn_pointer(&mut commands, frame.from),
-            // Page-layer wet ink: rendered once the page scene lands.
-            WetInk::BeginAnchored { .. }
-            | WetInk::PointerAnchored { .. }
-            | WetInk::PointerAnchoredGone => {}
+            WetInk::PointerAnchoredGone => scenes.despawn_pointer(&mut commands, frame.from),
+            // Embedded sketches are no longer shown on the desktop.
+            WetInk::Begin { sketch, .. } | WetInk::Pointer { sketch, .. } => {
+                tracing::debug!(%sketch, "sketch-keyed wet ink ignored");
+            }
+            WetInk::PointerGone { .. } => {}
         }
     }
 
@@ -980,4 +1093,36 @@ fn report_latency(latency: &mut WetLatency) {
 /// The ink texture arrays, before any scene exists.
 fn init_ink_assets(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     commands.insert_resource(InkAssets::new(&mut images));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_extent_rounds_and_clamps() {
+        assert_eq!(target_extent(0.0), MIN_TARGET);
+        assert_eq!(target_extent(300.0), 320);
+        assert_eq!(target_extent(320.0), 320);
+        assert_eq!(target_extent(1e6), MAX_TARGET);
+    }
+
+    #[test]
+    fn target_region_overscans_above_and_below() {
+        let (min, size) = target_region(Vec2::new(-4.0, 1000.0), Vec2::new(700.0, 500.0));
+        assert_eq!(min, Vec2::new(-4.0, 1000.0 - OVERSCAN));
+        assert_eq!(size, Vec2::new(704.0, 1024.0));
+    }
+
+    #[test]
+    fn camera_centres_on_region_with_y_flipped() {
+        let t = camera_transform(Vec2::new(0.0, 100.0), Vec2::new(200.0, 400.0));
+        assert_eq!(t.translation, Vec3::new(100.0, -300.0, 0.0));
+    }
+
+    #[test]
+    fn placement_negates_y_only() {
+        let t = place(Vec2::new(3.0, 7.0), 0.5);
+        assert_eq!(t.translation, Vec3::new(3.0, -7.0, 0.5));
+    }
 }
