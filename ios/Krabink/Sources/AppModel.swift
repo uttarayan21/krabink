@@ -74,7 +74,9 @@ final class AppModel {
         }
         UserDefaults.standard.set(uri, forKey: "pairURI")
         paired = info
-        syncState = "connecting"
+        // The node may already hold a connection (a peer dialled us, or
+        // the same workspace was re-adopted): read the state, don't guess.
+        refreshSyncState()
         applyDiscovery(info)
         // Announce this device in the synced registry so peers can list it.
         registerDevice()
@@ -170,6 +172,14 @@ final class AppModel {
     func resume() {
         discovery?.start()
         try? core.connect()
+        refreshSyncState()
+    }
+
+    /// Relabel from the core's current aggregate state. Pushed changes
+    /// keep it fresh afterwards; this covers the moments the label was
+    /// set locally.
+    func refreshSyncState() {
+        syncState = CoreEvents.label(core.syncState(), paired: paired != nil)
     }
 
     /// Background: close every connection so iOS doesn't kill us holding

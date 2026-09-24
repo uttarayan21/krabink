@@ -172,7 +172,10 @@ fn open_docs(shared: &Shared) -> Vec<(DocKey, Vec<u8>)> {
 }
 
 /// Report the aggregate [`SyncState`] whenever the node's peers, its relay
-/// health, or the app's online flag change.
+/// health, or the app's online flag change. `last` is what the listener
+/// has actually been told: a state reached before the app installed its
+/// listener is delivered as soon as it does (see [`Shared::poke`]), so the
+/// app never starts on a stale label.
 pub(crate) async fn watch_status(shared: Weak<Shared>, node: Node) {
     let mut peers = node.watch_peers();
     let mut relay = node.watch_relay();
@@ -182,11 +185,11 @@ pub(crate) async fn watch_status(shared: Weak<Shared>, node: Node) {
             return;
         };
         let state = sync_state(&strong, &node);
-        if last.as_ref() != Some(&state) {
-            let listener = strong.lock_state().core_listener.clone();
-            if let Some(listener) = listener {
-                listener.sync_state(state.clone());
-            }
+        let listener = strong.lock_state().core_listener.clone();
+        if let Some(listener) = listener
+            && last.as_ref() != Some(&state)
+        {
+            listener.sync_state(state.clone());
             last = Some(state);
         }
         drop(strong);

@@ -311,8 +311,12 @@ impl Core {
         }))
     }
 
+    /// Install the app's listener. The current sync state is pushed to it
+    /// right away, so a node that connected before the app was ready is
+    /// not reported as still connecting.
     pub fn set_listener(&self, listener: Arc<dyn CoreListener>) {
         self.shared.lock_state().core_listener = Some(listener);
+        self.shared.poke.notify_one();
     }
 
     /// All notes, newest edit first.

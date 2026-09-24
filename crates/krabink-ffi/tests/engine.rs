@@ -433,6 +433,38 @@ fn two_cores_converge_direct() {
     wait_for("offline edit reaches B", || note_b.text().unwrap() == "hi!");
 }
 
+/// A state reached before the app installs its listener (a peer dialled
+/// in during launch) is pushed the moment the listener lands, and a
+/// listener that dropped in and out never sees a stale label.
+#[test]
+fn late_listener_gets_current_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let core_a = Core::new(dir.path().join("a").to_str().unwrap().into()).unwrap();
+    let core_b = Core::new(dir.path().join("b").to_str().unwrap().into()).unwrap();
+
+    let mut pair = core_a.pair_info();
+    pair.addrs = vec![format!("127.0.0.1:{}", core_a.bound_port().unwrap())];
+    core_b.set_pairing(pair).unwrap();
+    // A is dialled by B; both are connected before either has a listener.
+    wait_for("B connects to A", || connected(&core_b.sync_state()));
+    wait_for("A lists B", || core_a.peers().iter().any(|p| p.inbound));
+
+    let rec_a = Arc::new(RecCore::default());
+    core_a.set_listener(rec_a.clone());
+    let rec_b = Arc::new(RecCore::default());
+    core_b.set_listener(rec_b.clone());
+    wait_for("A's listener hears connected", || {
+        rec_a.states.lock().unwrap().iter().any(connected)
+    });
+    wait_for("B's listener hears connected", || {
+        rec_b.states.lock().unwrap().iter().any(connected)
+    });
+    // No "connecting" was ever reported to B: it was told the state as it
+    // stood when it started listening.
+    let states = rec_b.states.lock().unwrap();
+    assert!(!states.contains(&SyncState::Connecting), "{states:?}");
+}
+
 #[test]
 fn two_cores_converge_through_relay() {
     let dir = tempfile::tempdir().unwrap();
