@@ -270,9 +270,13 @@ stroke, the committed stroke and every remote copy are the same geometry;
 wet ink carries the stage-1 points so receivers run the same fold. See
 `docs/plans/ink-renderer.md` and `docs/plans/brush-engine.md`.
 
-A sketch is one z-ordered list of `Element`s: freehand `Stroke`s and
-`ShapeElement`s (line, arrow, rectangle, ellipse, with reserved
-Excalidraw-style end bindings). Holding the Pencil still mid-stroke runs
+A note's ink is one z-ordered list of `Element`s (the `page` list, each
+element anchored to the source line it was drawn on by a Loro stable
+cursor): freehand `Stroke`s and `ShapeElement`s (line, arrow, rectangle,
+ellipse, with reserved Excalidraw-style end bindings). Ink and text share
+one surface: the styled markdown source on the iPad and the desktop, with
+a reading-view toggle that hides the markers and keeps the ink on its
+lines. Holding the Pencil still mid-stroke runs
 `shape::recognize` on the modelled points (hold trimming, arc-length
 resampling, ShortStraw corners, closure, PCA/corner fits, all thresholds
 relative to the stroke's size); a hit previews the snapped outline and

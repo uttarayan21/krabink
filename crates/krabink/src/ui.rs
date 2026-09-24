@@ -520,15 +520,7 @@ fn editor_ui(
                     };
                     palette.status_dot(ui, color, label);
                     ui.add_space(8.0);
-                    // Right-to-left: "Edit  Preview" read left to right.
-                    let mut preview = editor.preview;
-                    if ui.selectable_label(preview, "Preview").clicked() {
-                        preview = true;
-                    }
-                    if ui.selectable_label(!preview, "Edit").clicked() {
-                        preview = false;
-                    }
-                    editor.preview = preview;
+                    palette.toggle_switch(ui, &mut editor.preview, "Preview");
                 });
             });
             ui.add_space(12.0);

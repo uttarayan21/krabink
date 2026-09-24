@@ -60,10 +60,10 @@ the app actually does.
 - **Category**: Productivity.
 - **Screenshots**: iPad 13" and 12.9" (2nd/3rd gen) sets are required for
   iPad-only apps. Capture from the archive build on the M4 iPad Pro: note
-  list with a note open, markdown preview with an embedded sketch, the
-  sketch screen mid-stroke, settings with a paired desktop.
+  list with a note open, the reading view of a note with ink on it, the
+  page mid-stroke with the keyboard up, settings with a paired desktop.
 - **Review notes**: the app is fully usable unpaired (local notes and
-  sketches). Pairing needs a second device running the desktop app or
+  ink). Pairing needs a second device running the desktop app or
   `krabink-server`; say so, and that no account exists. If review asks
   for a demo of sync, point a `krabink-server --dev` at a public relay and
   put its `krabink://pair?…` URI in the notes: Settings → "join" accepts

@@ -401,6 +401,41 @@ impl Palette {
             ui.label(egui::RichText::new(label).color(self.text));
         });
     }
+
+    /// A labelled slide switch: `on` flips on click, the knob slides with
+    /// egui's animation. Returns the switch's response.
+    pub fn toggle_switch(&self, ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(label).color(self.text));
+            let size = Vec2::new(34.0, 18.0);
+            let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
+            if response.clicked() {
+                *on = !*on;
+                response.mark_changed();
+            }
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, label)
+            });
+            if ui.is_rect_visible(rect) {
+                let t = ui.ctx().animate_bool_responsive(response.id, *on);
+                let track = if *on {
+                    self.accent
+                } else if response.hovered() {
+                    self.surface_pressed
+                } else {
+                    self.surface_raised
+                };
+                let radius = 0.5 * rect.height();
+                ui.painter().rect_filled(rect, radius, track);
+                let x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), t);
+                let knob = if *on { self.on_accent } else { self.text };
+                ui.painter()
+                    .circle_filled(egui::pos2(x, rect.center().y), radius - 3.0, knob);
+            }
+            response
+        })
+        .inner
+    }
 }
 
 /// The active flavour. Change it with [`Theme::set_flavor`]; the

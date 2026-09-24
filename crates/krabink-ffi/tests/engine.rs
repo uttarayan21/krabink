@@ -128,7 +128,6 @@ impl CoreListener for RecCore {
 struct RecNote {
     synced: Mutex<u32>,
     text: Mutex<String>,
-    stroke_events: Mutex<Vec<String>>,
     page_events: Mutex<u32>,
     wet: Mutex<Vec<String>>,
     /// (stroke id, anchor) of every `wet_begin_anchored`.
@@ -148,26 +147,10 @@ impl NoteListener for RecNote {
         *self.page_events.lock().unwrap() += 1;
     }
 
-    fn strokes_changed(&self, sketch: String) {
-        self.stroke_events.lock().unwrap().push(sketch);
-    }
-
     fn wet_begin_anchored(
         &self,
         stroke: String,
         anchor: Vec<u8>,
-        _tool: Tool,
-        _color: u32,
-        _width: f32,
-        _spec: Option<Vec<u8>>,
-    ) {
-        self.wet_anchored.lock().unwrap().push((stroke, anchor));
-    }
-
-    fn wet_begin(
-        &self,
-        _sketch: String,
-        stroke: String,
         _tool: Tool,
         color: u32,
         width: f32,
@@ -178,6 +161,7 @@ impl NoteListener for RecNote {
             .lock()
             .unwrap()
             .push(format!("begin:{stroke}:{color:08x}:{width}{custom}"));
+        self.wet_anchored.lock().unwrap().push((stroke, anchor));
     }
 
     fn wet_points(&self, stroke: String, _sent_ms: u64, points: Vec<StrokePoint>) {
@@ -216,12 +200,12 @@ fn local_state_survives_reopen() {
     let note = core.clone().create_note("groceries".into()).unwrap();
     note.apply_text_edit(0, 0, "# groceries\n\nmilk".into())
         .unwrap();
-    let sketch = note.create_sketch().unwrap();
+    // Ink on the "milk" line (scalar 13).
+    let anchor = note.anchor_at(13).unwrap();
     let stroke_id = note
-        .begin_stroke(sketch.clone(), Tool::Pen, 0x1e3cc8ff, 3.0, None)
+        .begin_page_stroke(anchor.clone(), Tool::Pen, 0x1e3cc8ff, 3.0, None)
         .unwrap();
-    note.finish_stroke(
-        sketch.clone(),
+    note.finish_page_stroke(
         Stroke {
             id: stroke_id.clone(),
             tool: Tool::Pen,
@@ -232,6 +216,7 @@ fn local_state_survives_reopen() {
             created_ms: 1,
             brush: None,
         },
+        anchor,
         Vec::new(),
     )
     .unwrap();
@@ -250,11 +235,15 @@ fn local_state_survives_reopen() {
     let note = core.clone().open_note(note_id).unwrap();
     assert_eq!(note.text().unwrap(), "# groceries\n\nmilk");
     assert_eq!(note.title().unwrap().as_deref(), Some("groceries"));
-    let strokes = note.strokes(sketch).unwrap();
-    assert_eq!(strokes.len(), 1);
-    assert_eq!(strokes[0].id, stroke_id);
-    assert_eq!(strokes[0].color, 0x1e3cc8ff);
-    assert_eq!(strokes[0].points.len(), 16);
+    let page = note.page_elements().unwrap();
+    assert_eq!(page.len(), 1);
+    let Element::Stroke(stroke) = &page[0].element else {
+        panic!("expected a stroke, got {:?}", page[0].element);
+    };
+    assert_eq!(stroke.id, stroke_id);
+    assert_eq!(stroke.color, 0x1e3cc8ff);
+    assert_eq!(stroke.points.len(), 16);
+    assert_eq!(page[0].char_index, Some(13), "anchor resolves after reopen");
 }
 
 #[test]
@@ -263,7 +252,8 @@ fn bad_ids_are_rejected() {
     let core = Core::new(dir.path().to_str().unwrap().into()).unwrap();
     assert!(core.clone().open_note("not-a-ulid".into()).is_err());
     let note = core.clone().create_note("x".into()).unwrap();
-    assert!(note.strokes("nope".into()).is_err());
+    assert!(note.remove_page_element("nope".into()).is_err());
+    assert!(note.resolve_anchor(vec![1, 2, 3]).unwrap().is_none());
     assert!(
         core.set_pairing(PairInfo {
             node: "not-a-key".into(),
@@ -578,22 +568,17 @@ fn two_cores_converge_through_relay() {
     });
     assert_eq!(*rec_b.text.lock().unwrap(), "# hello from A");
 
-    // Sketch + live ink: wet events stream ephemerally, then the committed
-    // stroke lands in the CRDT.
-    let sketch = note_a.create_sketch().unwrap();
-    wait_for("sketch reaches B", || {
-        note_b.sketch_ids().unwrap().contains(&sketch)
-    });
-
+    // Page ink + live ink: wet events stream ephemerally, then the committed
+    // stroke lands in the page layer, anchored to its line.
+    let anchor = note_a.anchor_at(0).unwrap();
     let stroke_id = note_a
-        .begin_stroke(sketch.clone(), Tool::Pen, 0x1e3cc8ff, 3.0, None)
+        .begin_page_stroke(anchor.clone(), Tool::Pen, 0x1e3cc8ff, 3.0, None)
         .unwrap();
     note_a
         .append_points(stroke_id.clone(), 1, polyline(2))
         .unwrap();
     note_a
-        .finish_stroke(
-            sketch.clone(),
+        .finish_page_stroke(
             Stroke {
                 id: stroke_id.clone(),
                 tool: Tool::Pen,
@@ -604,20 +589,23 @@ fn two_cores_converge_through_relay() {
                 created_ms: 2,
                 brush: None,
             },
+            anchor.clone(),
             polyline(1),
         )
         .unwrap();
 
     wait_for("stroke reaches B", || {
         note_b
-            .strokes(sketch.clone())
-            .map(|s| s.len() == 1)
+            .page_elements()
+            .map(|p| p.len() == 1)
             .unwrap_or(false)
     });
-    let strokes = note_b.strokes(sketch.clone()).unwrap();
-    assert_eq!(strokes[0].id, stroke_id);
-    assert_eq!(strokes[0].points.len(), 16);
-    assert!(rec_b.stroke_events.lock().unwrap().contains(&sketch));
+    let page = note_b.page_elements().unwrap();
+    assert_eq!(page[0].element.id(), stroke_id);
+    assert!(matches!(&page[0].element, Element::Stroke(s) if s.points.len() == 16));
+    assert_eq!(page[0].anchor, anchor);
+    assert_eq!(page[0].char_index, Some(0));
+    assert!(*rec_b.page_events.lock().unwrap() > 0);
 
     let wet = rec_b.wet.lock().unwrap().clone();
     assert!(
@@ -635,15 +623,14 @@ fn two_cores_converge_through_relay() {
     );
 
     // A snapped shape: wet ink streams under an id, the shape commits
-    // under the same id, and B is told the sketch changed (the change
+    // under the same id, and B is told the page changed (the change
     // detection must count shapes, not just strokes).
-    let events_before = rec_b.stroke_events.lock().unwrap().len();
+    let events_before = *rec_b.page_events.lock().unwrap();
     let shape_id = note_a
-        .begin_stroke(sketch.clone(), Tool::Marker, 0xff0000ff, 5.0, None)
+        .begin_page_stroke(anchor.clone(), Tool::Marker, 0xff0000ff, 5.0, None)
         .unwrap();
     note_a
-        .finish_shape(
-            sketch.clone(),
+        .finish_page_shape(
             ShapeElement {
                 id: shape_id.clone(),
                 shape: Shape::Rect {
@@ -658,17 +645,18 @@ fn two_cores_converge_through_relay() {
                 end: None,
                 created_ms: 3,
             },
+            anchor.clone(),
         )
         .unwrap();
     wait_for("shape reaches B", || {
         note_b
-            .elements(sketch.clone())
+            .page_elements()
             .map(|e| e.len() == 2)
             .unwrap_or(false)
     });
-    let elements = note_b.elements(sketch.clone()).unwrap();
-    assert!(matches!(&elements[0], Element::Stroke(s) if s.id == stroke_id));
-    match &elements[1] {
+    let page = note_b.page_elements().unwrap();
+    assert!(matches!(&page[0].element, Element::Stroke(s) if s.id == stroke_id));
+    match &page[1].element {
         Element::Shape(s) => {
             assert_eq!(s.id, shape_id);
             assert!(matches!(s.shape, Shape::Rect { size, .. } if size.x == 100.0));
@@ -676,10 +664,10 @@ fn two_cores_converge_through_relay() {
         }
         other => panic!("expected the shape, got {other:?}"),
     }
-    assert_eq!(note_b.strokes(sketch.clone()).unwrap().len(), 1);
+    assert_eq!(page[1].char_index, Some(0));
     assert!(
-        rec_b.stroke_events.lock().unwrap().len() > events_before,
-        "strokes_changed must fire for a remote shape"
+        *rec_b.page_events.lock().unwrap() > events_before,
+        "page_changed must fire for a remote shape"
     );
     assert!(
         rec_b

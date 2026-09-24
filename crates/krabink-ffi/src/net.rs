@@ -344,21 +344,6 @@ fn dispatch_wet(shared: &Shared, doc: DocKey, payload: &[u8]) {
         return;
     };
     match ink {
-        WetInk::Begin {
-            sketch,
-            stroke,
-            tool,
-            color,
-            base_width,
-            spec,
-        } => listener.wet_begin(
-            sketch.to_string(),
-            stroke.to_string(),
-            tool.into(),
-            rgba_to_u32(color),
-            base_width,
-            spec,
-        ),
         WetInk::Points {
             stroke, sent_ms, ..
         }
@@ -394,8 +379,10 @@ fn dispatch_wet(shared: &Shared, doc: DocKey, payload: &[u8]) {
             base_width,
             spec,
         ),
-        // Remote pointers are rendered on the desktop only for now.
-        WetInk::Pointer { .. }
+        // Sketch-keyed wet ink predates the page layer and has nothing to
+        // land on; remote pointers are rendered on the desktop only for now.
+        WetInk::Begin { .. }
+        | WetInk::Pointer { .. }
         | WetInk::PointerGone { .. }
         | WetInk::PointerAnchored { .. }
         | WetInk::PointerAnchoredGone => {}
@@ -411,7 +398,6 @@ enum Notify {
     Devices(Arc<dyn CoreListener>, Vec<DeviceInfo>),
     Text(Arc<dyn NoteListener>, String),
     Page(Arc<dyn NoteListener>),
-    Strokes(Arc<dyn NoteListener>, String),
 }
 
 impl Notify {
@@ -423,7 +409,6 @@ impl Notify {
             Self::Devices(listener, devices) => listener.devices_changed(devices),
             Self::Text(listener, text) => listener.text_changed(text),
             Self::Page(listener) => listener.page_changed(),
-            Self::Strokes(listener, sketch) => listener.strokes_changed(sketch),
         }
     }
 }
@@ -482,7 +467,6 @@ impl ClientDocs for Docs<'_> {
         };
         let text_before = note.doc.text();
         let page_before = note.doc.page_len();
-        let counts_before = sketch_counts(&note.doc);
         let changed = note.doc.import_update(payload)?;
         state.store.append_update(doc, payload, Flush::Eventual)?;
         if let Some(listener) = note.listener.clone() {
@@ -494,22 +478,7 @@ impl ClientDocs for Docs<'_> {
             // Page elements are only ever added/removed whole, so a length
             // diff catches every change.
             if note.doc.page_len() != page_before {
-                self.pending.push(Notify::Page(listener.clone()));
-            }
-            // Strokes are only ever added/removed whole, so a per-sketch count
-            // diff catches every change.
-            let counts_after = sketch_counts(&note.doc);
-            for (sketch, count) in &counts_after {
-                if counts_before.get(sketch) != Some(count) {
-                    self.pending
-                        .push(Notify::Strokes(listener.clone(), sketch.to_string()));
-                }
-            }
-            for sketch in counts_before.keys() {
-                if !counts_after.contains_key(sketch) {
-                    self.pending
-                        .push(Notify::Strokes(listener.clone(), sketch.to_string()));
-                }
+                self.pending.push(Notify::Page(listener));
             }
         }
         Ok(changed)
@@ -528,16 +497,4 @@ impl ClientDocs for Docs<'_> {
                 .unwrap_or_else(|| Ok(Vec::new()))
         }
     }
-}
-
-fn sketch_counts(
-    doc: &krabink_core::NoteDoc,
-) -> std::collections::HashMap<krabink_core::SketchId, usize> {
-    doc.sketch_ids()
-        .into_iter()
-        .map(|sketch| {
-            let count = doc.elements(sketch).map(|s| s.len()).unwrap_or(0);
-            (sketch, count)
-        })
-        .collect()
 }

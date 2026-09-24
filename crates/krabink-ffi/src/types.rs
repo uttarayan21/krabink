@@ -145,7 +145,7 @@ impl From<pcore::StrokePoint> for StrokePoint {
 /// A finished stroke, as stored in the CRDT.
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct Stroke {
-    /// ULID string; use the id returned by `begin_stroke` so receivers can
+    /// ULID string; use the id returned by `begin_page_stroke` so receivers can
     /// swap provisional wet ink for this committed stroke.
     pub id: String,
     pub tool: Tool,

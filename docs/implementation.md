@@ -1,7 +1,7 @@
 # Krabink: stack and implementation
 
-State of the tree on branch `research-brush-strokes` at `34e7ab5`
-(2026-09-18). This is the map: what the stack is, where each piece lives,
+State of the tree on branch `unify-text-draw-canvas` (2026-09-24). This
+is the map: what the stack is, where each piece lives,
 and how the pieces talk to each other. The design rationale lives in the
 plans (`docs/plans/*.md`, each with per-phase implementation notes) and the
 sync topology in `docs/architecture.md`; this document points at them
@@ -12,14 +12,15 @@ rather than repeating them.
 | Layer | Technology | Where |
 |---|---|---|
 | Language, toolchain | Rust, edition 2024, workspace resolver 3; nix flake (crane) for CI, dev shells and packages | `Cargo.toml`, `flake.nix` |
-| Document model | Loro 1.13 CRDT wrapped so no Loro type escapes; postcard for wire and chunk encoding; ULID ids | `crates/krabink-core/src/{note,workspace,sync_doc,ids,stroke}.rs` |
+| Document model | Loro 1.13 CRDT wrapped so no Loro type escapes; postcard for wire and chunk encoding; ULID ids; Loro stable cursors as ink anchors | `crates/krabink-core/src/{note,workspace,sync_doc,ids,stroke,element}.rs` |
+| Markdown | pulldown-cmark 0.13 (strikethrough, task lists) → style runs over the source and a reading-view text with a source map | `crates/krabink-core/src/markdown.rs` |
 | Persistence | redb 4 (`snapshots` + `updates` tables keyed by `DocKey(u128)`) | `crates/krabink-core/src/store.rs` |
 | Sync protocol | sans-io state machines, one version byte + postcard frame; QUIC lanes or in-process channels underneath | `crates/krabink-core/src/sync.rs` |
 | Ink | `BrushSpec` presets, EMA input model, tip evaluator, lyon 1.0 stroker and a convex-hull nib sweeper, one `InkMesh` type | `crates/krabink-core/src/{brush,geom}/` |
 | Shapes | deterministic draw-and-hold recogniser (ShortStraw corners, PCA fits) | `crates/krabink-core/src/shape.rs` |
 | Sync node | iroh 1.2 `Endpoint` (hole punching, relay fallback), redb mirror of every doc, hub fan-out, mDNS (`_krabink._udp`, feature `mdns`) | `crates/krabink-local` |
 | Cloud | iroh relay (`iroh-relay` server, workspace-token access control) + headless replica node in one binary | `crates/krabink-server` |
-| Desktop | Bevy 0.19.1 (`wayland`), bevy_egui 0.42, egui_commonmark 0.25, custom `Material2d` + WGSL; runs a `krabink-local` node in-process | `crates/krabink` |
+| Desktop | Bevy 0.19.1 (`wayland`), bevy_egui 0.42, custom `Material2d` + WGSL; runs a `krabink-local` node in-process | `crates/krabink` |
 | iPad bridge | UniFFI 0.32 proc-macro bindings, staticlib per iOS target, XCFramework + generated `Krabink.swift` in a local SPM package | `crates/krabink-ffi`, `ios/KrabinkCore` |
 | iPad app | SwiftUI + UIKit, iOS 17 deployment target, Metal renderer (4x MSAA, sRGB, depth), PencilKit only as the tool picker, VisionKit QR scanner, Bonjour discovery; XcodeGen project | `ios/Krabink` |
 
@@ -50,11 +51,24 @@ sits above it.
 ### 3.1 Documents
 
 - `NoteDoc` (`note.rs`): one Loro doc per note. Containers: `meta` (title),
-  `text` (markdown), `sketches`, and per sketch an element list stored
-  under the key `strokes` where each entry is tagged `elem = stroke | shape`.
-  API is text splice, title, create sketch, add/remove stroke or shape,
-  `elements()` in z order, and the CRDT triad `version`,
-  `export_updates_since`, `import_update`, `export_snapshot`.
+  `text` (markdown) and the root movable list `page`: the note's ink, one
+  map per element (`elem = stroke | shape`, the stroke or shape fields,
+  and `anchor`). A root container exists implicitly, so two devices
+  drawing offline before their first sync simply union. An **anchor** is
+  an encoded Loro stable cursor on the first char of the source line the
+  ink was drawn on: `anchor_at(char_index)` makes one, `resolve_anchor`
+  turns it back into a unicode-scalar index in the current text (a
+  deleted line resolves to its deletion point; the refreshed cursor is
+  cached per anchor, since that resolution costs a Loro diff), and
+  `page_elements()` returns `PageElement { element, anchor }` in z order
+  with `add_page_stroke` / `add_page_shape` / `remove_page_element` /
+  `page_len` beside it. Element points are stored relative to `(text
+  container left edge, top of the line's first fragment)` at a 16 pt body
+  font on every platform. The legacy `sketches` container (per-sketch
+  element lists under `strokes`, `create_sketch`, `elements(sketch)`)
+  stays readable for old notes and the exporter but nothing writes it.
+  Text splice, title and the CRDT triad `version`,
+  `export_updates_since`, `import_update`, `export_snapshot` as before.
 - `WorkspaceDoc` (`workspace.rs`): registry of notes (`NoteMeta`) and paired
   devices (`DeviceMeta`) so the library UI never opens every note.
 - `SyncDoc` (`sync_doc.rs`): semantics-free import/export/version; what the
@@ -64,7 +78,8 @@ sits above it.
 - Ids (`ids.rs`): `NoteId`, `SketchId`, `StrokeId`, `ElementId`, `DeviceId`,
   all ULIDs; `seed()` yields the low 32 bits for stroke-mapped grain.
 - `export.rs`: markdown export rewriting `krabink://sketch/<id>` embeds to
-  SVG assets rendered from the elements through `geom/outline.rs`.
+  SVG assets rendered from the elements through `geom/outline.rs`. Page
+  ink is not exported yet (it has no layout-independent position).
 - `pair.rs`: `PairInfo` ⇄ `krabink://pair?server=…&token=…[&alt=…][&fallback=…][&relay=…]`.
 
 ### 3.2 Sync protocol (`sync.rs`)
@@ -91,15 +106,18 @@ Ephemeral payloads are opaque to the protocol; wet ink is one of them.
 - `Element` (`element.rs`): `Stroke(Stroke)` or `Shape(ShapeElement)`.
   `ShapeElement` holds a `Shape` (line, arrow, rectangle, ellipse), a
   `Style` and reserved Excalidraw-style `Binding`s.
-- `WetInk` (`wetink.rs`): `Begin{sketch, stroke, tool, color, base_width,
-  spec}` → `Points{seq, sent_ms, chunks}`* → `End{tail}` or `Cancel`. The
-  points are the modelled stage-1 points, so a receiver runs the identical
-  fold and the commit replaces the provisional ink without a visible change.
-  `Pointer{sketch, x, y, tilt, tool, color, base_width, down}` /
-  `PointerGone{sketch}` share the lane: where the sender's pen is (hovering
-  or drawing; `tool == None` is the eraser), throttled to ~30 Hz on the
-  iPad, keyed by the `from` device on receipt. Variants are append-only;
-  older receivers log-and-drop what they cannot decode.
+- `WetInk` (`wetink.rs`): `BeginAnchored{stroke, anchor, tool, color,
+  base_width, spec}` → `Points{seq, sent_ms, chunks}`* → `End{tail}` or
+  `Cancel`. The points are the modelled stage-1 points in the anchor's
+  space, so a receiver runs the identical fold and the commit replaces the
+  provisional ink without a visible change. `PointerAnchored{anchor, x, y,
+  tilt, tool, color, base_width, down}` / `PointerAnchoredGone` share the
+  lane: where the sender's pen is (hovering or drawing; `tool == None` is
+  the eraser), throttled to ~30 Hz on the iPad, keyed by the `from` device
+  on receipt. The sketch-keyed `Begin{sketch, …}` / `Pointer{sketch, …}` /
+  `PointerGone{sketch}` still decode (postcard tags are declaration order)
+  and every receiver drops them. Variants are append-only; older receivers
+  log-and-drop what they cannot decode.
 
 ### 3.4 Ink pipeline (`brush/`, `geom/`)
 
@@ -191,6 +209,26 @@ confidence; pen-up commits a `ShapeElement` under the wet stroke's id.
   behind `InputModelKind::Ism` / `BrushModeler::with_model`; the P4 trial,
   not what the canvas uses (decision in `docs/plans/brush-engine.md`).
 
+### 3.7 Markdown (`markdown.rs`)
+
+Both editors show the markdown source itself, styled in place, so the
+view text always equals the CRDT text. `style_runs(text)` parses with
+pulldown-cmark (strikethrough and task lists on) and returns
+`StyleRun { start, end, kind }` in unicode scalars: `Heading{level}`,
+`Strong`, `Emphasis`, `Strikethrough`, `CodeSpan`, `CodeBlock`,
+`ListItem{depth, ordered}`, `BlockQuote`, `Link`, `ThematicBreak`, and
+`Marker` for the syntax itself (`# `, `**`, `- `, `1. `, `> `, fences,
+backticks, `[`/`](url)`, `[ ]`), found by the gap rule: inside each block
+span, whatever is not covered by a leaf event, split on whitespace. Runs
+are sorted by start, outer before inner, and block kinds cover whole
+source lines. `preview_text(text)` builds the reading view from the same
+runs: `PreviewText { text, source_of, runs }` is the source with markers
+dropped (bullets become `•` / `◦`, task boxes `☐` / `☑`, ordinal markers
+and rules kept, fence-only lines removed), a display-char → source-char
+map (one sentinel past the end) and the runs remapped onto the display
+text. Both platforms translate ink anchors through `source_of` so the
+same ink sits on the same line in either view.
+
 ## 4. Sync node (`krabink-local`) and cloud (`krabink-server`)
 
 Every device runs one `krabink_local::Node`: an iroh `Endpoint` with a
@@ -234,17 +272,32 @@ Bevy app with egui UI. Modules:
 - `sync.rs`: one `ClientSession` over the node's `LocalLink`, driven once
   per frame; the node does peers, relay and fan-out. See
   `docs/architecture.md`.
-- `ui.rs`: library sidebar, markdown editor bound to the CRDT by
-  prefix/suffix diffing, live preview. `settings.rs`: sync state, devices,
-  pairing QR, paste-to-join.
-- `sketch.rs`: each sketch is an off-screen Bevy scene (own render layer and
-  camera) rendered into an `Image` and handed to egui through a
-  `krabink://` texture loader. Committed elements are ink meshes at z
-  `k/100`; remote wet strokes at `990 + j/100` (900 slots) are dropped when
-  the commit lands or on timeout. Peers' pens draw above that at 999.2
-  (the tool's hover dab, faint hovering / stronger drawing) and 999.4 (a
-  monoline ring in a per-device hue); a pointer dies on `PointerGone` or
-  after 1.5 s of silence.
+- `ui.rs`: library sidebar and one styled editor per note: an egui
+  `TextEdit` with a custom layouter that turns the core's style runs into
+  a `LayoutJob` (16 pt body, heading sizes 16×{1.6, 1.4, 1.25, 1.1},
+  markers muted, code monospace on the raised surface, list indents;
+  `StyledCache` recomputes the runs once per edit), bound to the CRDT by
+  prefix/suffix diffing on `changed()`. A "Preview" slide switch swaps the
+  buffer for `preview_text` in the same read-only `TextEdit`
+  (`PreviewCache`). Each frame the open note writes a `PageLayout`
+  resource: the galley, the visible window, and every page element's
+  origin (`resolve_anchor` → `pos_from_cursor`, translated through the
+  preview's source map when it is showing; unresolvable anchors go to the
+  end of the text). The page texture is painted under the text at the
+  scrolled rect. `settings.rs`: sync state, devices, pairing QR,
+  paste-to-join.
+- `sketch.rs`: the page ink is one off-screen Bevy scene (own render layer
+  and camera) rendered into an `Image` the size of the visible window
+  (rounded to 64 px, 256 px vertical overscan, capped at 4096) with the
+  paper colour as its opaque clear colour, so the marker's multiply blend
+  has paper to multiply against. Element meshes are built once in anchor
+  space and only their `Transform` moves when `PageLayout` changes.
+  Committed elements sit at z `k/100`; remote wet strokes at `990 + j/100`
+  (900 slots) are dropped when the commit lands or on timeout. Peers' pens
+  draw above that at 999.2 (the tool's hover dab, faint hovering /
+  stronger drawing) and 999.4 (a monoline ring in a per-device hue); a
+  pointer dies on `PointerAnchoredGone` or after 1.5 s of silence. The
+  desktop shows page ink; it does not draw.
 - `lab.rs`: `krabink brush-lab --corpus <file|dir> --presets … --models
   ema,ism --out dir --svg --metrics`, the tuning bench: SVG grids per
   recording through `elements_to_svg` and `metrics.json` from
@@ -254,7 +307,7 @@ Bevy app with egui UI. Modules:
   the workspace's assets, rebuilt when `asset_ids()` changes; scenes
   respawn their strokes when its generation moves.
 - `ink_material.rs` + `ink.wgsl`: the desktop twin of the Metal pipeline.
-  One `Material2d` per `InkCombo` (blend × overlap, four per sketch)
+  One `Material2d` per `InkCombo` (blend × overlap, four for the page)
   sharing one `InkPalette` storage buffer of `StrokeStyle`; each mesh
   carries a `MeshTag` index into it plus the custom `ATTRIBUTE_INK_UV` and
   `ATTRIBUTE_INK_OPACITY` vertex attributes. Reversed-Z: accumulate runs
@@ -273,13 +326,20 @@ UniFFI proc macros (`uniffi::setup_scaffolding!("krabink")`), no UDL.
 - `engine.rs`: `Core` (store, the in-process `krabink-local` node, note
   registry; `create_note`, `open_note`, `set_pairing(PairInfo)`,
   `add_peer_addr`, `connect`, `suspend`, `network_changed`, `node_id`,
-  `bound_port`, `peers`, `sync_state`, `pair_info`, device registry) and `NoteSession` (text edits, title,
-  sketches, `elements`, `begin_stroke` / `append_points` / `finish_stroke` /
-  `cancel_stroke`, `finish_shape`, `erase_at`, `remove_element`). Events
-  come back through the foreign traits `CoreListener` (`notes_changed`,
-  `brushes_changed`, `sync_state`) and `NoteListener` (`synced`,
-  `text_changed`, `strokes_changed`, `wet_begin` / `wet_points` /
-  `wet_end` / `wet_cancel`, `assets_changed`). `Core` also owns the shared
+  `bound_port`, `peers`, `sync_state`, `pair_info`, device registry) and
+  `NoteSession` (`text`, `apply_text_edit`, title; page ink: `anchor_at`,
+  `resolve_anchor` / `resolve_anchors`, `page_elements` (each element with
+  its anchor resolved to a `char_index`), `begin_page_stroke` /
+  `append_points` / `finish_page_stroke` / `cancel_stroke`,
+  `finish_page_shape`, `erase_page_at` (one probe per element, in that
+  element's anchor space, hit-tested in the core), `remove_page_element`,
+  `send_page_pointer` / `send_page_pointer_gone`). Events come back
+  through the foreign traits `CoreListener` (`notes_changed`,
+  `brushes_changed`, `assets_changed`, `devices_changed`, `sync_state`)
+  and `NoteListener` (`synced`, `text_changed`, `page_changed`,
+  `wet_begin_anchored` / `wet_points` / `wet_end` / `wet_cancel`).
+  `page_changed` fires when an import changes the page list's length
+  (elements are only ever added or removed whole). `Core` also owns the shared
   brush library (`list_brushes` / `upsert_brush` / `remove_brush`) and
   asset library (`list_assets` / `put_asset` / `remove_asset`) next to
   `builtin_brushes()`, `builtin_assets()` and the `brush_knobs` /
@@ -296,9 +356,15 @@ UniFFI proc macros (`uniffi::setup_scaffolding!("krabink")`), no UDL.
   `resize_shape`, `stroke_seed`. Meshes cross the boundary as byte buffers
   (`INK_VERTEX_FLOATS` floats per vertex) rather than element-wise lifts,
   which is what made 1000-point live strokes redraw in under 2 ms.
-- `types.rs`: Swift-facing records and enums mirroring the core.
-- `tests/engine.rs`: local persistence and a two-client round trip through
-  the real relay router.
+- `markdown.rs`: `style_runs` and `preview_text` as free functions with
+  `StyleRun` / `StyleKind` / `PreviewText` records.
+- `types.rs`: Swift-facing records and enums mirroring the core
+  (`PageElement`, `PageProbe` among them).
+- `tests/engine.rs`: local persistence, two-client round trips (direct and
+  through the real relay router) including page ink and anchored wet ink,
+  eraser probes, style runs. `examples/probe.rs` is the UI-test harness's
+  remote peer: `--expect`, `--append`, `--add-page-stroke LINE`,
+  `--expect-page-elements N`, `--wet-watch`, `--devices`.
 
 Build: `scripts/build-ios-core.sh` builds `staticlib` for
 `aarch64-apple-ios` and `aarch64-apple-ios-sim`, runs library-mode bindgen
@@ -313,32 +379,55 @@ iOS 17, iPad and iPhone, `krabink://` URL scheme, camera, local network and
 Bonjour usage strings, file sharing for recordings).
 
 - `KrabinkApp.swift`, `AppModel.swift`: owns the UniFFI `Core`, the note
-  list and one `NoteModel` per open note. Listener callbacks arrive on the
-  Rust network thread and hop to the main actor. `-spike 1` and
-  `-brushLab 1` replace the main UI.
-- `MarkdownTextView.swift`: UITextView with a two-way CRDT binding.
-  `MarkdownRenderer.swift`: Foundation cmark-gfm parse (`AttributedString`,
-  `.full`) turned into TextKit styling — headings, bullets/numbers with
-  hanging indents, task boxes, quotes, code blocks, tab-stop tables, rules,
-  links; images resolved by a caller callback. `SketchPreview.swift`:
-  read-only preview on top of it with tappable sketch thumbnails.
+  list and one `NoteModel` per open note (each with its `PageInkModel`,
+  cached with the note). Listener callbacks arrive on the Rust network
+  thread and hop to the main actor. `NoteDetail` is the note page on a
+  card with an Edit / Preview toggle, erase-last, and on iOS 17 a brush
+  sheet. `-spike 1` and `-brushLab 1` replace the main UI.
+- `NoteCanvasView.swift`: the one surface per note. A TextKit 1
+  `UITextView` (`usingTextLayoutManager: false`: eager, deterministic line
+  fragments) over an opaque Metal view cleared to the paper colour, so
+  ink renders under the text and the highlighter multiplies against
+  paper. The CRDT binding is shadow-based: a local edit is diffed against
+  the shadow (`TextSplice.of`), a remote text arriving while a local
+  splice is pending is reconciled by transforming the local splice past
+  the remote one (`TextSplice.transformed(past:)`) and rewriting the view
+  from the merged CRDT text with the caret remapped, so neither side's
+  keystrokes are lost or applied at stale offsets. In preview the view
+  goes read-only and shows `previewText` restyled from its runs.
+  `LineLayout.swift`: `ScalarIndex` (unicode scalar ↔ UTF-16) and
+  `LineLayout`, the forward map scalar → top of its line's first fragment
+  and the inverse point → line, both translated through the preview's
+  `sourceOf` map so the ink model only ever sees source scalars.
+  `MarkdownStyler.swift`: applies the core's style runs as TextKit
+  attributes over the whole text after every edit (attribute-only edits
+  do not fire `textViewDidChange` or move the selection).
 - `SettingsScreen.swift`, `PairScreen.swift`, `ScanScreen.swift`,
   `PeerDiscovery.swift`: peers and routes, device registry, pairing QR out
   and in (VisionKit), Bonjour lookup (`_krabink._udp`, UDP resolve) of the
   paired desktop for the relay-less LAN.
-- `SketchScreen.swift`: the canvas. A `UIScrollView` owns finger pan, zoom
-  and inertia over an empty content view; the Metal view sits above it
-  pinned to the screen and reads the scroll state into its `Viewport`.
-  `PenGestureRecognizer` captures pencil touches (coalesced and predicted)
-  and `touchesEstimatedPropertiesUpdated`; `SketchModel` feeds them to the
-  core `BrushModeler`, streams wet batches every 60 ms, draws the live mesh
-  from `liveMesh`, coalesces estimate redraws to one per run-loop pass,
-  waits up to a settle timeout for pending estimates before commit, arms
-  draw-and-hold for shape snapping with a haptic, resizes a snapped shape on
-  drag, erases by hit-testing elements in the core, and shows the hover dab
-  from a `UIHoverGestureRecognizer`. Remote wet ink and `strokesChanged`
-  diffs are deferred while a local pen is down. `StrokeRecorder` writes
-  recorder v2 files under Documents when launched with `-recordStrokes 1`.
+- `PenInput.swift`: `PenGestureRecognizer` on the text view captures
+  Pencil touches (coalesced and predicted) and
+  `touchesEstimatedPropertiesUpdated`; every other recogniser on the text
+  view must fail first, Scribble is refused, and fingers scroll and place
+  the caret. On the simulator or under `-anyInput 1` a finger inks too
+  (a short, still touch is a tap for the caret; two fingers scroll).
+  `StrokeRecorder` writes recorder v2 files under Documents when launched
+  with `-recordStrokes 1`.
+- `PageInkModel.swift`: pen-down asks the layout for the line under the
+  pen, takes an anchor for it and translates every sample into that
+  line's space; it feeds the core `BrushModeler`, streams wet batches
+  every 60 ms, draws the live mesh from `liveMesh`, coalesces estimate
+  redraws to one per run-loop pass, waits up to a settle timeout for
+  pending estimates before commit, arms draw-and-hold for shape snapping
+  with a haptic, resizes a snapped shape on drag, erases by hit-testing
+  elements in the core (one probe per element in reach), and shows the
+  hover dab from a `UIHoverGestureRecognizer`. `layoutChanged()` (coalesced
+  from `NSLayoutManagerDelegate`) re-resolves every anchor and moves the
+  placed, wet, settling and live ink to its line's new origin, so ink
+  follows its line while typing above it. Remote wet ink and `pageChanged`
+  diffs are deferred while a local pen is down. The status line the UI
+  tests read: `strokes= shapes= wetSent= wetRecv= est= custom= originY=`.
 - `StrokeCodec.swift`: the PencilKit tool picker maps onto core presets
   (pen, pencil, marker, monoline, fountain; crayon → the bundled
   `builtin:crayon` at 1.5× width; watercolour → marker at 0.6 opacity) or,
@@ -357,8 +446,11 @@ Bonjour usage strings, file sharing for recordings).
   pipeline changes; wet, live, hover and settling strokes are separate
   geometries. Vertex stream is the core mesh plus a per-vertex stroke index
   into a `StrokeStyle` array (linear colour, mask, grain, depth slot,
-  flags). Depth slots: committed `0.2 + 0.8·(N−k)/(N+1)`, wet `0.1 +
-  0.001·(W−j)`, settling `0.05 − 0.001·i`, live `0.01`, hover `0.005`.
+  flags). Every element carries its line origin; the offset is added
+  while the mesh floats are copied into the batch, so moving a line
+  re-uploads without re-tessellating. Depth slots: committed `0.2 +
+  0.8·(N−k)/(N+1)`, wet `0.1 + 0.001·(W−j)`, settling `0.05 − 0.001·i`,
+  live `0.01`, hover `0.005`.
   Three pipelines: normal, multiply, screen. `darkPaper` (from the clear
   colour's linear luminance) swaps multiply for screen so a highlighter
   tints a black canvas instead of vanishing. Thumbnails render offscreen
@@ -374,11 +466,13 @@ Launch arguments read from `UserDefaults`: `pairURI`, `spike`, `brushLab`,
 `fakeEstimates`, `pencilOnly`, `anyInput`. UI tests take the pairing URI
 from `KRABINK_TEST_PAIR` (what `krabink-server --dev` prints).
 
-UI tests (`UITests/`): `SketchUITests` (create and draw, remote stroke and
-erase, marker self-overlap luminance, estimate settling, hold-to-shape,
-embed preview tap, reopen keeps strokes, sidebar title, delete, bulk delete),
-`PreviewUITests` (markdown structure renders, offline), `SyncUITests`,
-`PairUITests`, `SpikeUITests`, `DeviceSpikeUITests`.
+UI tests (`UITests/`): `SketchUITests` (draw on the page, remote page
+stroke and erase, marker self-overlap luminance, estimate settling,
+hold-to-shape, custom brush round trip, reopen keeps strokes, sidebar
+title, delete, bulk delete), `StyledEditorUITests` (source text preserved,
+ink follows its line when a heading above it changes),
+`PreviewUITests` (reading view hides markers and keeps the source),
+`SyncUITests`, `PairUITests`, `SpikeUITests`, `DeviceSpikeUITests`.
 
 ## 8. The shared rendering contract
 
@@ -450,3 +544,22 @@ Open, in priority order:
   before any brush work and is not in the regression file.
 - `cargo mutants` not run; the desktop parity screenshot script does not
   exist.
+
+Text and ink are one surface since `unify-text-draw-canvas`: ink is
+anchored to source lines in the note's `page` list, both apps show the
+styled source (markers visible) with a reading-view toggle, the iPad
+draws and types, the desktop shows page ink read-only. Known limits:
+
+- Anchors are per source line (first fragment): ink on a later wrapped
+  fragment drifts when the width changes, and iPad and desktop widths
+  differ.
+- Inserting a newline exactly at a line start moves that line's ink down;
+  typing elsewhere on the line does not.
+- Old `krabink://sketch/` notes: the embed line stays as styled text and
+  the sketch data stays in the doc, unread by either app.
+- Page ink is not exported; the desktop does not draw; the iPad does not
+  show peers' pointers.
+- The reading view is the source with markers hidden: tables and raw
+  HTML show as source, images are not rendered.
+- The ink layer is opaque paper under the text (a transparent overlay
+  would break the marker's multiply blend).

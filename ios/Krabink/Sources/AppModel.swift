@@ -358,9 +358,6 @@ private final class NoteEvents: NoteListener {
         Task { @MainActor [weak model] in model?.ink.remoteChanged() }
     }
 
-    /// Embedded sketches are no longer shown (their data stays in the doc).
-    func strokesChanged(sketch: String) {}
-
     func wetBeginAnchored(
         stroke: String, anchor: Data, tool: Tool, color: UInt32, baseWidth: Float, spec: Data?
     ) {
@@ -370,11 +367,6 @@ private final class NoteEvents: NoteListener {
                 spec: spec)
         }
     }
-
-    /// Sketch-keyed wet ink: nothing to draw it on.
-    func wetBegin(
-        sketch: String, stroke: String, tool: Tool, color: UInt32, baseWidth: Float, spec: Data?
-    ) {}
 
     func wetPoints(stroke: String, sentMs: UInt64, points: [StrokePoint]) {
         Task { @MainActor [weak model] in

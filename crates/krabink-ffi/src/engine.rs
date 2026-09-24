@@ -14,15 +14,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use krabink_core as pcore;
-use krabink_core::{DeviceId, DocKey, Flush, NoteId, NoteMeta, SketchId, Store, WorkspaceDoc};
+use krabink_core::{DeviceId, DocKey, Flush, NoteId, NoteMeta, Store, WorkspaceDoc};
 use krabink_local::{Node, NodeConfig, PeerKind, PeerTarget, RelayTarget, Role, direct_addrs};
 use tokio::sync::mpsc;
 
 use crate::brush::{AssetInfo, AssetKind};
 use crate::net::{self, Cmd};
 use crate::types::{
-    BrushInfo, DeviceInfo, Element, NoteInfo, PageElement, PageProbe, PairInfo, PeerInfo,
-    ShapeElement, Stroke, StrokePoint, SyncState, Tilt, Tool, rgba_from_u32,
+    BrushInfo, DeviceInfo, NoteInfo, PageElement, PageProbe, PairInfo, PeerInfo, ShapeElement,
+    Stroke, StrokePoint, SyncState, Tilt, Tool, rgba_from_u32,
 };
 
 /// Errors crossing the FFI boundary. Flattened to message-carrying variants;
@@ -66,12 +66,11 @@ pub trait CoreListener: Send + Sync {
     fn sync_state(&self, state: SyncState);
 }
 
-/// Per-note events. Text and element changes are coarse: re-read via
-/// [`NoteSession::text`] / [`NoteSession::page_elements`] /
-/// [`NoteSession::elements`]. Wet-ink events mirror the ephemeral stream
-/// and never touch the CRDT; render them provisionally and drop the
-/// overlay when `page_changed` / `strokes_changed` delivers the committed
-/// element (a stroke or a snapped shape) under the same id.
+/// Per-note events. Text and page changes are coarse: re-read via
+/// [`NoteSession::text`] / [`NoteSession::page_elements`]. Wet-ink events
+/// mirror the ephemeral stream and never touch the CRDT; render them
+/// provisionally and drop the overlay when `page_changed` delivers the
+/// committed element (a stroke or a snapped shape) under the same id.
 #[uniffi::export(foreign)]
 pub trait NoteListener: Send + Sync {
     /// Catch-up with the server finished; local edits now propagate live.
@@ -81,27 +80,15 @@ pub trait NoteListener: Send + Sync {
     /// The page ink layer changed (an element was added or removed by a
     /// peer): re-read [`NoteSession::page_elements`].
     fn page_changed(&self);
-    fn strokes_changed(&self, sketch: String);
-    /// A peer's pen went down on the page layer: `anchor` is the line the
-    /// wet stroke belongs to (resolve it with [`NoteSession::resolve_anchor`]),
-    /// and the points that follow are in that anchor's space. `spec` as
-    /// in `wet_begin`.
+    /// A peer's pen went down on the page: `anchor` is the line the wet
+    /// stroke belongs to (resolve it with [`NoteSession::resolve_anchor`]),
+    /// and the points that follow are in that anchor's space. `spec` is a
+    /// custom brush's encoded spec (pass it as `BrushRef.custom` with any
+    /// id to mesh the wet points); `None` for the tool's preset.
     fn wet_begin_anchored(
         &self,
         stroke: String,
         anchor: Vec<u8>,
-        tool: Tool,
-        color: u32,
-        base_width: f32,
-        spec: Option<Vec<u8>>,
-    );
-    /// `spec` is a custom brush's encoded spec (pass it as
-    /// `BrushRef.custom` with any id to mesh the wet points); `None` for
-    /// the tool's preset.
-    fn wet_begin(
-        &self,
-        sketch: String,
-        stroke: String,
         tool: Tool,
         color: u32,
         base_width: f32,
@@ -840,12 +827,6 @@ impl NoteSession {
         Ok(())
     }
 
-    fn parse_sketch(&self, sketch: &str) -> Result<SketchId> {
-        sketch.parse().map_err(|_| KrabinkError::MalformedId {
-            id: sketch.to_string(),
-        })
-    }
-
     fn parse_element(&self, element: &str) -> Result<pcore::ElementId> {
         element.parse().map_err(|_| KrabinkError::MalformedId {
             id: element.to_string(),
@@ -969,7 +950,11 @@ impl NoteSession {
     }
 
     /// Pen-up on the page: commit the stroke anchored to `anchor` and end
-    /// the wet stream. Same contract as [`Self::finish_stroke`].
+    /// the wet stream. `stroke.id` must be the id returned by
+    /// [`Self::begin_page_stroke`] (or a fresh ULID when there was no wet
+    /// phase). `tail` is whatever `BrushModeler.finish` added beyond the
+    /// last `append_points` batch, so receivers complete the wet stroke
+    /// before the commit lands.
     pub fn finish_page_stroke(
         &self,
         stroke: Stroke,
@@ -1037,8 +1022,10 @@ impl NoteSession {
         self.commit(Flush::Immediate, |doc| doc.remove_page_element(id))
     }
 
-    /// Where the pen is on the page, in `anchor`'s space; otherwise as
-    /// [`Self::send_pointer`].
+    /// Where the pen is on the page, in `anchor`'s space, hovering
+    /// (`down == false`) or drawing: peers show a pointer there. `tool ==
+    /// None` means the eraser is selected and `base_width` is its
+    /// diameter. Call at a throttled rate; the view decides the cadence.
     #[allow(clippy::too_many_arguments)]
     pub fn send_page_pointer(
         &self,
@@ -1069,55 +1056,9 @@ impl NoteSession {
         self.send_wet(pcore::WetInk::PointerAnchoredGone)
     }
 
-    // ---- embedded sketches (legacy) ----
-
-    pub fn sketch_ids(&self) -> Result<Vec<String>> {
-        self.read(|doc| Ok(doc.sketch_ids().iter().map(SketchId::to_string).collect()))
-    }
-
-    pub fn create_sketch(&self) -> Result<String> {
-        self.commit(Flush::Immediate, |doc| doc.create_sketch(now_ms()))
-            .map(|id| id.to_string())
-    }
-
-    /// All strokes of a sketch in z-order (shapes left out; prefer
-    /// [`Self::elements`]).
-    pub fn strokes(&self, sketch: String) -> Result<Vec<Stroke>> {
-        let sketch = self.parse_sketch(&sketch)?;
-        self.read(|doc| Ok(doc.strokes(sketch)?.into_iter().map(Into::into).collect()))
-    }
-
-    /// Every element of a sketch (strokes and shapes) in z-order.
-    pub fn elements(&self, sketch: String) -> Result<Vec<Element>> {
-        let sketch = self.parse_sketch(&sketch)?;
-        self.read(|doc| Ok(doc.elements(sketch)?.into_iter().map(Into::into).collect()))
-    }
-
-    /// Pen-down: announce a wet stroke on the ephemeral channel. Returns the
-    /// stroke id to use for `append_points` and the committed stroke.
-    pub fn begin_stroke(
-        &self,
-        sketch: String,
-        tool: Tool,
-        color: u32,
-        base_width: f32,
-        spec: Option<Vec<u8>>,
-    ) -> Result<String> {
-        let sketch = self.parse_sketch(&sketch)?;
-        let stroke = pcore::StrokeId::new();
-        self.send_wet(pcore::WetInk::Begin {
-            sketch,
-            stroke,
-            tool: tool.into(),
-            color: rgba_from_u32(color),
-            base_width,
-            spec,
-        })?;
-        Ok(stroke.to_string())
-    }
-
     /// The stored points emitted since the last batch (`BrushModeler.push`
-    /// results). `seq` is monotonic per stroke, starting at 1.
+    /// results), in the stroke's anchor space. `seq` is monotonic per
+    /// stroke, starting at 1.
     pub fn append_points(&self, stroke: String, seq: u32, points: Vec<StrokePoint>) -> Result<()> {
         let stroke: pcore::StrokeId = stroke
             .parse()
@@ -1126,62 +1067,7 @@ impl NoteSession {
         self.send_wet(pcore::WetInk::points(stroke, seq, now_ms(), &points)?)
     }
 
-    /// Pen-up: commit the authoritative stroke to the CRDT and end the wet
-    /// stream. `stroke.id` must be the id returned by `begin_stroke` (or a
-    /// fresh ULID when there was no wet phase). `tail` is whatever
-    /// `BrushModeler.finish` added beyond the last `append_points` batch,
-    /// so receivers complete the wet stroke before the commit lands.
-    pub fn finish_stroke(
-        &self,
-        sketch: String,
-        stroke: Stroke,
-        tail: Vec<StrokePoint>,
-    ) -> Result<()> {
-        let sketch = self.parse_sketch(&sketch)?;
-        let stroke_id: pcore::StrokeId =
-            stroke.id.parse().map_err(|_| KrabinkError::MalformedId {
-                id: stroke.id.clone(),
-            })?;
-        let committed = pcore::Stroke::from(stroke);
-        self.commit(Flush::Immediate, |doc| doc.add_stroke(sketch, &committed))?;
-        let tail: Vec<pcore::StrokePoint> = tail.into_iter().map(Into::into).collect();
-        self.send_wet(pcore::WetInk::end(stroke_id, now_ms(), &tail)?)
-    }
-
-    /// Pen-up on a stroke that snapped to a shape: commit the shape under
-    /// the wet stroke's id and end the wet stream, so receivers swap the
-    /// provisional ink for the shape in one step. `shape.id` must be the id
-    /// returned by `begin_stroke`.
-    pub fn finish_shape(&self, sketch: String, shape: ShapeElement) -> Result<()> {
-        let sketch = self.parse_sketch(&sketch)?;
-        let id: pcore::ElementId = shape.id.parse().map_err(|_| KrabinkError::MalformedId {
-            id: shape.id.clone(),
-        })?;
-        let committed = pcore::ShapeElement::from(shape);
-        self.commit(Flush::Immediate, |doc| doc.add_shape(sketch, &committed))?;
-        self.send_wet(pcore::WetInk::end(id, now_ms(), &[])?)
-    }
-
-    /// Eraser sample: remove every element whose ink a circle of `radius`
-    /// at (`x`, `y`) touches; returns their ids so the view can drop them.
-    /// The hit test lives in the core so erasing matches on every platform.
-    pub fn erase_at(&self, sketch: String, x: f32, y: f32, radius: f32) -> Result<Vec<String>> {
-        let sketch_id = self.parse_sketch(&sketch)?;
-        let hit: Vec<pcore::ElementId> = self.read(|doc| {
-            Ok(doc
-                .elements(sketch_id)?
-                .iter()
-                .filter(|el| el.ink().hits(&el.outline(), x, y, radius))
-                .map(pcore::Element::id)
-                .collect())
-        })?;
-        for id in &hit {
-            self.commit(Flush::Immediate, |doc| doc.remove_element(sketch_id, *id))?;
-        }
-        Ok(hit.iter().map(ToString::to_string).collect())
-    }
-
-    /// The wet stream opened by [`Self::begin_stroke`] ends without a
+    /// The wet stream opened by [`Self::begin_page_stroke`] ends without a
     /// stroke (the pen moved a ruler, not ink): tell receivers to drop the
     /// provisional ink immediately.
     pub fn cancel_stroke(&self, stroke: String) -> Result<()> {
@@ -1189,56 +1075,5 @@ impl NoteSession {
             .parse()
             .map_err(|_| KrabinkError::MalformedId { id: stroke })?;
         self.send_wet(pcore::WetInk::Cancel { stroke: stroke_id })
-    }
-
-    /// Where the pen is now, hovering (`down == false`) or drawing: peers
-    /// show a pointer there. `tool == None` means the eraser is selected
-    /// and `base_width` is its diameter. Call at a throttled rate; the
-    /// view decides the cadence.
-    #[allow(clippy::too_many_arguments)]
-    pub fn send_pointer(
-        &self,
-        sketch: String,
-        x: f32,
-        y: f32,
-        tilt: Option<Tilt>,
-        tool: Option<Tool>,
-        color: u32,
-        base_width: f32,
-        down: bool,
-    ) -> Result<()> {
-        let sketch = self.parse_sketch(&sketch)?;
-        self.send_wet(pcore::WetInk::Pointer {
-            sketch,
-            x,
-            y,
-            tilt: tilt.map(Into::into),
-            tool: tool.map(Into::into),
-            color: rgba_from_u32(color),
-            base_width,
-            down,
-            sent_ms: now_ms(),
-        })
-    }
-
-    /// The pen left the sketch: peers drop the pointer at once instead of
-    /// waiting for it to go stale.
-    pub fn send_pointer_gone(&self, sketch: String) -> Result<()> {
-        let sketch = self.parse_sketch(&sketch)?;
-        self.send_wet(pcore::WetInk::PointerGone { sketch })
-    }
-
-    /// Remove one element (stroke or shape) by id.
-    pub fn remove_element(&self, sketch: String, element: String) -> Result<()> {
-        let sketch = self.parse_sketch(&sketch)?;
-        let id: pcore::ElementId = element
-            .parse()
-            .map_err(|_| KrabinkError::MalformedId { id: element })?;
-        self.commit(Flush::Immediate, |doc| doc.remove_element(sketch, id))
-    }
-
-    /// Alias of [`Self::remove_element`].
-    pub fn remove_stroke(&self, sketch: String, stroke: String) -> Result<()> {
-        self.remove_element(sketch, stroke)
     }
 }

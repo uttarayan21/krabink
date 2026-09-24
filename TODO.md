@@ -16,7 +16,13 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
 - [ ] Publish `{endpoint_id, relay}` in `DeviceMeta` so nodes dial every
       workspace device without pairwise QRs (today: scanner dials QR owner,
       everyone dials the replica).
-- [ ] Desktop-side sketch editing (currently view-only on desktop).
+- [ ] Desktop-side drawing (page ink is view-only on desktop).
+- [ ] Page ink export: group `page_elements()` by resolved line and emit
+      an SVG after each paragraph (`export.rs` skips page ink today).
+- [ ] Transparent ink overlay above the text (premultiplied output; the
+      marker's multiply blend needs a different formulation) so ink can
+      sit over text instead of under it.
+- [ ] Peers' pointers on the iPad (`PointerAnchored` is desktop-only).
 
 ## Known debt
 
@@ -31,8 +37,8 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
       advertises, so two iPads on a relay-less LAN cannot find each other.
 - [ ] Note close/unsubscribe not exposed over FFI — open notes stay subscribed
       for the session.
-- [ ] Change events are coarse (full-text + per-sketch, not deltas). Fine until
-      a consumer needs cursor-stable patches.
+- [ ] Change events are coarse (full-text + page-length, not deltas). Fine
+      until a consumer needs cursor-stable patches.
 
 ### iPad
 - [x] Stroke identity keyed by `PKStrokePath.creationDate` — gone: PencilKit is
@@ -40,13 +46,17 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
 - [ ] Eraser is whole-stroke only (core hit test); PencilKit's pixel eraser
       (stroke splitting) is not reproduced.
 - [ ] Lasso tool does nothing (no PKDrawing to select from).
-- [ ] Remotely-created empty sketch is invisible until its first stroke lands.
 - [ ] Marker translucency not round-tripped through the stroke schema.
 - [ ] IME / marked-text composition not guarded in the remote-apply path of the
       text editor.
-- [ ] No markdown syntax highlighting in the source editor.
-- [ ] Preview is a separate read-only mode, not inline editable images — the
-      UITextView↔CRDT offset mapping requires view text == CRDT text.
+- [ ] Whole-text restyle after every keystroke (`MarkdownStyler.restyle`);
+      fine to ~50 KB, an incremental restyle is the follow-up.
+- [ ] Ink anchors are per source line, first fragment: ink on a wrapped
+      continuation drifts when the width changes (iPad and desktop widths
+      differ).
+- [ ] Old `krabink://sketch/` embeds stay as plain styled text; the sketch
+      data is never shown.
+- [ ] Reading view renders no images or tables (source shows through).
 - [ ] Wet ink carries no per-point size yet; receivers (desktop and iPad, same
       ribbon code) fall back to `base_width * force` until the commit lands.
 
@@ -60,8 +70,13 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
 ### Desktop
 - [ ] Cursor can jump when a remote edit lands while typing in the same note
       (buffer rebuilt; egui clamps). Cursor remap through remote deltas queued.
+- [ ] No bundled bold face: `Strong` is full-strength colour against a
+      softened body instead of a heavier weight.
 
 ## Verification still worth doing (non-blocking)
-- [ ] Hardware feel-check of the iM5 preview/tap-to-open flow on a real iPad.
+- [ ] Hardware feel-check of the unified page on a real iPad: Pencil over
+      text never scrolls or triggers Scribble, finger scrolls and places the
+      caret, hover dab, picker survives keyboard dismissal, ink follows its
+      line while typing above it, drawing in the reading view.
 - [ ] Real cross-device latency with NTP-synced clocks (current numbers are
       indicative — measured across iPad/mac clocks on one LAN).

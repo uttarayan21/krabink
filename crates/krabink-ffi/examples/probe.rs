@@ -1,7 +1,7 @@
 //! Desktop-class Rust peer for cross-device sync checks (used by the iOS UI
 //! test harness). Joins a workspace from a pairing URI with a fresh store,
 //! waits for the newest note, optionally asserts its text contains a
-//! substring and/or appends text.
+//! substring and/or appends text, and can draw or count page ink.
 //!
 //! cargo run -p krabink-ffi --example probe -- \
 //!     --pair 'krabink://pair?node=…&token=…&relay=…' \
@@ -11,9 +11,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use krabink_ffi::{
-    Core, NoteListener, NoteSession, PointKind, Stroke, StrokePoint, Tool, parse_pair_uri,
-};
+use krabink_ffi::{Core, NoteListener, PointKind, Stroke, StrokePoint, Tool, parse_pair_uri};
 
 #[derive(Default)]
 struct Recorder {
@@ -43,23 +41,10 @@ impl NoteListener for Recorder {
     }
     fn text_changed(&self, _text: String) {}
     fn page_changed(&self) {}
-    fn strokes_changed(&self, _sketch: String) {}
     fn wet_begin_anchored(
         &self,
         _st: String,
         _anchor: Vec<u8>,
-        _t: Tool,
-        _c: u32,
-        _w: f32,
-        _spec: Option<Vec<u8>>,
-    ) {
-        self.wet.lock().unwrap().begins += 1;
-        eprintln!("wet begin (page)");
-    }
-    fn wet_begin(
-        &self,
-        _s: String,
-        _st: String,
         _t: Tool,
         _c: u32,
         _w: f32,
@@ -85,8 +70,6 @@ struct Args {
     pair: String,
     expect: Option<String>,
     append: Option<String>,
-    expect_strokes: Option<usize>,
-    add_stroke: bool,
     /// Draw a page stroke anchored to this 0-based source line.
     add_page_stroke: Option<usize>,
     expect_page_elements: Option<usize>,
@@ -102,8 +85,6 @@ fn parse_args() -> Args {
         pair: String::new(),
         expect: None,
         append: None,
-        expect_strokes: None,
-        add_stroke: false,
         add_page_stroke: None,
         expect_page_elements: None,
         wet_watch: None,
@@ -118,8 +99,6 @@ fn parse_args() -> Args {
             "--pair" => args.pair = value(),
             "--expect" => args.expect = Some(value()),
             "--append" => args.append = Some(value()),
-            "--expect-strokes" => args.expect_strokes = Some(value().parse().unwrap()),
-            "--add-stroke" => args.add_stroke = true,
             "--add-page-stroke" => args.add_page_stroke = Some(value().parse().unwrap()),
             "--expect-page-elements" => args.expect_page_elements = Some(value().parse().unwrap()),
             "--wet-watch" => args.wet_watch = Some(Duration::from_secs(value().parse().unwrap())),
@@ -193,56 +172,6 @@ fn main() {
         wait_for(&format!("text containing {expect:?}"), args.timeout, || {
             session.text().ok().filter(|t| t.contains(expect.as_str()))
         });
-    }
-
-    if let Some(want) = args.expect_strokes {
-        let sketch = first_sketch(&session, args.timeout);
-        wait_for(
-            &format!("{want} strokes in the sketch"),
-            args.timeout,
-            || {
-                let n = session.strokes(sketch.clone()).ok()?.len();
-                (n == want).then_some(())
-            },
-        );
-    }
-
-    if args.add_stroke {
-        let sketch = first_sketch(&session, args.timeout);
-        let id = session
-            .begin_stroke(sketch.clone(), Tool::Pen, 0x1e3c_c8ff, 10.0, None)
-            .expect("begin stroke");
-        let points = (0..6u32)
-            .map(|i| StrokePoint {
-                x: 40.0 + 30.0 * i as f32,
-                y: 40.0 + 20.0 * i as f32,
-                force: 1.0,
-                t_ms: i * 16,
-                tilt: None,
-                size: None,
-            })
-            .collect();
-        session
-            .finish_stroke(
-                sketch,
-                Stroke {
-                    id,
-                    tool: Tool::Pen,
-                    color: 0x1e3c_c8ff,
-                    base_width: 10.0,
-                    kind: PointKind::BsplineControl,
-                    points,
-                    created_ms: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as u64,
-                    brush: None,
-                },
-                Vec::new(),
-            )
-            .expect("finish stroke");
-        // Give the network task a moment to flush the update.
-        std::thread::sleep(Duration::from_millis(750));
     }
 
     if let Some(want) = args.expect_page_elements {
@@ -331,28 +260,11 @@ fn main() {
         std::thread::sleep(Duration::from_millis(750));
     }
 
-    let mut sketch_summary = format!(
-        "\npage elements {}",
-        session.page_elements().map(|p| p.len()).unwrap_or(0)
-    );
-    for sketch in session.sketch_ids().unwrap_or_default() {
-        let count = session
-            .strokes(sketch.clone())
-            .map(|s| s.len())
-            .unwrap_or(0);
-        sketch_summary.push_str(&format!("\nsketch {sketch} strokes {count}"));
-    }
     println!(
-        "probe OK — note {} title {:?}{}\n{}",
+        "probe OK — note {} title {:?}\npage elements {}\n{}",
         newest.id,
         newest.title,
-        sketch_summary,
+        session.page_elements().map(|p| p.len()).unwrap_or(0),
         session.text().expect("text")
     );
-}
-
-fn first_sketch(session: &NoteSession, timeout: Duration) -> String {
-    wait_for("a sketch on the note", timeout, || {
-        session.sketch_ids().ok()?.into_iter().next()
-    })
 }
