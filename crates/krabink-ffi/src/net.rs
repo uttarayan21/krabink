@@ -379,8 +379,26 @@ fn dispatch_wet(shared: &Shared, doc: DocKey, payload: &[u8]) {
             }
         }
         WetInk::Cancel { stroke } => listener.wet_cancel(stroke.to_string()),
+        WetInk::BeginAnchored {
+            stroke,
+            anchor,
+            tool,
+            color,
+            base_width,
+            spec,
+        } => listener.wet_begin_anchored(
+            stroke.to_string(),
+            anchor,
+            tool.into(),
+            rgba_to_u32(color),
+            base_width,
+            spec,
+        ),
         // Remote pointers are rendered on the desktop only for now.
-        WetInk::Pointer { .. } | WetInk::PointerGone { .. } => {}
+        WetInk::Pointer { .. }
+        | WetInk::PointerGone { .. }
+        | WetInk::PointerAnchored { .. }
+        | WetInk::PointerAnchoredGone => {}
     }
 }
 
@@ -392,6 +410,7 @@ enum Notify {
     Assets(Arc<dyn CoreListener>, Vec<AssetInfo>),
     Devices(Arc<dyn CoreListener>, Vec<DeviceInfo>),
     Text(Arc<dyn NoteListener>, String),
+    Page(Arc<dyn NoteListener>),
     Strokes(Arc<dyn NoteListener>, String),
 }
 
@@ -403,6 +422,7 @@ impl Notify {
             Self::Assets(listener, assets) => listener.assets_changed(assets),
             Self::Devices(listener, devices) => listener.devices_changed(devices),
             Self::Text(listener, text) => listener.text_changed(text),
+            Self::Page(listener) => listener.page_changed(),
             Self::Strokes(listener, sketch) => listener.strokes_changed(sketch),
         }
     }
@@ -461,6 +481,7 @@ impl ClientDocs for Docs<'_> {
             return Ok(false); // note was closed since we subscribed
         };
         let text_before = note.doc.text();
+        let page_before = note.doc.page_len();
         let counts_before = sketch_counts(&note.doc);
         let changed = note.doc.import_update(payload)?;
         state.store.append_update(doc, payload, Flush::Eventual)?;
@@ -469,6 +490,11 @@ impl ClientDocs for Docs<'_> {
             if text_after != text_before {
                 self.pending
                     .push(Notify::Text(listener.clone(), text_after));
+            }
+            // Page elements are only ever added/removed whole, so a length
+            // diff catches every change.
+            if note.doc.page_len() != page_before {
+                self.pending.push(Notify::Page(listener.clone()));
             }
             // Strokes are only ever added/removed whole, so a per-sketch count
             // diff catches every change.

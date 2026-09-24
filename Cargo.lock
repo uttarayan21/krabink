@@ -5194,6 +5194,7 @@ dependencies = [
  "lyon_tessellation",
  "postcard",
  "proptest",
+ "pulldown-cmark",
  "redb",
  "serde",
  "tempfile",

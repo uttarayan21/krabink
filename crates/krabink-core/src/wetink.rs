@@ -74,6 +74,31 @@ pub enum WetInk {
     PointerGone {
         sketch: SketchId,
     },
+    /// [`Self::Begin`] for the note's page ink layer: the stroke's points
+    /// are relative to the line `anchor` names (see [`crate::Anchor`]), so a
+    /// receiver places the provisional ink where the commit will land.
+    BeginAnchored {
+        stroke: StrokeId,
+        anchor: Vec<u8>,
+        tool: Tool,
+        color: Rgba,
+        base_width: f32,
+        spec: Option<Vec<u8>>,
+    },
+    /// [`Self::Pointer`] on the page layer, positioned relative to `anchor`.
+    PointerAnchored {
+        anchor: Vec<u8>,
+        x: f32,
+        y: f32,
+        tilt: Option<Tilt>,
+        tool: Option<Tool>,
+        color: Rgba,
+        base_width: f32,
+        down: bool,
+        sent_ms: u64,
+    },
+    /// The pen left the note's page.
+    PointerAnchoredGone,
 }
 
 impl WetInk {
@@ -116,9 +141,12 @@ impl WetInk {
             Self::Points { chunks, .. } => decode_chunks(chunks.iter().map(Vec::as_slice)),
             Self::End { tail, .. } => decode_chunks(tail.iter().map(Vec::as_slice)),
             Self::Begin { .. }
+            | Self::BeginAnchored { .. }
             | Self::Cancel { .. }
             | Self::Pointer { .. }
-            | Self::PointerGone { .. } => Ok(Vec::new()),
+            | Self::PointerGone { .. }
+            | Self::PointerAnchored { .. }
+            | Self::PointerAnchoredGone => Ok(Vec::new()),
         }
     }
 }
@@ -204,5 +232,50 @@ mod tests {
     #[test]
     fn garbage_rejected() {
         assert!(WetInk::decode(&[0xff, 0xff, 0xff]).is_err());
+    }
+
+    #[test]
+    fn anchored_variants_roundtrip() {
+        let begin = WetInk::BeginAnchored {
+            stroke: StrokeId::new(),
+            anchor: vec![1, 2, 3],
+            tool: Tool::Pencil,
+            color: Rgba([1, 2, 3, 4]),
+            base_width: 3.5,
+            spec: Some(vec![9]),
+        };
+        assert_eq!(WetInk::decode(&begin.encode().unwrap()).unwrap(), begin);
+        assert!(begin.decode_points().unwrap().is_empty());
+        let pointer = WetInk::PointerAnchored {
+            anchor: vec![7],
+            x: -3.0,
+            y: 12.0,
+            tilt: None,
+            tool: None,
+            color: Rgba([0; 4]),
+            base_width: 24.0,
+            down: true,
+            sent_ms: 5,
+        };
+        assert_eq!(WetInk::decode(&pointer.encode().unwrap()).unwrap(), pointer);
+        let gone = WetInk::PointerAnchoredGone;
+        assert_eq!(WetInk::decode(&gone.encode().unwrap()).unwrap(), gone);
+    }
+
+    #[test]
+    fn variants_are_append_only() {
+        // Older receivers drop what they cannot decode; a tag past the last
+        // variant must be an error, and the first variant's tag must stay 0.
+        assert!(WetInk::decode(&[9, 0, 0]).is_err());
+        let begin = WetInk::Begin {
+            sketch: crate::SketchId::new(),
+            stroke: StrokeId::new(),
+            tool: Tool::Pen,
+            color: Rgba::BLACK,
+            base_width: 1.0,
+            spec: None,
+        };
+        assert_eq!(begin.encode().unwrap()[0], 0);
+        assert_eq!(WetInk::PointerAnchoredGone.encode().unwrap(), vec![8]);
     }
 }

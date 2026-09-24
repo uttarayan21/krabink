@@ -929,6 +929,10 @@ fn apply_wet_ink(
                 );
             }
             WetInk::PointerGone { .. } => scenes.despawn_pointer(&mut commands, frame.from),
+            // Page-layer wet ink: rendered once the page scene lands.
+            WetInk::BeginAnchored { .. }
+            | WetInk::PointerAnchored { .. }
+            | WetInk::PointerAnchoredGone => {}
         }
     }
 

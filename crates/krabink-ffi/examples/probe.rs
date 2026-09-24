@@ -5,7 +5,8 @@
 //!
 //! cargo run -p krabink-ffi --example probe -- \
 //!     --pair 'krabink://pair?node=…&token=…&relay=…' \
-//!     [--expect SUBSTRING] [--append TEXT] [--timeout-secs 15]
+//!     [--expect SUBSTRING] [--append TEXT] [--timeout-secs 15] \
+//!     [--add-page-stroke LINE] [--expect-page-elements N]
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -41,7 +42,20 @@ impl NoteListener for Recorder {
         *self.synced.lock().unwrap() = true;
     }
     fn text_changed(&self, _text: String) {}
+    fn page_changed(&self) {}
     fn strokes_changed(&self, _sketch: String) {}
+    fn wet_begin_anchored(
+        &self,
+        _st: String,
+        _anchor: Vec<u8>,
+        _t: Tool,
+        _c: u32,
+        _w: f32,
+        _spec: Option<Vec<u8>>,
+    ) {
+        self.wet.lock().unwrap().begins += 1;
+        eprintln!("wet begin (page)");
+    }
     fn wet_begin(
         &self,
         _s: String,
@@ -73,6 +87,9 @@ struct Args {
     append: Option<String>,
     expect_strokes: Option<usize>,
     add_stroke: bool,
+    /// Draw a page stroke anchored to this 0-based source line.
+    add_page_stroke: Option<usize>,
+    expect_page_elements: Option<usize>,
     wet_watch: Option<Duration>,
     timeout: Duration,
     /// Print the device registry as it changes, then exit; no note needed.
@@ -87,6 +104,8 @@ fn parse_args() -> Args {
         append: None,
         expect_strokes: None,
         add_stroke: false,
+        add_page_stroke: None,
+        expect_page_elements: None,
         wet_watch: None,
         timeout: Duration::from_secs(15),
         devices: false,
@@ -101,6 +120,8 @@ fn parse_args() -> Args {
             "--append" => args.append = Some(value()),
             "--expect-strokes" => args.expect_strokes = Some(value().parse().unwrap()),
             "--add-stroke" => args.add_stroke = true,
+            "--add-page-stroke" => args.add_page_stroke = Some(value().parse().unwrap()),
+            "--expect-page-elements" => args.expect_page_elements = Some(value().parse().unwrap()),
             "--wet-watch" => args.wet_watch = Some(Duration::from_secs(value().parse().unwrap())),
             "--timeout-secs" => args.timeout = Duration::from_secs(value().parse().unwrap()),
             "--devices" => args.devices = true,
@@ -224,6 +245,56 @@ fn main() {
         std::thread::sleep(Duration::from_millis(750));
     }
 
+    if let Some(want) = args.expect_page_elements {
+        wait_for(&format!("{want} page elements"), args.timeout, || {
+            let n = session.page_elements().ok()?.len();
+            (n == want).then_some(())
+        });
+    }
+
+    if let Some(line) = args.add_page_stroke {
+        // Anchor to the first char of the requested source line (clamped
+        // to the end of the text when there are fewer lines).
+        let text = session.text().expect("text");
+        let start = text
+            .split_inclusive('\n')
+            .take(line)
+            .map(|l| l.chars().count())
+            .sum::<usize>() as u64;
+        let anchor = session.anchor_at(start).expect("anchor");
+        let id = session
+            .begin_page_stroke(anchor.clone(), Tool::Pen, 0x1e3c_c8ff, 6.0, None)
+            .expect("begin page stroke");
+        let points = (0..6u32)
+            .map(|i| StrokePoint {
+                x: 20.0 + 30.0 * i as f32,
+                y: 4.0 + 2.0 * i as f32,
+                force: 1.0,
+                t_ms: i * 16,
+                tilt: None,
+                size: None,
+            })
+            .collect();
+        session
+            .finish_page_stroke(
+                Stroke {
+                    id,
+                    tool: Tool::Pen,
+                    color: 0x1e3c_c8ff,
+                    base_width: 6.0,
+                    kind: PointKind::BsplineControl,
+                    points,
+                    created_ms: now_unix_ms(),
+                    brush: None,
+                },
+                anchor,
+                Vec::new(),
+            )
+            .expect("finish page stroke");
+        // Give the network task a moment to flush the update.
+        std::thread::sleep(Duration::from_millis(750));
+    }
+
     if let Some(window) = args.wet_watch {
         // Latency gate rig: sit on the ephemeral channel while someone draws
         // on another device, then report receive-latency percentiles.
@@ -260,7 +331,10 @@ fn main() {
         std::thread::sleep(Duration::from_millis(750));
     }
 
-    let mut sketch_summary = String::new();
+    let mut sketch_summary = format!(
+        "\npage elements {}",
+        session.page_elements().map(|p| p.len()).unwrap_or(0)
+    );
     for sketch in session.sketch_ids().unwrap_or_default() {
         let count = session
             .strokes(sketch.clone())

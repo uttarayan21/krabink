@@ -27,6 +27,7 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1.1", features = ["use-std"] }
 ulid = { version = "1", features = ["serde"] }
 loro = "1.13"
+pulldown-cmark = { version = "0.13", default-features = false }
 redb = "4.2"
 futures = "0.3"
 toml = "0.9"

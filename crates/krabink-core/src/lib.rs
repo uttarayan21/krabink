@@ -21,6 +21,7 @@ mod element;
 mod export;
 mod geom;
 mod ids;
+mod markdown;
 mod note;
 mod pair;
 mod shape;
@@ -40,12 +41,13 @@ pub use brush::{
 };
 #[cfg(feature = "ism")]
 pub use brush::{IsmModel, IsmParams, UNITS_PER_CM};
-pub use element::{Binding, Element, ShapeElement, Style};
+pub use element::{Anchor, Binding, Element, PageElement, ShapeElement, Style};
 pub use export::{ExportAsset, ExportBundle, SKETCH_URI_PREFIX, elements_to_svg};
 pub use geom::{
     DEFAULT_TOLERANCE, GrainStyle, Ink, InkMesh, InkStyle, InkVertex, MAX_DABS, MaskStyle,
 };
 pub use ids::{DeviceId, ElementId, NoteId, SketchId, StrokeId};
+pub use markdown::{StyleKind, StyleRun, style_runs};
 pub use note::NoteDoc;
 pub use pair::PairInfo;
 pub use shape::{Recognition, RecognizerParams, Shape, recognize, recognize_with};

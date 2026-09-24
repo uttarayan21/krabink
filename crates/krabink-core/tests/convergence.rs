@@ -13,6 +13,8 @@ enum Op {
     Delete { at: usize, len: usize },
     AddStroke { seed: u32 },
     AddShape { seed: u32 },
+    AddPageStroke { seed: u32, at: usize },
+    RemovePage { nth: usize },
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -21,7 +23,32 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         (0usize..64, 1usize..8).prop_map(|(at, len)| Op::Delete { at, len }),
         (0u32..1000).prop_map(|seed| Op::AddStroke { seed }),
         (0u32..1000).prop_map(|seed| Op::AddShape { seed }),
+        (0u32..1000, 0usize..64).prop_map(|(seed, at)| Op::AddPageStroke { seed, at }),
+        (0usize..8).prop_map(|nth| Op::RemovePage { nth }),
     ]
+}
+
+fn sample_stroke(seed: u32) -> Stroke {
+    let points = (0..10)
+        .map(|i| StrokePoint {
+            x: (seed as f32) + i as f32,
+            y: (seed % 37) as f32 * 2.0,
+            force: 0.5,
+            t_ms: i * 8,
+            tilt: None,
+            size: None,
+        })
+        .collect();
+    Stroke {
+        id: StrokeId::new(),
+        tool: Tool::Pen,
+        brush: None,
+        color: Rgba::BLACK,
+        base_width: 2.0,
+        kind: PointKind::PolylineSample,
+        points,
+        created_ms: u64::from(seed),
+    }
 }
 
 fn apply(doc: &NoteDoc, sketch: krabink_core::SketchId, op: &Op) {
@@ -39,30 +66,17 @@ fn apply(doc: &NoteDoc, sketch: krabink_core::SketchId, op: &Op) {
             }
         }
         Op::AddStroke { seed } => {
-            let points = (0..10)
-                .map(|i| StrokePoint {
-                    x: (*seed as f32) + i as f32,
-                    y: (*seed % 37) as f32 * 2.0,
-                    force: 0.5,
-                    t_ms: i * 8,
-                    tilt: None,
-                    size: None,
-                })
-                .collect();
-            doc.add_stroke(
-                sketch,
-                &Stroke {
-                    id: StrokeId::new(),
-                    tool: Tool::Pen,
-                    brush: None,
-                    color: Rgba::BLACK,
-                    base_width: 2.0,
-                    kind: PointKind::PolylineSample,
-                    points,
-                    created_ms: u64::from(*seed),
-                },
-            )
-            .unwrap();
+            doc.add_stroke(sketch, &sample_stroke(*seed)).unwrap();
+        }
+        Op::AddPageStroke { seed, at } => {
+            let anchor = doc.anchor_at((*at).min(doc.text_len())).unwrap();
+            doc.add_page_stroke(&sample_stroke(*seed), &anchor).unwrap();
+        }
+        Op::RemovePage { nth } => {
+            let page = doc.page_elements();
+            if let Some(entry) = page.get(*nth % page.len().max(1)) {
+                doc.remove_page_element(entry.element.id()).unwrap();
+            }
         }
         Op::AddShape { seed } => {
             let s = *seed as f32;
@@ -141,5 +155,11 @@ proptest! {
 
         prop_assert_eq!(a.text(), b.text());
         prop_assert_eq!(a.elements(sketch).unwrap(), b.elements(sketch).unwrap());
+        let (page_a, page_b) = (a.page_elements(), b.page_elements());
+        prop_assert_eq!(&page_a, &page_b);
+        // Anchors resolve to the same line on both replicas.
+        let at_a: Vec<_> = page_a.iter().map(|p| a.resolve_anchor(&p.anchor)).collect();
+        let at_b: Vec<_> = page_b.iter().map(|p| b.resolve_anchor(&p.anchor)).collect();
+        prop_assert_eq!(at_a, at_b);
     }
 }

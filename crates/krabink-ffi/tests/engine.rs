@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use krabink_ffi::{
     AssetInfo, AssetKind, BrushInfo, Core, CoreListener, DeviceInfo, Element, NoteInfo,
-    NoteListener, PairInfo, Point2, PointKind, Route, Shape, ShapeElement, Stroke, StrokePoint,
-    SyncState, Tool,
+    NoteListener, PageProbe, PairInfo, Point2, PointKind, Route, Shape, ShapeElement, Stroke,
+    StrokePoint, StyleKind, SyncState, Tool, style_runs,
 };
 
 fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
@@ -129,7 +129,10 @@ struct RecNote {
     synced: Mutex<u32>,
     text: Mutex<String>,
     stroke_events: Mutex<Vec<String>>,
+    page_events: Mutex<u32>,
     wet: Mutex<Vec<String>>,
+    /// (stroke id, anchor) of every `wet_begin_anchored`.
+    wet_anchored: Mutex<Vec<(String, Vec<u8>)>>,
 }
 
 impl NoteListener for RecNote {
@@ -141,8 +144,24 @@ impl NoteListener for RecNote {
         *self.text.lock().unwrap() = text;
     }
 
+    fn page_changed(&self) {
+        *self.page_events.lock().unwrap() += 1;
+    }
+
     fn strokes_changed(&self, sketch: String) {
         self.stroke_events.lock().unwrap().push(sketch);
+    }
+
+    fn wet_begin_anchored(
+        &self,
+        stroke: String,
+        anchor: Vec<u8>,
+        _tool: Tool,
+        _color: u32,
+        _width: f32,
+        _spec: Option<Vec<u8>>,
+    ) {
+        self.wet_anchored.lock().unwrap().push((stroke, anchor));
     }
 
     fn wet_begin(
@@ -702,4 +721,190 @@ fn two_cores_converge_through_relay() {
     });
 
     let _ = cloud.stop.send(());
+}
+
+/// A pen stroke of `n` points shifted by (`dx`, `dy`), for page ink.
+fn page_stroke(id: String, n: u32, dx: f32, dy: f32) -> Stroke {
+    let points = (0..n)
+        .map(|i| StrokePoint {
+            x: dx + i as f32 * 3.0,
+            y: dy + i as f32,
+            force: 0.5,
+            t_ms: i * 8,
+            tilt: None,
+            size: None,
+        })
+        .collect();
+    Stroke {
+        id,
+        tool: Tool::Pen,
+        color: 0x1122_33ff,
+        base_width: 4.0,
+        kind: PointKind::PolylineSample,
+        points,
+        created_ms: 1,
+        brush: None,
+    }
+}
+
+/// Page ink drawn on A reaches B as anchored wet ink, then as a committed
+/// page element whose anchor resolves to the same line; an edit above it
+/// on B shifts A's resolution.
+#[test]
+fn page_ink_converges_direct() {
+    let dir = tempfile::tempdir().unwrap();
+    let core_a = Core::new(dir.path().join("a").to_str().unwrap().into()).unwrap();
+    let core_b = Core::new(dir.path().join("b").to_str().unwrap().into()).unwrap();
+    let mut pair = core_a.pair_info();
+    pair.addrs = vec![format!("127.0.0.1:{}", core_a.bound_port().unwrap())];
+    core_b.set_pairing(pair).unwrap();
+    wait_for("B connects to A", || connected(&core_b.sync_state()));
+
+    let note_a = core_a.clone().create_note("page".into()).unwrap();
+    note_a.apply_text_edit(0, 0, "one\ntwo\n".into()).unwrap();
+    wait_for("note reaches B", || {
+        core_b.list_notes().iter().any(|n| n.title == "page")
+    });
+    let note_b = core_b.clone().open_note(note_a.id()).unwrap();
+    let rec_b = Arc::new(RecNote::default());
+    note_b.set_listener(rec_b.clone());
+    wait_for("text reaches B", || note_b.text().unwrap() == "one\ntwo\n");
+
+    // A draws on the line "two" (starts at scalar 4).
+    let anchor = note_a.anchor_at(4).unwrap();
+    assert_eq!(note_a.resolve_anchor(anchor.clone()).unwrap(), Some(4));
+    let id = note_a
+        .begin_page_stroke(anchor.clone(), Tool::Pen, 0x1122_33ff, 4.0, None)
+        .unwrap();
+    note_a.append_points(id.clone(), 1, polyline(3)).unwrap();
+    note_a
+        .finish_page_stroke(
+            page_stroke(id.clone(), 5, 0.0, 0.0),
+            anchor.clone(),
+            Vec::new(),
+        )
+        .unwrap();
+
+    wait_for("B hears the anchored wet begin", || {
+        !rec_b.wet_anchored.lock().unwrap().is_empty()
+    });
+    {
+        let wet = rec_b.wet_anchored.lock().unwrap();
+        assert_eq!(wet[0].0, id);
+        assert_eq!(wet[0].1, anchor, "anchor bytes cross unchanged");
+    }
+    wait_for("B hears page_changed", || {
+        *rec_b.page_events.lock().unwrap() > 0
+    });
+    let page_b = note_b.page_elements().unwrap();
+    assert_eq!(page_b.len(), 1);
+    assert_eq!(page_b[0].element.id(), id);
+    assert_eq!(page_b[0].anchor, anchor);
+    assert_eq!(page_b[0].char_index, Some(4), "B resolves the same line");
+    assert_eq!(note_b.resolve_anchor(anchor.clone()).unwrap(), Some(4));
+    assert_eq!(
+        note_b
+            .resolve_anchors(vec![anchor.clone(), vec![1, 2, 3]])
+            .unwrap(),
+        vec![Some(4), None]
+    );
+    assert!(
+        rec_b
+            .wet
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e == &format!("end:{id}")),
+        "wet stream ended: {:?}",
+        rec_b.wet.lock().unwrap()
+    );
+
+    // B inserts a line above: the ink on A follows "two".
+    note_b.apply_text_edit(0, 0, "zero\n".into()).unwrap();
+    wait_for("edit reaches A", || {
+        note_a.text().unwrap() == "zero\none\ntwo\n"
+    });
+    assert_eq!(note_a.resolve_anchor(anchor.clone()).unwrap(), Some(9));
+    assert_eq!(note_a.page_elements().unwrap()[0].char_index, Some(9));
+
+    // Removal propagates as another page_changed.
+    note_a.remove_page_element(id).unwrap();
+    wait_for("removal reaches B", || {
+        note_b.page_elements().unwrap().is_empty()
+    });
+    assert!(*rec_b.page_events.lock().unwrap() >= 2);
+}
+
+/// Only the elements whose ink a probe touches are removed; probes are in
+/// each element's own anchor space, so the same pen position hits or
+/// misses depending on the element's origin.
+#[test]
+fn erase_page_hits_only_touched_elements() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::new(dir.path().to_str().unwrap().into()).unwrap();
+    let note = core.clone().create_note("erase".into()).unwrap();
+    note.apply_text_edit(0, 0, "a\nb\n".into()).unwrap();
+    let top = note.anchor_at(0).unwrap();
+    let bottom = note.anchor_at(2).unwrap();
+    let near = note
+        .begin_page_stroke(top.clone(), Tool::Pen, 0xff, 4.0, None)
+        .unwrap();
+    note.finish_page_stroke(page_stroke(near.clone(), 6, 0.0, 0.0), top, Vec::new())
+        .unwrap();
+    let far = note
+        .begin_page_stroke(bottom.clone(), Tool::Pen, 0xff, 4.0, None)
+        .unwrap();
+    note.finish_page_stroke(
+        page_stroke(far.clone(), 6, 500.0, 500.0),
+        bottom,
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(note.page_elements().unwrap().len(), 2);
+
+    // A pen at the near stroke's start, expressed in both anchor spaces.
+    let probes = vec![
+        PageProbe {
+            element: near.clone(),
+            x: 0.0,
+            y: 0.0,
+        },
+        PageProbe {
+            element: far.clone(),
+            x: 0.0,
+            y: 0.0,
+        },
+        PageProbe {
+            element: "not-an-id".into(),
+            x: 0.0,
+            y: 0.0,
+        },
+    ];
+    let hit = note.erase_page_at(probes, 6.0).unwrap();
+    assert_eq!(hit, vec![near]);
+    let left = note.page_elements().unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].element.id(), far);
+    assert_eq!(left[0].char_index, Some(2));
+}
+
+#[test]
+fn style_runs_crosses_ffi() {
+    let runs = style_runs("# Hi **there**\n".into());
+    assert!(
+        runs.iter()
+            .any(|r| r.start == 0 && r.kind == StyleKind::Heading { level: 1 }),
+        "{runs:?}"
+    );
+    assert!(
+        runs.iter()
+            .any(|r| r.start == 5 && r.end == 14 && r.kind == StyleKind::Strong),
+        "{runs:?}"
+    );
+    assert!(
+        runs.iter()
+            .any(|r| r.start == 0 && r.end == 1 && r.kind == StyleKind::Marker),
+        "{runs:?}"
+    );
+    assert!(style_runs(String::new()).is_empty());
 }

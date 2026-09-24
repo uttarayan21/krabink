@@ -21,8 +21,8 @@ use tokio::sync::mpsc;
 use crate::brush::{AssetInfo, AssetKind};
 use crate::net::{self, Cmd};
 use crate::types::{
-    BrushInfo, DeviceInfo, Element, NoteInfo, PairInfo, PeerInfo, ShapeElement, Stroke,
-    StrokePoint, SyncState, Tilt, Tool, rgba_from_u32,
+    BrushInfo, DeviceInfo, Element, NoteInfo, PageElement, PageProbe, PairInfo, PeerInfo,
+    ShapeElement, Stroke, StrokePoint, SyncState, Tilt, Tool, rgba_from_u32,
 };
 
 /// Errors crossing the FFI boundary. Flattened to message-carrying variants;
@@ -67,9 +67,10 @@ pub trait CoreListener: Send + Sync {
 }
 
 /// Per-note events. Text and element changes are coarse: re-read via
-/// [`NoteSession::text`] / [`NoteSession::elements`]. Wet-ink events mirror
-/// the ephemeral stream and never touch the CRDT; render them provisionally
-/// and drop the overlay when `strokes_changed` delivers the committed
+/// [`NoteSession::text`] / [`NoteSession::page_elements`] /
+/// [`NoteSession::elements`]. Wet-ink events mirror the ephemeral stream
+/// and never touch the CRDT; render them provisionally and drop the
+/// overlay when `page_changed` / `strokes_changed` delivers the committed
 /// element (a stroke or a snapped shape) under the same id.
 #[uniffi::export(foreign)]
 pub trait NoteListener: Send + Sync {
@@ -77,7 +78,23 @@ pub trait NoteListener: Send + Sync {
     /// Fires once per (re)connection.
     fn synced(&self);
     fn text_changed(&self, text: String);
+    /// The page ink layer changed (an element was added or removed by a
+    /// peer): re-read [`NoteSession::page_elements`].
+    fn page_changed(&self);
     fn strokes_changed(&self, sketch: String);
+    /// A peer's pen went down on the page layer: `anchor` is the line the
+    /// wet stroke belongs to (resolve it with [`NoteSession::resolve_anchor`]),
+    /// and the points that follow are in that anchor's space. `spec` as
+    /// in `wet_begin`.
+    fn wet_begin_anchored(
+        &self,
+        stroke: String,
+        anchor: Vec<u8>,
+        tool: Tool,
+        color: u32,
+        base_width: f32,
+        spec: Option<Vec<u8>>,
+    );
     /// `spec` is a custom brush's encoded spec (pass it as
     /// `BrushRef.custom` with any id to mesh the wet points); `None` for
     /// the tool's preset.
@@ -828,6 +845,12 @@ impl NoteSession {
             id: sketch.to_string(),
         })
     }
+
+    fn parse_element(&self, element: &str) -> Result<pcore::ElementId> {
+        element.parse().map_err(|_| KrabinkError::MalformedId {
+            id: element.to_string(),
+        })
+    }
 }
 
 #[uniffi::export]
@@ -879,6 +902,174 @@ impl NoteSession {
         }
         Ok(())
     }
+
+    // ---- page ink (anchored to source lines) ----
+
+    /// A stable anchor for the line whose first char is at `char_index`
+    /// (unicode scalars, clamped to the text length). Opaque bytes; store
+    /// them with the ink and resolve them after every edit.
+    pub fn anchor_at(&self, char_index: u64) -> Result<Vec<u8>> {
+        self.read(|doc| Ok(doc.anchor_at(char_index as usize)?.0))
+    }
+
+    /// Where `anchor` sits in the current text (unicode scalars). A deleted
+    /// line resolves to its deletion point; `None` means the bytes are not
+    /// an anchor of this note (place the ink at the end of the text).
+    pub fn resolve_anchor(&self, anchor: Vec<u8>) -> Result<Option<u64>> {
+        self.read(|doc| Ok(doc.resolve_anchor(&pcore::Anchor(anchor)).map(|i| i as u64)))
+    }
+
+    /// [`Self::resolve_anchor`] for many anchors under one lock; results
+    /// are positional.
+    pub fn resolve_anchors(&self, anchors: Vec<Vec<u8>>) -> Result<Vec<Option<u64>>> {
+        self.read(|doc| {
+            Ok(anchors
+                .into_iter()
+                .map(|a| doc.resolve_anchor(&pcore::Anchor(a)).map(|i| i as u64))
+                .collect())
+        })
+    }
+
+    /// Every element of the page layer in z-order, each with its anchor
+    /// resolved against the current text.
+    pub fn page_elements(&self) -> Result<Vec<PageElement>> {
+        self.read(|doc| {
+            Ok(doc
+                .page_elements()
+                .into_iter()
+                .map(|p| {
+                    let at = doc.resolve_anchor(&p.anchor);
+                    PageElement::from_core(p, at)
+                })
+                .collect())
+        })
+    }
+
+    /// Pen-down on the page: announce a wet stroke anchored to a line.
+    /// Returns the stroke id to use for `append_points` and the committed
+    /// element; points streamed and committed are in `anchor`'s space.
+    pub fn begin_page_stroke(
+        &self,
+        anchor: Vec<u8>,
+        tool: Tool,
+        color: u32,
+        base_width: f32,
+        spec: Option<Vec<u8>>,
+    ) -> Result<String> {
+        let stroke = pcore::StrokeId::new();
+        self.send_wet(pcore::WetInk::BeginAnchored {
+            stroke,
+            anchor,
+            tool: tool.into(),
+            color: rgba_from_u32(color),
+            base_width,
+            spec,
+        })?;
+        Ok(stroke.to_string())
+    }
+
+    /// Pen-up on the page: commit the stroke anchored to `anchor` and end
+    /// the wet stream. Same contract as [`Self::finish_stroke`].
+    pub fn finish_page_stroke(
+        &self,
+        stroke: Stroke,
+        anchor: Vec<u8>,
+        tail: Vec<StrokePoint>,
+    ) -> Result<()> {
+        let stroke_id = self.parse_element(&stroke.id)?;
+        let committed = pcore::Stroke::from(stroke);
+        let anchor = pcore::Anchor(anchor);
+        self.commit(Flush::Immediate, |doc| {
+            doc.add_page_stroke(&committed, &anchor)
+        })?;
+        let tail: Vec<pcore::StrokePoint> = tail.into_iter().map(Into::into).collect();
+        self.send_wet(pcore::WetInk::end(stroke_id, now_ms(), &tail)?)
+    }
+
+    /// Pen-up on the page for a stroke that snapped to a shape: commit the
+    /// shape under the wet stroke's id, anchored to `anchor`, and end the
+    /// wet stream.
+    pub fn finish_page_shape(&self, shape: ShapeElement, anchor: Vec<u8>) -> Result<()> {
+        let id = self.parse_element(&shape.id)?;
+        let committed = pcore::ShapeElement::from(shape);
+        let anchor = pcore::Anchor(anchor);
+        self.commit(Flush::Immediate, |doc| {
+            doc.add_page_shape(&committed, &anchor)
+        })?;
+        self.send_wet(pcore::WetInk::end(id, now_ms(), &[])?)
+    }
+
+    /// Eraser sample on the page. Each probe is the pen position expressed
+    /// in one element's anchor space (the view knows every element's
+    /// origin; the core does not). Every probed element whose ink a circle
+    /// of `radius` at the probe touches is removed; returns their ids.
+    pub fn erase_page_at(&self, probes: Vec<PageProbe>, radius: f32) -> Result<Vec<String>> {
+        let hit: Vec<pcore::ElementId> = self.read(|doc| {
+            let elements = doc.page_elements();
+            let mut hit = Vec::new();
+            for probe in &probes {
+                let Ok(id) = probe.element.parse::<pcore::ElementId>() else {
+                    continue;
+                };
+                if hit.contains(&id) {
+                    continue;
+                }
+                let touched = elements
+                    .iter()
+                    .map(|p| &p.element)
+                    .find(|el| el.id() == id)
+                    .is_some_and(|el| el.ink().hits(&el.outline(), probe.x, probe.y, radius));
+                if touched {
+                    hit.push(id);
+                }
+            }
+            Ok(hit)
+        })?;
+        for id in &hit {
+            self.commit(Flush::Immediate, |doc| doc.remove_page_element(*id))?;
+        }
+        Ok(hit.iter().map(ToString::to_string).collect())
+    }
+
+    /// Remove one page element (stroke or shape) by id.
+    pub fn remove_page_element(&self, element: String) -> Result<()> {
+        let id = self.parse_element(&element)?;
+        self.commit(Flush::Immediate, |doc| doc.remove_page_element(id))
+    }
+
+    /// Where the pen is on the page, in `anchor`'s space; otherwise as
+    /// [`Self::send_pointer`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_page_pointer(
+        &self,
+        anchor: Vec<u8>,
+        x: f32,
+        y: f32,
+        tilt: Option<Tilt>,
+        tool: Option<Tool>,
+        color: u32,
+        base_width: f32,
+        down: bool,
+    ) -> Result<()> {
+        self.send_wet(pcore::WetInk::PointerAnchored {
+            anchor,
+            x,
+            y,
+            tilt: tilt.map(Into::into),
+            tool: tool.map(Into::into),
+            color: rgba_from_u32(color),
+            base_width,
+            down,
+            sent_ms: now_ms(),
+        })
+    }
+
+    /// The pen left the page: peers drop the pointer at once.
+    pub fn send_page_pointer_gone(&self) -> Result<()> {
+        self.send_wet(pcore::WetInk::PointerAnchoredGone)
+    }
+
+    // ---- embedded sketches (legacy) ----
 
     pub fn sketch_ids(&self) -> Result<Vec<String>> {
         self.read(|doc| Ok(doc.sketch_ids().iter().map(SketchId::to_string).collect()))

@@ -4,6 +4,11 @@
 //! The markdown is rewritten by plain string substitution rather than a
 //! parse-and-reserialize pass, so the exported source is byte-identical to
 //! the note outside the rewritten URIs.
+//!
+//! The note's page ink layer ([`NoteDoc::page_elements`]) is not exported
+//! yet: its elements have no layout-independent position, only a line
+//! anchor. A follow-up can group them by resolved line and emit one SVG
+//! after each paragraph.
 
 use std::fmt::Write as _;
 

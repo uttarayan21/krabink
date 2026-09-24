@@ -42,6 +42,21 @@ pub struct ShapeElement {
     pub created_ms: u64,
 }
 
+/// Where an element of the note's page ink layer sits: an encoded stable
+/// text position (a Loro cursor at the first character of a source line),
+/// taken from [`crate::NoteDoc::anchor_at`]. Opaque outside `note.rs`; the
+/// element's points are relative to that line's layout origin.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Anchor(pub Vec<u8>);
+
+/// One entry of the note's page ink layer: an element and the line it is
+/// anchored to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageElement {
+    pub element: Element,
+    pub anchor: Anchor,
+}
+
 /// One entry of a sketch's z-ordered element list.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Element {

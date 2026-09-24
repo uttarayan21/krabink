@@ -670,3 +670,40 @@ impl From<Element> for pcore::Element {
         }
     }
 }
+
+/// One entry of the note's page ink layer: an element plus the line it is
+/// anchored to. Points are in anchor space (relative to the text
+/// container's left edge and the top of the anchored line, at a 16 pt body
+/// font).
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct PageElement {
+    pub element: Element,
+    /// Opaque anchor bytes (a Loro stable cursor); pass them back to
+    /// `resolve_anchor` after an edit.
+    pub anchor: Vec<u8>,
+    /// Unicode-scalar index the anchor resolves to right now (the first
+    /// char of its line at draw time; any char on that line after edits).
+    /// `None` when the anchor cannot be resolved: place the ink at the end
+    /// of the text.
+    pub char_index: Option<u64>,
+}
+
+impl PageElement {
+    pub(crate) fn from_core(p: pcore::PageElement, char_index: Option<usize>) -> Self {
+        Self {
+            element: p.element.into(),
+            anchor: p.anchor.0,
+            char_index: char_index.map(|i| i as u64),
+        }
+    }
+}
+
+/// An eraser sample expressed in one page element's anchor space, for
+/// `NoteSession::erase_page_at`.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct PageProbe {
+    /// The element's id.
+    pub element: String,
+    pub x: f32,
+    pub y: f32,
+}

@@ -16,6 +16,7 @@ postcard.workspace = true
 ulid.workspace = true
 tracing.workspace = true
 loro.workspace = true
+pulldown-cmark.workspace = true
 redb.workspace = true
 lyon_tessellation.workspace = true
 ink-stroke-modeler-rs = { workspace = true, optional = true }

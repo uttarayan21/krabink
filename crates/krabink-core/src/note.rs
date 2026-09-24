@@ -1,12 +1,20 @@
-//! CRDT-backed note document: markdown text plus embedded vector sketches.
+//! CRDT-backed note document: markdown text, the page ink layer anchored to
+//! its lines, and (legacy) embedded vector sketches.
 //!
 //! Wraps `loro` entirely - no Loro types cross this module's public API, so
 //! the CRDT stays swappable and the FFI surface stays small.
 
-use loro::{ExportMode, LoroDoc, LoroList, LoroMap, LoroMovableList, LoroValue, ValueOrContainer};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use loro::cursor::{Cursor, Side};
+use loro::{
+    ContainerID, ContainerType, ExportMode, LoroDoc, LoroList, LoroMap, LoroMovableList, LoroValue,
+    ValueOrContainer,
+};
 
 use crate::brush::{BrushId, BrushSpec, CustomBrush};
-use crate::element::{Binding, Element, ShapeElement, Style};
+use crate::element::{Anchor, Binding, Element, PageElement, ShapeElement, Style};
 use crate::shape::Shape;
 use crate::stroke::{Rgba, Stroke, Tool, decode_chunks, encode_chunks};
 use crate::{ElementId, Error, NoteId, Result, SketchId, StrokeId};
@@ -14,16 +22,26 @@ use crate::{ElementId, Error, NoteId, Result, SketchId, StrokeId};
 const META: &str = "meta";
 const TEXT: &str = "text";
 const SKETCHES: &str = "sketches";
+/// The note's page ink layer: one z-ordered element list whose entries
+/// carry an `anchor` (see [`Anchor`]). A root container, so two devices that
+/// draw before their first sync both write into the same list rather than
+/// racing to create it.
+const PAGE: &str = "page";
 /// Per-sketch z-ordered element list. Named for the days it held only
 /// strokes; renaming would orphan every existing sketch.
 const ELEMENTS: &str = "strokes";
 const ELEM_STROKE: &str = "stroke";
 const ELEM_SHAPE: &str = "shape";
+const ANCHOR: &str = "anchor";
 
-/// A single note: CommonMark text + sketches, one Loro doc.
+/// A single note: CommonMark text + page ink + sketches, one Loro doc.
 pub struct NoteDoc {
     doc: LoroDoc,
     id: NoteId,
+    /// Cursors Loro refreshed after their character was deleted, keyed by
+    /// the anchor bytes as stored. Resolving such an anchor otherwise costs
+    /// a history diff every time.
+    anchors: Mutex<HashMap<Vec<u8>, Cursor>>,
 }
 
 impl NoteDoc {
@@ -31,6 +49,7 @@ impl NoteDoc {
         Self {
             doc: LoroDoc::new(),
             id,
+            anchors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -78,6 +97,123 @@ impl NoteDoc {
         Ok(())
     }
 
+    // ---- anchors ----
+
+    /// A stable position at `char_index` (unicode scalars, clamped to the
+    /// text length) for anchoring page ink to the line that starts there.
+    /// Survives every edit: see [`Self::resolve_anchor`].
+    pub fn anchor_at(&self, char_index: usize) -> Result<Anchor> {
+        let cursor = self
+            .doc
+            .get_text(TEXT)
+            .get_cursor(char_index, Side::Left)
+            .ok_or_else(|| Error::Schema("text container is detached".into()))?;
+        Ok(Anchor(cursor.encode()))
+    }
+
+    /// Where `anchor` sits in the current text, as a unicode-scalar index.
+    /// An anchor whose character was deleted resolves to the deletion
+    /// point. `None` for bytes that are not an anchor of this note's text or
+    /// whose history is gone; callers place such ink at the end.
+    pub fn resolve_anchor(&self, anchor: &Anchor) -> Option<usize> {
+        let cached = self.anchor_cache().get(&anchor.0).cloned();
+        let cursor = match cached {
+            Some(cursor) => cursor,
+            None => Cursor::decode(&anchor.0).ok()?,
+        };
+        if cursor.container != text_container_id() {
+            return None;
+        }
+        match self.doc.get_cursor_pos(&cursor) {
+            Ok(found) => {
+                if let Some(fresh) = found.update {
+                    self.anchor_cache().insert(anchor.0.clone(), fresh);
+                }
+                Some(found.current.pos)
+            }
+            Err(err) => {
+                tracing::warn!(%err, "anchor cannot be resolved");
+                None
+            }
+        }
+    }
+
+    fn anchor_cache(&self) -> std::sync::MutexGuard<'_, HashMap<Vec<u8>, Cursor>> {
+        self.anchors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // ---- page ink ----
+
+    fn page_list(&self) -> LoroMovableList {
+        self.doc.get_movable_list(PAGE)
+    }
+
+    /// Number of entries in the page layer (a cheap change probe).
+    pub fn page_len(&self) -> usize {
+        self.page_list().len()
+    }
+
+    /// Append a stroke on top of the page layer, anchored to a line.
+    pub fn add_page_stroke(&self, stroke: &Stroke, anchor: &Anchor) -> Result<()> {
+        let map = self.page_list().push_container(LoroMap::new())?;
+        write_stroke(&map, stroke)?;
+        map.insert(ANCHOR, LoroValue::Binary(anchor.0.clone().into()))?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// Append a shape on top of the page layer, anchored to a line.
+    pub fn add_page_shape(&self, shape: &ShapeElement, anchor: &Anchor) -> Result<()> {
+        let map = self.page_list().push_container(LoroMap::new())?;
+        write_shape(&map, shape)?;
+        map.insert(ANCHOR, LoroValue::Binary(anchor.0.clone().into()))?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// Remove the page element with `id`.
+    pub fn remove_page_element(&self, id: ElementId) -> Result<()> {
+        remove_by_id(&self.page_list(), id)?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// The page layer in z-order. Entries this version cannot read, or
+    /// that carry no anchor, are logged and skipped.
+    pub fn page_elements(&self) -> Vec<PageElement> {
+        let list = self.page_list();
+        let mut elements = Vec::new();
+        let mut anchors = Vec::new();
+        for i in 0..list.len() {
+            let Some(map) = list.get(i).and_then(as_map) else {
+                tracing::warn!(index = i, "page entry is not a map; skipped");
+                continue;
+            };
+            let element = match Self::read_element(&map) {
+                Ok(Some(element)) => element,
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(index = i, %err, "unreadable page element skipped");
+                    continue;
+                }
+            };
+            let Some(anchor) = map.get(ANCHOR).and_then(as_binary) else {
+                tracing::warn!(index = i, "page element without anchor skipped");
+                continue;
+            };
+            elements.push(element);
+            anchors.push(Anchor(anchor));
+        }
+        prune_bindings(&mut elements);
+        elements
+            .into_iter()
+            .zip(anchors)
+            .map(|(element, anchor)| PageElement { element, anchor })
+            .collect()
+    }
+
     // ---- meta ----
 
     pub fn title(&self) -> Option<String> {
@@ -114,23 +250,8 @@ impl NoteDoc {
 
     /// Append a stroke on top of the sketch's z-order.
     pub fn add_stroke(&self, sketch: SketchId, stroke: &Stroke) -> Result<()> {
-        let elements = self.elements_list(sketch)?;
-        let map = elements.push_container(LoroMap::new())?;
-        map.insert("id", stroke.id.to_string())?;
-        map.insert("elem", ELEM_STROKE)?;
-        map.insert("tool", stroke.tool.as_str())?;
-        map.insert("color", stroke.color.packed())?;
-        map.insert("width", f64::from(stroke.base_width))?;
-        map.insert("kind", stroke.kind.as_str())?;
-        map.insert("created", to_i64(stroke.created_ms))?;
-        if let Some(custom) = &stroke.brush {
-            map.insert("brush", custom.id.to_string())?;
-            map.insert("spec", LoroValue::Binary(custom.spec.encode()?.into()))?;
-        }
-        let points = map.insert_container("points", LoroList::new())?;
-        for chunk in encode_chunks(&stroke.points)? {
-            points.push(LoroValue::Binary(chunk.into()))?;
-        }
+        let map = self.elements_list(sketch)?.push_container(LoroMap::new())?;
+        write_stroke(&map, stroke)?;
         self.doc.commit();
         Ok(())
     }
@@ -138,85 +259,15 @@ impl NoteDoc {
     /// Append a shape on top of the sketch's z-order. Geometry is stored
     /// as flat scalar keys so a later edit merges per field.
     pub fn add_shape(&self, sketch: SketchId, shape: &ShapeElement) -> Result<()> {
-        let elements = self.elements_list(sketch)?;
-        let map = elements.push_container(LoroMap::new())?;
-        map.insert("id", shape.id.to_string())?;
-        map.insert("elem", ELEM_SHAPE)?;
-        map.insert("tool", shape.style.tool.as_str())?;
-        map.insert("color", shape.style.color.packed())?;
-        map.insert("width", f64::from(shape.style.width))?;
-        map.insert("created", to_i64(shape.created_ms))?;
-        let (kind, fields): (&str, Vec<(&str, f32)>) = match shape.shape {
-            Shape::Line { a, b } => (
-                "line",
-                vec![("ax", a[0]), ("ay", a[1]), ("bx", b[0]), ("by", b[1])],
-            ),
-            Shape::Arrow { a, b } => (
-                "arrow",
-                vec![("ax", a[0]), ("ay", a[1]), ("bx", b[0]), ("by", b[1])],
-            ),
-            Shape::Rect {
-                center,
-                size,
-                angle,
-            } => (
-                "rect",
-                vec![
-                    ("cx", center[0]),
-                    ("cy", center[1]),
-                    ("w", size[0]),
-                    ("h", size[1]),
-                    ("angle", angle),
-                ],
-            ),
-            Shape::Ellipse {
-                center,
-                radii,
-                angle,
-            } => (
-                "ellipse",
-                vec![
-                    ("cx", center[0]),
-                    ("cy", center[1]),
-                    ("rx", radii[0]),
-                    ("ry", radii[1]),
-                    ("angle", angle),
-                ],
-            ),
-        };
-        map.insert("shape", kind)?;
-        for (key, value) in fields {
-            map.insert(key, f64::from(value))?;
-        }
-        for (key, binding) in [("start", shape.start), ("end", shape.end)] {
-            if let Some(b) = binding {
-                let m = map.insert_container(key, LoroMap::new())?;
-                m.insert("element", b.element.to_string())?;
-                m.insert("fx", f64::from(b.fixed_point[0]))?;
-                m.insert("fy", f64::from(b.fixed_point[1]))?;
-                m.insert("gap", f64::from(b.gap))?;
-            }
-        }
+        let map = self.elements_list(sketch)?.push_container(LoroMap::new())?;
+        write_shape(&map, shape)?;
         self.doc.commit();
         Ok(())
     }
 
     /// Remove the element with `id` (stroke or shape).
     pub fn remove_element(&self, sketch: SketchId, id: ElementId) -> Result<()> {
-        let elements = self.elements_list(sketch)?;
-        let target = id.to_string();
-        let index = (0..elements.len()).find(|&i| {
-            elements
-                .get(i)
-                .and_then(as_map)
-                .and_then(|m| m.get("id"))
-                .and_then(as_string)
-                .is_some_and(|id| id == target)
-        });
-        let Some(index) = index else {
-            return Err(Error::Schema(format!("element {target} not found")));
-        };
-        elements.delete(index, 1)?;
+        remove_by_id(&self.elements_list(sketch)?, id)?;
         self.doc.commit();
         Ok(())
     }
@@ -247,16 +298,7 @@ impl NoteDoc {
                 }
             })
             .collect();
-        let ids: std::collections::HashSet<ElementId> = elements.iter().map(Element::id).collect();
-        for el in &mut elements {
-            if let Element::Shape(shape) = el {
-                for binding in [&mut shape.start, &mut shape.end] {
-                    if binding.is_some_and(|b| !ids.contains(&b.element)) {
-                        *binding = None;
-                    }
-                }
-            }
-        }
+        prune_bindings(&mut elements);
         Ok(elements)
     }
 
@@ -403,7 +445,23 @@ impl NoteDoc {
         fields: &[(&str, LoroValue)],
         chunks: &[Vec<u8>],
     ) -> Result<()> {
-        let map = self.elements_list(sketch)?.push_container(LoroMap::new())?;
+        self.push_raw_into(&self.elements_list(sketch)?, fields, chunks)
+    }
+
+    /// [`Self::push_raw`] for the page layer.
+    #[cfg(test)]
+    fn push_raw_page(&self, fields: &[(&str, LoroValue)], chunks: &[Vec<u8>]) -> Result<()> {
+        self.push_raw_into(&self.page_list(), fields, chunks)
+    }
+
+    #[cfg(test)]
+    fn push_raw_into(
+        &self,
+        list: &LoroMovableList,
+        fields: &[(&str, LoroValue)],
+        chunks: &[Vec<u8>],
+    ) -> Result<()> {
+        let map = list.push_container(LoroMap::new())?;
         for (k, v) in fields {
             map.insert(k, v.clone())?;
         }
@@ -440,6 +498,124 @@ impl NoteDoc {
     pub fn import_update(&self, bytes: &[u8]) -> Result<bool> {
         let status = self.doc.import(bytes)?;
         Ok(!status.success.is_empty())
+    }
+}
+
+// ---- element (de)serialisation shared by sketches and the page layer ----
+
+fn text_container_id() -> ContainerID {
+    ContainerID::new_root(TEXT, ContainerType::Text)
+}
+
+fn write_stroke(map: &LoroMap, stroke: &Stroke) -> Result<()> {
+    map.insert("id", stroke.id.to_string())?;
+    map.insert("elem", ELEM_STROKE)?;
+    map.insert("tool", stroke.tool.as_str())?;
+    map.insert("color", stroke.color.packed())?;
+    map.insert("width", f64::from(stroke.base_width))?;
+    map.insert("kind", stroke.kind.as_str())?;
+    map.insert("created", to_i64(stroke.created_ms))?;
+    if let Some(custom) = &stroke.brush {
+        map.insert("brush", custom.id.to_string())?;
+        map.insert("spec", LoroValue::Binary(custom.spec.encode()?.into()))?;
+    }
+    let points = map.insert_container("points", LoroList::new())?;
+    for chunk in encode_chunks(&stroke.points)? {
+        points.push(LoroValue::Binary(chunk.into()))?;
+    }
+    Ok(())
+}
+
+/// Geometry is stored as flat scalar keys so a later edit merges per field.
+fn write_shape(map: &LoroMap, shape: &ShapeElement) -> Result<()> {
+    map.insert("id", shape.id.to_string())?;
+    map.insert("elem", ELEM_SHAPE)?;
+    map.insert("tool", shape.style.tool.as_str())?;
+    map.insert("color", shape.style.color.packed())?;
+    map.insert("width", f64::from(shape.style.width))?;
+    map.insert("created", to_i64(shape.created_ms))?;
+    let (kind, fields): (&str, Vec<(&str, f32)>) = match shape.shape {
+        Shape::Line { a, b } => (
+            "line",
+            vec![("ax", a[0]), ("ay", a[1]), ("bx", b[0]), ("by", b[1])],
+        ),
+        Shape::Arrow { a, b } => (
+            "arrow",
+            vec![("ax", a[0]), ("ay", a[1]), ("bx", b[0]), ("by", b[1])],
+        ),
+        Shape::Rect {
+            center,
+            size,
+            angle,
+        } => (
+            "rect",
+            vec![
+                ("cx", center[0]),
+                ("cy", center[1]),
+                ("w", size[0]),
+                ("h", size[1]),
+                ("angle", angle),
+            ],
+        ),
+        Shape::Ellipse {
+            center,
+            radii,
+            angle,
+        } => (
+            "ellipse",
+            vec![
+                ("cx", center[0]),
+                ("cy", center[1]),
+                ("rx", radii[0]),
+                ("ry", radii[1]),
+                ("angle", angle),
+            ],
+        ),
+    };
+    map.insert("shape", kind)?;
+    for (key, value) in fields {
+        map.insert(key, f64::from(value))?;
+    }
+    for (key, binding) in [("start", shape.start), ("end", shape.end)] {
+        if let Some(b) = binding {
+            let m = map.insert_container(key, LoroMap::new())?;
+            m.insert("element", b.element.to_string())?;
+            m.insert("fx", f64::from(b.fixed_point[0]))?;
+            m.insert("fy", f64::from(b.fixed_point[1]))?;
+            m.insert("gap", f64::from(b.gap))?;
+        }
+    }
+    Ok(())
+}
+
+/// Delete the entry whose `id` field is `id`; the caller commits.
+fn remove_by_id(list: &LoroMovableList, id: ElementId) -> Result<()> {
+    let target = id.to_string();
+    let index = (0..list.len()).find(|&i| {
+        list.get(i)
+            .and_then(as_map)
+            .and_then(|m| m.get("id"))
+            .and_then(as_string)
+            .is_some_and(|id| id == target)
+    });
+    let Some(index) = index else {
+        return Err(Error::Schema(format!("element {target} not found")));
+    };
+    list.delete(index, 1)?;
+    Ok(())
+}
+
+/// Drop bindings whose target is not among `elements`.
+fn prune_bindings(elements: &mut [Element]) {
+    let ids: std::collections::HashSet<ElementId> = elements.iter().map(Element::id).collect();
+    for el in elements.iter_mut() {
+        if let Element::Shape(shape) = el {
+            for binding in [&mut shape.start, &mut shape.end] {
+                if binding.is_some_and(|b| !ids.contains(&b.element)) {
+                    *binding = None;
+                }
+            }
+        }
     }
 }
 
@@ -722,6 +898,192 @@ mod tests {
                 }
             );
         }
+    }
+
+    fn page_stroke(a: &NoteDoc, at: usize) -> (Stroke, Anchor) {
+        let anchor = a.anchor_at(at).unwrap();
+        let stroke = sample_stroke();
+        a.add_page_stroke(&stroke, &anchor).unwrap();
+        (stroke, anchor)
+    }
+
+    fn sync(from: &NoteDoc, to: &NoteDoc) {
+        to.import_update(&from.export_updates_since(&to.version()).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn page_elements_roundtrip_through_sync() {
+        let id = NoteId::new();
+        let a = NoteDoc::new(id);
+        let b = NoteDoc::new(id);
+        a.splice_text(0, 0, "one\ntwo\n").unwrap();
+        let (stroke, anchor) = page_stroke(&a, 4);
+        let rect = sample_shape(Shape::Rect {
+            center: [10.0, 20.0],
+            size: [100.0, 50.0],
+            angle: 0.0,
+        });
+        let arrow = ShapeElement {
+            start: Some(Binding {
+                element: rect.id,
+                fixed_point: [1.0, 0.5],
+                gap: 4.0,
+            }),
+            end: Some(Binding {
+                element: ElementId::new(),
+                fixed_point: [0.0, 0.5],
+                gap: 0.0,
+            }),
+            ..sample_shape(Shape::Arrow {
+                a: [0.0, 0.0],
+                b: [80.0, 5.0],
+            })
+        };
+        let top = a.anchor_at(0).unwrap();
+        a.add_page_shape(&rect, &top).unwrap();
+        a.add_page_shape(&arrow, &top).unwrap();
+        sync(&a, &b);
+
+        let expected = vec![
+            PageElement {
+                element: Element::Stroke(stroke.clone()),
+                anchor: anchor.clone(),
+            },
+            PageElement {
+                element: Element::Shape(rect),
+                anchor: top.clone(),
+            },
+            PageElement {
+                element: Element::Shape(ShapeElement { end: None, ..arrow }),
+                anchor: top,
+            },
+        ];
+        assert_eq!(b.page_elements(), expected);
+        assert_eq!(b.page_len(), 3);
+        assert_eq!(b.resolve_anchor(&anchor), Some(4));
+
+        b.remove_page_element(stroke.id).unwrap();
+        sync(&b, &a);
+        assert_eq!(a.page_elements(), expected[1..]);
+        assert!(a.sketch_ids().is_empty());
+    }
+
+    #[test]
+    fn concurrent_first_page_draws_both_survive() {
+        let id = NoteId::new();
+        let a = NoteDoc::new(id);
+        let b = NoteDoc::new(id);
+        a.splice_text(0, 0, "shared\n").unwrap();
+        sync(&a, &b);
+        // Neither replica has seen the other's page layer yet.
+        let (sa, _) = page_stroke(&a, 0);
+        let (sb, _) = page_stroke(&b, 0);
+        sync(&a, &b);
+        sync(&b, &a);
+        let ids_a: Vec<ElementId> = a.page_elements().iter().map(|p| p.element.id()).collect();
+        let ids_b: Vec<ElementId> = b.page_elements().iter().map(|p| p.element.id()).collect();
+        assert_eq!(ids_a, ids_b);
+        assert_eq!(ids_a.len(), 2);
+        assert!(ids_a.contains(&sa.id) && ids_a.contains(&sb.id));
+    }
+
+    #[test]
+    fn anchor_moves_with_insert_above_not_below() {
+        let a = NoteDoc::new(NoteId::new());
+        a.splice_text(0, 0, "a\nb\nc\n").unwrap();
+        let anchor = a.anchor_at(2).unwrap();
+        assert_eq!(a.resolve_anchor(&anchor), Some(2));
+        a.splice_text(0, 0, "xx\n").unwrap();
+        assert_eq!(a.resolve_anchor(&anchor), Some(5));
+        a.splice_text(7, 0, "tail").unwrap();
+        assert_eq!(a.resolve_anchor(&anchor), Some(5));
+        // Typing at the anchored line's start keeps the anchor on that char.
+        a.splice_text(5, 0, "# ").unwrap();
+        assert_eq!(a.resolve_anchor(&anchor), Some(7));
+    }
+
+    #[test]
+    fn anchor_of_deleted_line_snaps_to_deletion_point() {
+        let a = NoteDoc::new(NoteId::new());
+        a.splice_text(0, 0, "a\nb\nc\n").unwrap();
+        let anchor = a.anchor_at(2).unwrap();
+        a.splice_text(2, 2, "").unwrap();
+        assert_eq!(a.text(), "a\nc\n");
+        assert_eq!(a.resolve_anchor(&anchor), Some(2));
+        // Second resolve hits the refreshed cursor and still tracks edits.
+        a.splice_text(0, 0, "z").unwrap();
+        assert_eq!(a.resolve_anchor(&anchor), Some(3));
+        assert_eq!(a.resolve_anchor(&anchor), Some(3));
+    }
+
+    #[test]
+    fn anchor_at_end_tracks_growth() {
+        let a = NoteDoc::new(NoteId::new());
+        let empty = a.anchor_at(0).unwrap();
+        assert_eq!(a.resolve_anchor(&empty), Some(0));
+        a.splice_text(0, 0, "abc").unwrap();
+        let end = a.anchor_at(99).unwrap();
+        assert_eq!(a.resolve_anchor(&end), Some(3));
+        a.splice_text(3, 0, "def").unwrap();
+        assert_eq!(a.resolve_anchor(&end), Some(6));
+    }
+
+    #[test]
+    fn anchor_resolves_on_replica_after_remote_edit() {
+        let id = NoteId::new();
+        let a = NoteDoc::new(id);
+        let b = NoteDoc::new(id);
+        a.splice_text(0, 0, "one\ntwo\n").unwrap();
+        let (_, anchor) = page_stroke(&a, 4);
+        sync(&a, &b);
+        assert_eq!(b.resolve_anchor(&anchor), Some(4));
+        b.splice_text(0, 0, "zero\n").unwrap();
+        sync(&b, &a);
+        assert_eq!(a.resolve_anchor(&anchor), Some(9));
+        assert_eq!(b.resolve_anchor(&anchor), Some(9));
+    }
+
+    #[test]
+    fn garbage_or_foreign_anchor_is_none() {
+        let a = NoteDoc::new(NoteId::new());
+        a.splice_text(0, 0, "text").unwrap();
+        assert_eq!(a.resolve_anchor(&Anchor(vec![0xff, 0x00, 0x13])), None);
+        let foreign = a.doc.get_text("other").get_cursor(0, Side::Left).unwrap();
+        assert_eq!(a.resolve_anchor(&Anchor(foreign.encode())), None);
+    }
+
+    #[test]
+    fn page_entries_without_anchor_or_unknown_kind_are_skipped() {
+        let a = NoteDoc::new(NoteId::new());
+        let (stroke, _) = page_stroke(&a, 0);
+        let chunks = encode_chunks(&stroke.points).unwrap();
+        a.push_raw_page(
+            &[
+                ("id", StrokeId::new().to_string().into()),
+                ("elem", "stroke".into()),
+                ("tool", "pen".into()),
+                ("color", 255_i64.into()),
+                ("width", 2.0_f64.into()),
+                ("kind", "polyline".into()),
+                ("created", 0_i64.into()),
+            ],
+            &chunks,
+        )
+        .unwrap();
+        a.push_raw_page(
+            &[
+                ("id", ElementId::new().to_string().into()),
+                ("elem", "hologram".into()),
+                ("anchor", LoroValue::Binary(vec![1, 2, 3].into())),
+            ],
+            &[],
+        )
+        .unwrap();
+        let page = a.page_elements();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].element.id(), stroke.id);
+        assert_eq!(a.page_len(), 3);
     }
 
     #[test]
