@@ -329,21 +329,28 @@ private struct NoteRow: View {
 }
 
 /// The selected note's page (styled markdown source with ink drawn over
-/// it) on a card under a title header with the live-sync dot, matching
-/// the desktop layout.
+/// it), or its rendered preview, on a card under a title header with the
+/// live-sync dot, matching the desktop layout.
 private struct NoteDetail: View {
     let model: AppModel
     let note: NoteModel
     @State private var theme = ThemeStore.shared
     @State private var showBrushes = false
+    @State private var preview = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
-            NoteCanvas(model: note, flavor: theme.flavor)
-                .card()
-                .padding(.horizontal, Theme.pagePadding)
-                .padding(.bottom, Theme.pagePadding)
+            Group {
+                if preview {
+                    MarkdownPreview(model: note, flavor: theme.flavor)
+                } else {
+                    NoteCanvas(model: note, flavor: theme.flavor)
+                }
+            }
+            .card()
+            .padding(.horizontal, Theme.pagePadding)
+            .padding(.bottom, Theme.pagePadding)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.bg)
@@ -351,6 +358,14 @@ private struct NoteDetail: View {
         .toolbarBackground(Theme.bg, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    preview.toggle()
+                } label: {
+                    Label(preview ? "Edit" : "Preview", systemImage: preview ? "pencil" : "eye")
+                }
+                .accessibilityIdentifier("previewToggle")
+            }
             if #unavailable(iOS 18.0) {
                 // iOS 17 has no custom picker items: library brushes come
                 // from a sheet, and a pill names the active one.
@@ -408,6 +423,7 @@ private struct NoteDetail: View {
                 .foregroundStyle(Theme.muted)
                 .lineLimit(1)
                 .accessibilityIdentifier("sketchStatus")
+            Caption(preview ? "preview" : "markdown")
         }
         .padding(.horizontal, Theme.pagePadding + 4)
         .padding(.top, 8)

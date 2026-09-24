@@ -54,6 +54,58 @@ struct ScalarIndex {
     }
 }
 
+/// One replacement in unicode scalars: `del` scalars at `at` become
+/// `insert`. The CRDT's edit unit (`NoteSession.applyTextEdit`).
+struct TextSplice: Equatable {
+    var at: Int
+    var del: Int
+    var insert: String
+    var insertCount: Int { insert.unicodeScalars.count }
+
+    /// The single splice turning `old` into `new` (common prefix and
+    /// suffix trimmed); `nil` when equal.
+    static func of(_ old: String, _ new: String) -> TextSplice? {
+        guard old != new else { return nil }
+        let a = Array(old.unicodeScalars)
+        let b = Array(new.unicodeScalars)
+        var prefix = 0
+        while prefix < a.count && prefix < b.count && a[prefix] == b[prefix] { prefix += 1 }
+        var suffix = 0
+        while suffix < a.count - prefix && suffix < b.count - prefix
+            && a[a.count - 1 - suffix] == b[b.count - 1 - suffix]
+        {
+            suffix += 1
+        }
+        var insert = String.UnicodeScalarView()
+        insert.append(contentsOf: b[prefix..<(b.count - suffix)])
+        return TextSplice(at: prefix, del: a.count - prefix - suffix, insert: String(insert))
+    }
+
+    /// This splice, made against the same base text as `remote`, moved to
+    /// apply after `remote` did. Disjoint edits shift; when they overlap,
+    /// the local insertion is kept and only the part of its deletion the
+    /// remote did not already cover is deleted.
+    func transformed(past remote: TextSplice) -> TextSplice {
+        var out = self
+        let remoteEnd = remote.at + remote.del
+        let localEnd = at + del
+        if remoteEnd <= at {
+            out.at += remote.insertCount - remote.del
+        } else if remote.at >= localEnd {
+            // Remote is after: nothing moves.
+        } else if remote.at <= at {
+            // Remote starts before or at us: land after its insertion and
+            // delete only what remains past its deletion.
+            out.at = remote.at + remote.insertCount
+            out.del = max(0, localEnd - remoteEnd)
+        } else {
+            // We start before the remote: delete up to where it begins.
+            out.del = remote.at - at
+        }
+        return out
+    }
+}
+
 /// What the ink model needs from the editor's layout.
 @MainActor
 protocol LineLayoutProvider: AnyObject {

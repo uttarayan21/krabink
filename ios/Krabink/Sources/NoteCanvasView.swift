@@ -15,11 +15,17 @@
 // its content offset at zoom 1, so ink scrolls with the text. Fonts are
 // fixed at 16 pt (no Dynamic Type): anchor space depends on it.
 //
-// CRDT binding, both ways. Local: `shouldChangeTextIn` converts the UTF-16
-// range to unicode scalars and forwards the splice; the text view then
-// applies the edit itself. Remote: `applyRemote` diffs the view against
-// the model (common prefix/suffix), replaces only the changed range and
-// remaps the cursor, so typing survives remote edits. After either, the
+// CRDT binding, both ways, through one reconciliation (`reconcile`).
+// `shadow` is the text the view and the CRDT last agreed on. A local edit
+// (`textViewDidChange`) is the splice from `shadow` to the view; a remote
+// one (`textChanged` → `model.text`) the splice from `shadow` to the CRDT.
+// When both are pending the local splice is transformed past the remote
+// one before it goes into the CRDT, then the merged text comes back into
+// the view (only the changed range replaced, cursor remapped). Offsets are
+// never taken from a view that lags the CRDT, and the view never holds
+// text the CRDT lacks past the next keystroke: that was the drift, where
+// a remote edit that landed just before a keystroke shifted every later
+// local splice and was dropped from the view. After either direction the
 // markdown is restyled and the layout manager's completion re-places the
 // ink.
 
@@ -49,6 +55,8 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
     var onLayoutChanged: (() -> Void)?
     private let hoverRecognizer = UIHoverGestureRecognizer()
     private var index = ScalarIndex("")
+    /// The text the view and the CRDT last agreed on.
+    private var shadow = ""
     private var layoutNotifyPending = false
     private var lastTailHeight: CGFloat = -1
 
@@ -206,6 +214,7 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
 
     private func setText(_ text: String) {
         textView.text = text
+        shadow = text
         index = ScalarIndex(text)
         restyle()
     }
@@ -222,11 +231,36 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
         scheduleLayoutNotify()
     }
 
-    /// The model's text changed under us (a remote edit): replace only
-    /// the changed range so the local cursor survives.
+    /// The model's text changed under us (a remote edit landed): fold it
+    /// in. Cheap when nothing is pending.
     func syncFromModel() {
-        let target = model.text
-        guard textView.text != target else { return }
+        guard model.text != shadow || textView.text != shadow else { return }
+        reconcile()
+    }
+
+    /// Bring the view and the CRDT to the same text. Local changes since
+    /// `shadow` go into the CRDT, moved past any remote change that landed
+    /// meanwhile; the CRDT's text then comes back into the view.
+    private func reconcile() {
+        let view = textView.text ?? ""
+        guard let crdt = try? model.session.text() else { return }
+        if let local = TextSplice.of(shadow, view) {
+            var splice = local
+            if crdt != shadow, let remote = TextSplice.of(shadow, crdt) {
+                splice = local.transformed(past: remote)
+            }
+            model.localEdit(at: UInt64(splice.at), del: UInt64(splice.del), insert: splice.insert)
+        }
+        let merged = (try? model.session.text()) ?? crdt
+        if merged != view { replaceInView(with: merged) }
+        shadow = merged
+        model.text = merged
+        index = ScalarIndex(merged)
+        restyle()
+    }
+
+    /// Replace only the range that differs so the local cursor survives.
+    private func replaceInView(with target: String) {
         let old = Array((textView.text ?? "").utf16)
         let new = Array(target.utf16)
 
@@ -257,33 +291,15 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
             selection.length = 0
         }
         textView.selectedRange = selection
-        index = ScalarIndex(textView.text ?? "")
-        restyle()
     }
 
     // MARK: UITextViewDelegate
 
-    nonisolated func textView(
-        _ textView: UITextView, shouldChangeTextIn range: NSRange, replacementText text: String
-    ) -> Bool {
-        MainActor.assumeIsolated {
-            let current = textView.text ?? ""
-            if index.utf16Count != (current as NSString).length { index = ScalarIndex(current) }
-            let at = index.scalar(ofUTF16: range.location)
-            let del = index.scalar(ofUTF16: range.location + range.length) - at
-            model.localEdit(at: UInt64(at), del: UInt64(del), insert: text)
-            return true
-        }
-    }
-
+    /// Every edit the view made (typing, paste, autocorrect, undo,
+    /// dictation) lands here; the splice is taken from the text itself,
+    /// so nothing the view does can slip past the CRDT.
     nonisolated func textViewDidChange(_ textView: UITextView) {
-        MainActor.assumeIsolated {
-            // Keep the model in step so the next sync sees no phantom diff.
-            let text = textView.text ?? ""
-            model.text = text
-            index = ScalarIndex(text)
-            restyle()
-        }
+        MainActor.assumeIsolated { reconcile() }
     }
 
     /// The keyboard went away: keep the tool picker by taking the

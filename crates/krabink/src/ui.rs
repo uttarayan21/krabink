@@ -1,10 +1,11 @@
 //! Editor UI: library sidebar and one styled markdown editor bound to the
 //! CRDT via prefix/suffix diffing. The source is styled in place (headings
-//! large, markers dimmed, lists indented, code monospace); there is no
-//! separate preview. The note's page ink renders under the text: each frame
-//! the editor publishes a [`PageLayout`] (where every anchored element's
-//! line sits in the galley, and which part of the galley is on screen) and
-//! paints the off-screen page texture the sketch module renders from it.
+//! large, markers dimmed, lists indented, code monospace); a toggle swaps
+//! the editor for a rendered read-only preview of the same text. The note's
+//! page ink renders under the editor's text: each frame the editor
+//! publishes a [`PageLayout`] (where every anchored element's line sits in
+//! the galley, and which part of the galley is on screen) and paints the
+//! off-screen page texture the sketch module renders from it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use std::sync::Arc;
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, egui};
 use egui::text::{ByteIndex, CCursor, LayoutJob, LayoutSection, TextFormat};
+use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use krabink_core::{Anchor, DocKey, ElementId, NoteDoc, NoteId, StyleKind, StyleRun, style_runs};
 
 use crate::docs::Docs;
@@ -45,9 +47,15 @@ pub struct EditorState {
     last: String,
     /// Set by the sync layer when remote changes may have landed.
     pub remote_dirty: bool,
+    /// Show the rendered preview instead of the editor.
+    pub preview: bool,
     /// Style runs of the buffer, reparsed only when the text changes.
     styled: StyledCache,
 }
+
+/// egui_commonmark's image/link cache for the preview.
+#[derive(Default)]
+struct MarkdownCache(CommonMarkCache);
 
 #[derive(Default)]
 struct StyledCache {
@@ -151,6 +159,7 @@ impl Plugin for EditorUiPlugin {
         app.init_resource::<EditorState>()
             .init_resource::<FollowLatest>()
             .init_resource::<PageLayout>()
+            .init_non_send::<MarkdownCache>()
             // Theme first so the very first frame already renders styled.
             .add_systems(EguiPrimaryContextPass, editor_ui.after(theme::apply));
     }
@@ -191,6 +200,7 @@ fn editor_ui(
     mut editor: ResMut<EditorState>,
     mut layout: ResMut<PageLayout>,
     page_texture: Res<PageTexture>,
+    mut markdown: NonSendMut<MarkdownCache>,
     mut commits: MessageWriter<LocalCommit>,
     mut subscribes: MessageWriter<SubscribeNeeded>,
     mut settings: ResMut<Settings>,
@@ -449,11 +459,33 @@ fn editor_ui(
                         (palette.warn, "sync connecting…")
                     };
                     palette.status_dot(ui, color, label);
+                    ui.add_space(8.0);
+                    // Right-to-left: "Edit  Preview" read left to right.
+                    let mut preview = editor.preview;
+                    if ui.selectable_label(preview, "Preview").clicked() {
+                        preview = true;
+                    }
+                    if ui.selectable_label(!preview, "Edit").clicked() {
+                        preview = false;
+                    }
+                    editor.preview = preview;
                 });
             });
             ui.add_space(12.0);
 
             let editor_height = ui.available_height();
+            if editor.preview {
+                pane(ui, &palette, editor_height, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("preview")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            CommonMarkViewer::new().show(ui, &mut markdown.0, &editor.buffer);
+                        });
+                });
+                return;
+            }
             let (output, inner_rect) = pane(ui, &palette, editor_height, |ui| {
                 let scroll = egui::ScrollArea::vertical()
                     .id_salt("editor")
