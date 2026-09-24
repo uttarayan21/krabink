@@ -253,7 +253,11 @@ struct ContentView: View {
     @ViewBuilder
     private var detail: some View {
         if selection.count == 1, let id = selection.first, let note = model.note(for: id) {
+            // Keyed by note: the canvas binds its text view and ink model
+            // to one `NoteModel` when made, so a switch must make a new one
+            // rather than update the old one in place.
             NoteDetail(model: model, note: note)
+                .id(id)
         } else {
             emptyDetail
         }
