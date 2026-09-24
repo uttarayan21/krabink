@@ -569,23 +569,32 @@ fn editor_ui(
                         ui.add_space(available.y * TAIL_FRACTION);
                         if let Some(target) = &page_texture.0 {
                             // Painted in galley space, so a one-frame-old
-                            // window still lands on the right text.
-                            let rect = egui::Rect::from_min_size(
+                            // window still lands on the right text. The
+                            // texture overscans the viewport; only the
+                            // visible part is drawn, with the pane's
+                            // corner radius so the paper follows the card.
+                            let texture_rect = egui::Rect::from_min_size(
                                 output.galley_pos + target.window_min,
                                 target.size,
                             );
-                            ui.painter().set(
-                                under,
-                                egui::Shape::image(
-                                    target.texture,
-                                    rect,
-                                    egui::Rect::from_min_max(
-                                        egui::Pos2::ZERO,
-                                        egui::pos2(1.0, 1.0),
-                                    ),
-                                    egui::Color32::WHITE,
-                                ),
-                            );
+                            let visible = ui.clip_rect().intersect(texture_rect);
+                            if visible.is_positive() {
+                                let uv = egui::Rect::from_min_max(
+                                    ((visible.min - texture_rect.min) / texture_rect.size())
+                                        .to_pos2(),
+                                    ((visible.max - texture_rect.min) / texture_rect.size())
+                                        .to_pos2(),
+                                );
+                                ui.painter().set(
+                                    under,
+                                    egui::epaint::RectShape::filled(
+                                        visible,
+                                        egui::CornerRadius::same(theme::RADIUS),
+                                        egui::Color32::WHITE,
+                                    )
+                                    .with_texture(target.texture, uv),
+                                );
+                            }
                         }
                         output
                     });
