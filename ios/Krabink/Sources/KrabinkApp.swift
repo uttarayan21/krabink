@@ -329,8 +329,9 @@ private struct NoteRow: View {
 }
 
 /// The selected note's page (styled markdown source with ink drawn over
-/// it), or its rendered preview, on a card under a title header with the
-/// live-sync dot, matching the desktop layout.
+/// it, or the same page as the reading view with markers hidden) on a
+/// card under a title header with the live-sync dot, matching the desktop
+/// layout.
 private struct NoteDetail: View {
     let model: AppModel
     let note: NoteModel
@@ -341,16 +342,10 @@ private struct NoteDetail: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
-            Group {
-                if preview {
-                    MarkdownPreview(model: note, flavor: theme.flavor)
-                } else {
-                    NoteCanvas(model: note, flavor: theme.flavor)
-                }
-            }
-            .card()
-            .padding(.horizontal, Theme.pagePadding)
-            .padding(.bottom, Theme.pagePadding)
+            NoteCanvas(model: note, flavor: theme.flavor, preview: preview)
+                .card()
+                .padding(.horizontal, Theme.pagePadding)
+                .padding(.bottom, Theme.pagePadding)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.bg)

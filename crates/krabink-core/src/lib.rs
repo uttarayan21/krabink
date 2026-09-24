@@ -47,7 +47,7 @@ pub use geom::{
     DEFAULT_TOLERANCE, GrainStyle, Ink, InkMesh, InkStyle, InkVertex, MAX_DABS, MaskStyle,
 };
 pub use ids::{DeviceId, ElementId, NoteId, SketchId, StrokeId};
-pub use markdown::{StyleKind, StyleRun, style_runs};
+pub use markdown::{PreviewText, StyleKind, StyleRun, preview_text, style_runs};
 pub use note::NoteDoc;
 pub use pair::PairInfo;
 pub use shape::{Recognition, RecognizerParams, Shape, recognize, recognize_with};

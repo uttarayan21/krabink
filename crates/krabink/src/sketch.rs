@@ -427,9 +427,10 @@ fn to_egui(v: Vec2) -> egui::Vec2 {
     egui::vec2(v.x, v.y)
 }
 
-/// Where `anchor`'s line sits, in galley space.
-fn origin_of(galley: &egui::Galley, note: &NoteDoc, anchor: &Anchor) -> Vec2 {
-    to_bevy(resolve_origin(galley, note, anchor))
+/// Where `anchor`'s line sits, in galley space (through the reading
+/// view's source map when that is what the galley shows).
+fn origin_of(layout: &PageLayout, galley: &egui::Galley, note: &NoteDoc, anchor: &Anchor) -> Vec2 {
+    to_bevy(resolve_origin(galley, note, anchor, layout.source_map()))
 }
 
 /// The render target region for a visible galley `window`: the window
@@ -595,7 +596,7 @@ fn sync_page_scene(
             .origins
             .get(&id)
             .map(|o| to_bevy(*o))
-            .unwrap_or_else(|| origin_of(galley, note, &el.anchor));
+            .unwrap_or_else(|| origin_of(&layout, galley, note, &el.anchor));
         if let Some(drawn) = stale.remove(&id) {
             if let Some(drawn) = drawn {
                 commands.entity(drawn.entity).insert(place(origin, drawn.z));
@@ -641,14 +642,14 @@ fn sync_page_scene(
 
     // Wet strokes and pointers follow their lines too.
     for wet in wet.values_mut() {
-        let origin = origin_of(galley, note, &wet.anchor);
+        let origin = origin_of(&layout, galley, note, &wet.anchor);
         wet.origin = Some(origin);
         if let Some(drawn) = wet.drawn {
             commands.entity(drawn.entity).insert(place(origin, drawn.z));
         }
     }
     for pointer in pointers.values() {
-        let origin = origin_of(galley, note, &pointer.anchor);
+        let origin = origin_of(&layout, galley, note, &pointer.anchor);
         pointer.dab.replace(&mut commands, origin);
         pointer.ring.replace(&mut commands, origin);
     }
@@ -962,7 +963,7 @@ fn apply_wet_ink(
                         };
                         let origin = *wet
                             .origin
-                            .get_or_insert_with(|| origin_of(galley, note, &wet.anchor));
+                            .get_or_insert_with(|| origin_of(&layout, galley, note, &wet.anchor));
                         let slot = scene.palette.insert(&style, &ink_assets);
                         let z = wet_z(scene.wet_serial);
                         scene.wet_serial = (scene.wet_serial + 1) % WET_Z_SLOTS;
@@ -1021,7 +1022,7 @@ fn apply_wet_ink(
                     continue; // nowhere to place it
                 };
                 let anchor = Anchor(anchor);
-                let origin = origin_of(galley, note, &anchor);
+                let origin = origin_of(&layout, galley, note, &anchor);
                 let dab =
                     tool.and_then(|tool| pointer_dab(tool, color, base_width, x, y, tilt, down));
                 // The eraser's ring is its reach; a tool's hugs the tip.

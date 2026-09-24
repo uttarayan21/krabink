@@ -1,6 +1,7 @@
-// Preview mode renders markdown structure (not the raw source): headings
-// lose their `#`, list items get bullets/numbers, emphasis markers vanish.
-// Runs offline — notes are local until a relay connects.
+// Preview mode is the reading view: the same editor with the markdown
+// syntax hidden (headings lose their `#`, list items get bullets, emphasis
+// markers vanish, code fences go) and editing off. Runs offline — notes
+// are local until a relay connects.
 
 import XCTest
 
@@ -15,15 +16,14 @@ final class PreviewUITests: XCTestCase {
         return app
     }
 
-    func testPreviewRendersMarkdown() {
+    func testPreviewHidesMarkdownSyntax() {
         let app = launch()
         app.buttons["newNote"].tap()
 
         let editor = app.textViews["editor"]
         XCTAssertTrue(editor.waitForExistence(timeout: 5))
         editor.tap()
-        editor.typeText(
-            """
+        let source = """
             # Title
 
             Some *emphasis*, **strong** and `code` text with a [link](https://example.com).
@@ -44,39 +44,42 @@ final class PreviewUITests: XCTestCase {
             let x = 1
             ```
 
-            | name | count |
-            | --- | ---: |
-            | apples | 3 |
-
             ---
 
             ~~struck~~ end.
 
-            """)
+            """
+        editor.typeText(source)
 
         app.buttons["previewToggle"].tap()
-        let preview = app.textViews["preview"]
-        XCTAssertTrue(preview.waitForExistence(timeout: 5))
-        let text = preview.value as? String ?? ""
-
+        // Same text view, now read-only, showing the reading view.
+        XCTAssertTrue(editor.waitForExistence(timeout: 5))
         let shot = XCTAttachment(screenshot: app.screenshot())
         shot.name = "preview"
         shot.lifetime = .keepAlways
         add(shot)
 
+        let text = editor.value as? String ?? ""
         XCTAssertTrue(text.contains("Title"), text)
         XCTAssertFalse(text.contains("# Title"), "heading marker leaked: \(text)")
-        XCTAssertTrue(text.contains("•\tfirst"), "no bullet: \(text)")
-        XCTAssertTrue(text.contains("◦\tnested"), "no nested bullet: \(text)")
-        XCTAssertTrue(text.contains("1.\tone"), "no number: \(text)")
-        XCTAssertTrue(text.contains("☐\ttodo") || text.contains("☐ todo"), "no checkbox: \(text)")
-        XCTAssertTrue(text.contains("☑"), "no checked box: \(text)")
+        XCTAssertTrue(text.contains("• first"), "no bullet: \(text)")
+        XCTAssertTrue(text.contains("◦ nested"), "no nested bullet: \(text)")
+        XCTAssertTrue(text.contains("1. one"), "number lost: \(text)")
+        XCTAssertTrue(text.contains("☐ todo"), "no checkbox: \(text)")
+        XCTAssertTrue(text.contains("☑ done"), "no checked box: \(text)")
         XCTAssertFalse(text.contains("**"), "strong marker leaked: \(text)")
         XCTAssertFalse(text.contains("```"), "fence leaked: \(text)")
         XCTAssertTrue(text.contains("let x = 1"), text)
-        XCTAssertTrue(text.contains("apples\t3"), "table not tabbed: \(text)")
-        XCTAssertFalse(text.contains("| ---"), "table rule leaked: \(text)")
+        XCTAssertFalse(text.contains("> quoted"), "quote marker leaked: \(text)")
+        XCTAssertTrue(text.contains("quoted words"), text)
         XCTAssertFalse(text.contains("~~"), "strikethrough marker leaked: \(text)")
         XCTAssertFalse(text.contains("](https"), "link syntax leaked: \(text)")
+        XCTAssertTrue(text.contains("link."), "link text lost: \(text)")
+
+        // Back to the editor: the source is intact.
+        app.buttons["previewToggle"].tap()
+        let back = editor.value as? String ?? ""
+        XCTAssertTrue(back.contains("# Title"), "source lost after preview: \(back)")
+        XCTAssertTrue(back.contains("- [ ] todo"), "source lost after preview: \(back)")
     }
 }

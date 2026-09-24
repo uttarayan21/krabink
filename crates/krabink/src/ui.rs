@@ -1,11 +1,14 @@
 //! Editor UI: library sidebar and one styled markdown editor bound to the
 //! CRDT via prefix/suffix diffing. The source is styled in place (headings
 //! large, markers dimmed, lists indented, code monospace); a toggle swaps
-//! the editor for a rendered read-only preview of the same text. The note's
-//! page ink renders under the editor's text: each frame the editor
+//! the editor for the reading view: the same text laid out the same way
+//! with its markers hidden (`krabink_core::preview_text`), read-only. The
+//! note's page ink renders under the text in both: each frame the editor
 //! publishes a [`PageLayout`] (where every anchored element's line sits in
 //! the galley, and which part of the galley is on screen) and paints the
-//! off-screen page texture the sketch module renders from it.
+//! off-screen page texture the sketch module renders from it. In the
+//! reading view anchors resolve through the display's source map, so ink
+//! stays on its line.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,8 +16,9 @@ use std::sync::Arc;
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, egui};
 use egui::text::{ByteIndex, CCursor, LayoutJob, LayoutSection, TextFormat};
-use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
-use krabink_core::{Anchor, DocKey, ElementId, NoteDoc, NoteId, StyleKind, StyleRun, style_runs};
+use krabink_core::{
+    Anchor, DocKey, ElementId, NoteDoc, NoteId, StyleKind, StyleRun, preview_text, style_runs,
+};
 
 use crate::docs::Docs;
 use crate::settings::Settings;
@@ -47,20 +51,41 @@ pub struct EditorState {
     last: String,
     /// Set by the sync layer when remote changes may have landed.
     pub remote_dirty: bool,
-    /// Show the rendered preview instead of the editor.
+    /// Show the reading view (markers hidden, read-only) instead of the
+    /// editor.
     pub preview: bool,
     /// Style runs of the buffer, reparsed only when the text changes.
     styled: StyledCache,
+    /// The reading view of the buffer, rebuilt only when the text changes.
+    previewed: PreviewCache,
 }
-
-/// egui_commonmark's image/link cache for the preview.
-#[derive(Default)]
-struct MarkdownCache(CommonMarkCache);
 
 #[derive(Default)]
 struct StyledCache {
     for_text: String,
     runs: Vec<StyleRun>,
+}
+
+/// `preview_text` of the buffer: the display text (held mutably for the
+/// read-only `TextEdit`), its runs and its source map.
+#[derive(Default)]
+struct PreviewCache {
+    for_text: String,
+    display: String,
+    runs: Vec<StyleRun>,
+    source_of: Arc<Vec<usize>>,
+}
+
+impl PreviewCache {
+    fn refresh(&mut self, text: &str) {
+        if self.for_text != text {
+            let preview = preview_text(text);
+            self.for_text = text.to_owned();
+            self.display = preview.text;
+            self.runs = preview.runs;
+            self.source_of = Arc::new(preview.source_of);
+        }
+    }
 }
 
 impl StyledCache {
@@ -93,6 +118,9 @@ pub struct PageLayout {
     pub scale: f32,
     /// Bumped whenever `origins` or the galley geometry changed.
     pub generation: u64,
+    /// In the reading view: for each galley char, the source char it came
+    /// from (`PreviewText::source_of`). `None` while editing (identity).
+    pub source_of: Option<Arc<Vec<usize>>>,
 }
 
 impl Default for PageLayout {
@@ -106,6 +134,7 @@ impl Default for PageLayout {
             window: egui::Rect::ZERO,
             scale: 1.0,
             generation: 0,
+            source_of: None,
         }
     }
 }
@@ -120,17 +149,34 @@ impl PageLayout {
         galley: Arc<egui::Galley>,
         window: egui::Rect,
         scale: f32,
+        source_of: Option<Arc<Vec<usize>>>,
     ) {
         let version = note.version();
         let size = galley.size();
-        if self.note != Some(id) || self.doc_version != version || self.galley_size != size {
+        let same_map = match (&self.source_of, &source_of) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        if self.note != Some(id)
+            || self.doc_version != version
+            || self.galley_size != size
+            || !same_map
+        {
             self.note = Some(id);
             self.doc_version = version;
             self.galley_size = size;
+            self.source_of = source_of;
+            let map = self.source_of.as_deref().map(Vec::as_slice);
             self.origins = note
                 .page_elements()
                 .iter()
-                .map(|el| (el.element.id(), resolve_origin(&galley, note, &el.anchor)))
+                .map(|el| {
+                    (
+                        el.element.id(),
+                        resolve_origin(&galley, note, &el.anchor, map),
+                    )
+                })
                 .collect();
             self.generation += 1;
         }
@@ -138,13 +184,29 @@ impl PageLayout {
         self.window = window;
         self.scale = scale;
     }
+
+    /// The galley's source map, for resolving anchors not in `origins`.
+    pub fn source_map(&self) -> Option<&[usize]> {
+        self.source_of.as_deref().map(Vec::as_slice)
+    }
 }
 
 /// Anchor-space origin of `anchor` in galley space: the top of the row its
-/// line starts on. Unresolvable anchors sit below the last row.
-pub fn resolve_origin(galley: &egui::Galley, note: &NoteDoc, anchor: &Anchor) -> egui::Vec2 {
+/// line starts on. `source_of` maps galley chars to source chars when the
+/// galley is the reading view (`None`: identity). Unresolvable anchors sit
+/// below the last row.
+pub fn resolve_origin(
+    galley: &egui::Galley,
+    note: &NoteDoc,
+    anchor: &Anchor,
+    source_of: Option<&[usize]>,
+) -> egui::Vec2 {
     match note.resolve_anchor(anchor) {
         Some(index) => {
+            let index = match source_of {
+                Some(map) => map.partition_point(|&s| s < index),
+                None => index,
+            };
             let row = galley.pos_from_cursor(CCursor::new(index));
             egui::vec2(0.0, row.min.y)
         }
@@ -159,7 +221,6 @@ impl Plugin for EditorUiPlugin {
         app.init_resource::<EditorState>()
             .init_resource::<FollowLatest>()
             .init_resource::<PageLayout>()
-            .init_non_send::<MarkdownCache>()
             // Theme first so the very first frame already renders styled.
             .add_systems(EguiPrimaryContextPass, editor_ui.after(theme::apply));
     }
@@ -200,7 +261,6 @@ fn editor_ui(
     mut editor: ResMut<EditorState>,
     mut layout: ResMut<PageLayout>,
     page_texture: Res<PageTexture>,
-    mut markdown: NonSendMut<MarkdownCache>,
     mut commits: MessageWriter<LocalCommit>,
     mut subscribes: MessageWriter<SubscribeNeeded>,
     mut settings: ResMut<Settings>,
@@ -474,18 +534,7 @@ fn editor_ui(
             ui.add_space(12.0);
 
             let editor_height = ui.available_height();
-            if editor.preview {
-                pane(ui, &palette, editor_height, |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt("preview")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            CommonMarkViewer::new().show(ui, &mut markdown.0, &editor.buffer);
-                        });
-                });
-                return;
-            }
+            let preview = editor.preview;
             let (output, inner_rect) = pane(ui, &palette, editor_height, |ui| {
                 let scroll = egui::ScrollArea::vertical()
                     .id_salt("editor")
@@ -496,16 +545,30 @@ fn editor_ui(
                         // known.
                         let under = ui.painter().add(egui::Shape::Noop);
                         let available = ui.available_size();
-                        let EditorState { buffer, styled, .. } = &mut *editor;
+                        let EditorState {
+                            buffer,
+                            styled,
+                            previewed,
+                            ..
+                        } = &mut *editor;
+                        // The reading view shows the display text (read-only)
+                        // with the runs remapped onto it; the editor the
+                        // source with its own runs.
+                        let (text, runs): (&mut String, &[StyleRun]) = if preview {
+                            previewed.refresh(buffer);
+                            (&mut previewed.display, &previewed.runs)
+                        } else {
+                            let runs = styled.runs_for(buffer);
+                            (buffer, runs)
+                        };
                         let mut layouter =
                             |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-                                let text = text.as_str();
-                                let job =
-                                    layout_job(text, styled.runs_for(text), &palette, wrap_width);
+                                let job = layout_job(text.as_str(), runs, &palette, wrap_width);
                                 ui.painter().layout_job(job)
                             };
-                        let output = egui::TextEdit::multiline(buffer)
+                        let output = egui::TextEdit::multiline(text)
                             .layouter(&mut layouter)
+                            .interactive(!preview)
                             .frame(egui::Frame::NONE)
                             .desired_width(f32::INFINITY)
                             .min_size(available)
@@ -537,7 +600,7 @@ fn editor_ui(
                 (scroll.inner, scroll.inner_rect)
             });
 
-            if output.response.response.changed() {
+            if !preview && output.response.response.changed() {
                 let (buffer, last) = (editor.buffer.clone(), editor.last.clone());
                 if let Some((at, del, insert)) = splice_of(&last, &buffer) {
                     match docs.splice(id, at, del, &insert) {
@@ -572,7 +635,8 @@ fn editor_ui(
 
             if let Some(note) = docs.note(id) {
                 let window = inner_rect.translate(-output.galley_pos.to_vec2());
-                layout.update(id, note, output.galley, window, scale);
+                let map = preview.then(|| editor.previewed.source_of.clone());
+                layout.update(id, note, output.galley, window, scale, map);
             }
         });
 

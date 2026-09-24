@@ -117,11 +117,34 @@ protocol LineLayoutProvider: AnyObject {
     func origin(forScalar scalar: Int) -> CGPoint
 }
 
-/// Line geometry of a TextKit 1 text view.
+/// Line geometry of a TextKit 1 text view. In the reading view the text
+/// shown is the source with markers hidden: `sourceOf` maps each display
+/// scalar back to its source scalar (`PreviewText.sourceOf`), so the
+/// scalars this hands out and takes are always source scalars.
 @MainActor
 struct LineLayout {
     let textView: UITextView
+    /// Over the displayed text.
     let index: ScalarIndex
+    /// Display scalar → source scalar; `nil` while editing (identity).
+    let sourceOf: [Int]?
+
+    /// Display scalar of the first display char at or after source `scalar`.
+    private func display(ofSource scalar: Int) -> Int {
+        guard let sourceOf else { return scalar }
+        var low = 0
+        var high = sourceOf.count
+        while low < high {
+            let mid = (low + high) / 2
+            if sourceOf[mid] < scalar { low = mid + 1 } else { high = mid }
+        }
+        return low
+    }
+
+    private func source(ofDisplay scalar: Int) -> Int {
+        guard let sourceOf else { return scalar }
+        return sourceOf[max(0, min(scalar, sourceOf.count - 1))]
+    }
 
     private var layoutManager: NSLayoutManager { textView.layoutManager }
     private var container: NSTextContainer { textView.textContainer }
@@ -163,7 +186,7 @@ struct LineLayout {
     }
 
     func origin(forScalar scalar: Int) -> CGPoint {
-        origin(lineStart: lineStart(utf16: index.utf16(ofScalar: scalar)))
+        origin(lineStart: lineStart(utf16: index.utf16(ofScalar: display(ofSource: scalar))))
     }
 
     func line(at point: CGPoint) -> (scalar: Int, origin: CGPoint) {
@@ -184,6 +207,6 @@ struct LineLayout {
             let char = layoutManager.characterIndexForGlyph(at: glyph)
             start = lineStart(utf16: char)
         }
-        return (index.scalar(ofUTF16: start), origin(lineStart: start))
+        return (source(ofDisplay: index.scalar(ofUTF16: start)), origin(lineStart: start))
     }
 }

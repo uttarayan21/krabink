@@ -1,7 +1,10 @@
 //! Markdown style runs for the editors: which spans of the source are a
 //! heading, emphasis, code, a list item, or syntax markers. Both editors
 //! keep the source text as is (view text == CRDT text) and style it in
-//! place, so this is the one parse they share.
+//! place, so this is the one parse they share. [`preview_text`] derives
+//! the reading view from the same runs: the source with its syntax hidden
+//! (bullets substituted), plus the map from display chars back to source
+//! chars, so ink anchored to source lines lands on the same lines there.
 //!
 //! Offsets are unicode scalars, `[start, end)`, matching
 //! [`crate::NoteDoc::splice_text`].
@@ -166,6 +169,193 @@ fn push_markers(text: &str, range: Range<usize>, runs: &mut Vec<(Range<usize>, S
     if let Some(s) = start {
         runs.push((range.start + s..range.end, StyleKind::Marker));
     }
+}
+
+/// The reading view of a source text: markers hidden, list bullets and
+/// task boxes substituted, lines that were only syntax (code fences)
+/// dropped. Every display char knows the source char it came from, so
+/// anchors resolved against the source map onto display lines.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PreviewText {
+    pub text: String,
+    /// For each display char, the source char (unicode scalar index) it
+    /// came from; one more entry for the end of the text, mapping to the
+    /// source length. Non-decreasing.
+    pub source_of: Vec<usize>,
+    /// [`style_runs`] of the source, remapped to display coordinates
+    /// (still sorted, outer before inner; runs that vanished are gone).
+    pub runs: Vec<StyleRun>,
+}
+
+impl PreviewText {
+    /// Display index of the first display char at or after source char
+    /// `source` (the display length when nothing follows). A char in a
+    /// dropped line maps to the start of the next displayed line.
+    pub fn display_of(&self, source: usize) -> usize {
+        self.source_of.partition_point(|&s| s < source)
+    }
+}
+
+/// What the preview does with one source char.
+#[derive(Clone, Copy)]
+enum Show {
+    Keep,
+    Drop,
+    /// Replace the marker this char starts with.
+    Subst(&'static str),
+}
+
+/// See [`PreviewText`].
+pub fn preview_text(text: &str) -> PreviewText {
+    let runs = style_runs(text);
+    let chars: Vec<char> = text.chars().collect();
+    let mut show = vec![Show::Keep; chars.len()];
+    // The last substituted bullet: its start, and the index its item text
+    // starts at (past the space).
+    let mut last_bullet: Option<(usize, usize)> = None;
+
+    for (i, run) in runs.iter().enumerate() {
+        if run.kind != StyleKind::Marker {
+            continue;
+        }
+        // The innermost run this marker belongs to: the last earlier
+        // non-marker run that encloses it (sorted outer before inner).
+        let host = runs[..i]
+            .iter()
+            .rev()
+            .find(|r| r.kind != StyleKind::Marker && r.start <= run.start && r.end >= run.end)
+            .map(|r| r.kind);
+        let src: String = chars[run.start..run.end].iter().collect();
+        let action = match host {
+            Some(StyleKind::ListItem { depth, ordered }) => match src.as_str() {
+                "-" | "*" | "+" if !ordered => Show::Subst(if depth <= 1 { "•" } else { "◦" }),
+                "[ ]" => Show::Subst("☐"),
+                "[x]" | "[X]" => Show::Subst("☑"),
+                _ if ordered && is_ordinal(&src) => Show::Keep,
+                _ => Show::Drop,
+            },
+            Some(StyleKind::ThematicBreak) => Show::Keep,
+            _ => Show::Drop,
+        };
+        if matches!(action, Show::Keep) {
+            continue;
+        }
+        // A task box replaces the bullet before it.
+        if matches!(action, Show::Subst("☐" | "☑"))
+            && let Some((bullet, gap)) = last_bullet.take()
+            && gap == run.start
+        {
+            for slot in &mut show[bullet..run.start] {
+                *slot = Show::Drop;
+            }
+        }
+        show[run.start] = action;
+        for slot in &mut show[run.start + 1..run.end] {
+            *slot = Show::Drop;
+        }
+        // Block syntax (`#`, `>`, a dropped bullet) takes the space after
+        // it along, so lines do not start with a stray blank.
+        let at_line_start = chars[..run.start]
+            .iter()
+            .rev()
+            .take_while(|&&c| c != '\n')
+            .enumerate()
+            .all(|(back, c)| {
+                c.is_whitespace() || !matches!(show[run.start - 1 - back], Show::Keep)
+            });
+        if at_line_start && matches!(action, Show::Drop) {
+            let mut j = run.end;
+            while j < chars.len() && chars[j] == ' ' {
+                show[j] = Show::Drop;
+                j += 1;
+            }
+        }
+        if let Show::Subst("•" | "◦") = action {
+            // Remember the bullet and where the text after its space starts.
+            let mut gap = run.end;
+            while gap < chars.len() && chars[gap] == ' ' {
+                gap += 1;
+            }
+            last_bullet = Some((run.start, gap));
+        }
+    }
+
+    let mut out = String::new();
+    let mut source_of: Vec<usize> = Vec::new();
+    // Display length (chars) just before each source char is handled.
+    let mut display_start = vec![0usize; chars.len() + 1];
+    // The current source line: where its display started, whether the
+    // source had any content.
+    let mut line_start = 0usize;
+    let mut line_content = false;
+    let push = |out: &mut String, source_of: &mut Vec<usize>, ch: char, from: usize| {
+        out.push(ch);
+        source_of.push(from);
+    };
+    for (i, &ch) in chars.iter().enumerate() {
+        display_start[i] = source_of.len();
+        if ch == '\n' {
+            if line_content && out[byte_at(&out, line_start)..].trim().is_empty() {
+                // Only syntax on this line (a code fence): drop the line.
+                out.truncate(byte_at(&out, line_start));
+                source_of.truncate(line_start);
+            } else {
+                push(&mut out, &mut source_of, '\n', i);
+            }
+            line_start = source_of.len();
+            line_content = false;
+            continue;
+        }
+        line_content |= !ch.is_whitespace();
+        match show[i] {
+            Show::Keep => push(&mut out, &mut source_of, ch, i),
+            Show::Drop => {}
+            Show::Subst(s) => {
+                for sub in s.chars() {
+                    push(&mut out, &mut source_of, sub, i);
+                }
+            }
+        }
+    }
+    if line_content && out[byte_at(&out, line_start)..].trim().is_empty() {
+        out.truncate(byte_at(&out, line_start));
+        source_of.truncate(line_start);
+    }
+    display_start[chars.len()] = source_of.len();
+    // Chars of a dropped line were counted before the drop: clamp so the
+    // table is non-decreasing and within the display.
+    for i in (0..chars.len()).rev() {
+        display_start[i] = display_start[i].min(display_start[i + 1]);
+    }
+    source_of.push(chars.len());
+
+    let runs = runs
+        .into_iter()
+        .map(|r| StyleRun {
+            start: display_start[r.start],
+            end: display_start[r.end],
+            kind: r.kind,
+        })
+        .filter(|r| r.start < r.end)
+        .collect();
+    PreviewText {
+        text: out,
+        source_of,
+        runs,
+    }
+}
+
+/// `1.` / `12)`: an ordered-list marker.
+fn is_ordinal(marker: &str) -> bool {
+    let digits = marker.trim_end_matches(['.', ')']);
+    digits.len() + 1 == marker.len()
+        && !digits.is_empty()
+        && digits.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Byte offset of char `index` in `s` (`s.len()` past the end).
+fn byte_at(s: &str, index: usize) -> usize {
+    s.char_indices().nth(index).map_or(s.len(), |(b, _)| b)
 }
 
 fn heading_level(level: HeadingLevel) -> u8 {
@@ -425,5 +615,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn preview(text: &str) -> PreviewText {
+        preview_text(text)
+    }
+
+    #[test]
+    fn preview_hides_markers_and_substitutes_bullets() {
+        let p = preview(
+            "# Title\n\nSome *em* and **st** `c` [l](u).\n\n- a\n  - b\n\n1. one\n\n- [ ] t\n- [x] d\n",
+        );
+        assert_eq!(
+            p.text,
+            "Title\n\nSome em and st c l.\n\n• a\n  ◦ b\n\n1. one\n\n☐ t\n☑ d\n"
+        );
+    }
+
+    #[test]
+    fn preview_drops_fence_lines_and_keeps_rules() {
+        let p = preview("x\n```rust\nlet a = 1;\n```\n\n---\n");
+        assert_eq!(p.text, "x\nlet a = 1;\n\n---\n");
+        // Source char → display: the fence line maps to the code line.
+        let fence = 2;
+        let code = "x\n```rust\n".chars().count();
+        assert_eq!(p.display_of(fence), 2);
+        assert_eq!(p.display_of(code), 2);
+        assert_eq!(p.source_of[2], code);
+        assert_eq!(
+            *p.source_of.last().unwrap(),
+            "x\n```rust\nlet a = 1;\n```\n\n---\n".chars().count()
+        );
+        let code_run = p
+            .runs
+            .iter()
+            .find(|r| r.kind == StyleKind::CodeBlock)
+            .unwrap();
+        assert_eq!(
+            p.text
+                .chars()
+                .skip(code_run.start)
+                .take(code_run.end - code_run.start)
+                .collect::<String>(),
+            "let a = 1;\n"
+        );
+    }
+
+    #[test]
+    fn preview_runs_are_remapped_and_sorted() {
+        let p = preview("## H *e*\n\n> q **b**\n");
+        let display_runs: Vec<(String, StyleKind)> = p
+            .runs
+            .iter()
+            .map(|r| {
+                (
+                    p.text.chars().skip(r.start).take(r.end - r.start).collect(),
+                    r.kind,
+                )
+            })
+            .collect();
+        assert!(
+            display_runs
+                .iter()
+                .any(|(t, k)| t.trim_end() == "H e" && *k == StyleKind::Heading { level: 2 }),
+            "{display_runs:?}"
+        );
+        assert!(display_runs.contains(&("e".into(), StyleKind::Emphasis)));
+        assert!(display_runs.contains(&("b".into(), StyleKind::Strong)));
+        assert!(
+            display_runs
+                .iter()
+                .any(|(t, k)| t.trim_end() == "q b" && *k == StyleKind::BlockQuote),
+            "{display_runs:?}"
+        );
+        // Markers only survive as substitutions (bullets, boxes), never as
+        // syntax text.
+        assert!(
+            display_runs.iter().all(|(_, k)| *k != StyleKind::Marker),
+            "{display_runs:?}"
+        );
+        assert!(p.runs.windows(2).all(|w| w[0].start <= w[1].start));
+        assert_eq!(p.source_of.len(), p.text.chars().count() + 1);
+    }
+
+    #[test]
+    fn preview_of_plain_text_is_identity() {
+        let p = preview("plain\nlines\n");
+        assert_eq!(p.text, "plain\nlines\n");
+        assert_eq!(p.source_of, (0..=12).collect::<Vec<_>>());
+        assert!(p.runs.is_empty());
     }
 }

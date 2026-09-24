@@ -79,3 +79,28 @@ pub fn style_runs(text: String) -> Vec<StyleRun> {
         .map(Into::into)
         .collect()
 }
+
+/// The reading view of a source text. See `krabink_core::PreviewText`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PreviewText {
+    /// The source with markers hidden, bullets substituted and fence lines
+    /// dropped.
+    pub text: String,
+    /// For each display char (unicode scalar) the source char it came
+    /// from, plus one entry for the end mapping to the source length.
+    pub source_of: Vec<u64>,
+    /// Style runs in display coordinates.
+    pub runs: Vec<StyleRun>,
+}
+
+/// The reading view of `text`: markers hidden, every display char mapped
+/// back to its source char so anchors keep resolving.
+#[uniffi::export]
+pub fn preview_text(text: String) -> PreviewText {
+    let p = pcore::preview_text(&text);
+    PreviewText {
+        text: p.text,
+        source_of: p.source_of.into_iter().map(|s| s as u64).collect(),
+        runs: p.runs.into_iter().map(Into::into).collect(),
+    }
+}

@@ -15,6 +15,12 @@
 // its content offset at zoom 1, so ink scrolls with the text. Fonts are
 // fixed at 16 pt (no Dynamic Type): anchor space depends on it.
 //
+// `preview` swaps the source for the reading view (`previewText`: markers
+// hidden, bullets substituted, read-only) in the same text view, styled by
+// the same styler. Lines keep their identity through the display's source
+// map, so ink stays on its line and the Pencil still draws (anchors are
+// taken in source scalars either way).
+//
 // CRDT binding, both ways, through one reconciliation (`reconcile`).
 // `shadow` is the text the view and the CRDT last agreed on. A local edit
 // (`textViewDidChange`) is the splice from `shadow` to the view; a remote
@@ -55,8 +61,29 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
     var onLayoutChanged: (() -> Void)?
     private let hoverRecognizer = UIHoverGestureRecognizer()
     private var index = ScalarIndex("")
-    /// The text the view and the CRDT last agreed on.
+    /// The text the view and the CRDT last agreed on (the source text,
+    /// also in the reading view).
     private var shadow = ""
+    /// Display scalar → source scalar in the reading view; `nil` editing.
+    private var sourceOf: [Int]?
+    /// The source the reading view was last built from.
+    private var previewedFor: String?
+
+    /// Show the reading view (read-only) instead of the editor.
+    var preview = false {
+        didSet {
+            guard preview != oldValue else { return }
+            if preview, textView.isFirstResponder { textView.resignFirstResponder() }
+            textView.isEditable = !preview
+            if preview {
+                renderPreview()
+            } else {
+                previewedFor = nil
+                sourceOf = nil
+                setText(shadow)
+            }
+        }
+    }
     private var layoutNotifyPending = false
     private var lastTailHeight: CGFloat = -1
 
@@ -159,7 +186,7 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
     }
 
     /// The layout the ink model resolves anchors against.
-    var lineLayout: LineLayout { LineLayout(textView: textView, index: index) }
+    var lineLayout: LineLayout { LineLayout(textView: textView, index: index, sourceOf: sourceOf) }
 
     private func scheduleLayoutNotify() {
         guard !layoutNotifyPending else { return }
@@ -224,6 +251,10 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
     /// the composition.
     private func restyle() {
         guard textView.markedTextRange == nil else { return }
+        if preview {
+            renderPreview()
+            return
+        }
         let text = textView.text ?? ""
         if index.utf16Count != (text as NSString).length { index = ScalarIndex(text) }
         MarkdownStyler.restyle(textView.textStorage, runs: styleRuns(text: text), index: index)
@@ -231,9 +262,30 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
         scheduleLayoutNotify()
     }
 
+    /// Show the reading view of `shadow` (rebuilt only when the source
+    /// changed; restyled always, for a flavour switch).
+    private func renderPreview() {
+        let rendered = previewText(text: shadow)
+        if previewedFor != shadow {
+            previewedFor = shadow
+            textView.text = rendered.text
+            index = ScalarIndex(rendered.text)
+            sourceOf = rendered.sourceOf.map { Int($0) }
+        }
+        MarkdownStyler.restyle(textView.textStorage, runs: rendered.runs, index: index)
+        scheduleLayoutNotify()
+    }
+
     /// The model's text changed under us (a remote edit landed): fold it
     /// in. Cheap when nothing is pending.
     func syncFromModel() {
+        if preview {
+            // Read-only: the CRDT is the only writer.
+            guard model.text != shadow else { return }
+            shadow = model.text
+            renderPreview()
+            return
+        }
         guard model.text != shadow || textView.text != shadow else { return }
         reconcile()
     }
@@ -299,7 +351,10 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
     /// dictation) lands here; the splice is taken from the text itself,
     /// so nothing the view does can slip past the CRDT.
     nonisolated func textViewDidChange(_ textView: UITextView) {
-        MainActor.assumeIsolated { reconcile() }
+        MainActor.assumeIsolated {
+            guard !preview else { return }
+            reconcile()
+        }
     }
 
     /// The keyboard went away: keep the tool picker by taking the
@@ -362,6 +417,8 @@ struct NoteCanvas: UIViewRepresentable {
     /// Passed in (not read from the store) so a switch re-runs
     /// `updateUIView` and the paper and text colours follow.
     let flavor: ThemeFlavor
+    /// Reading view instead of the editor.
+    let preview: Bool
 
     func makeCoordinator() -> Coordinator { Coordinator(model: model.ink) }
 
@@ -411,6 +468,7 @@ struct NoteCanvas: UIViewRepresentable {
 
     func updateUIView(_ view: UIView, context: Context) {
         guard let canvas = view as? NoteCanvasView else { return }
+        canvas.preview = preview
         canvas.applyTheme()
         canvas.syncFromModel()
     }
