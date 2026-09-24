@@ -571,13 +571,21 @@ fn editor_ui(
                             // Painted in galley space, so a one-frame-old
                             // window still lands on the right text. The
                             // texture overscans the viewport; only the
-                            // visible part is drawn, with the pane's
-                            // corner radius so the paper follows the card.
+                            // visible part is drawn. The pane is filled
+                            // with the paper colour, so the texture's
+                            // straight edges vanish into it.
                             let texture_rect = egui::Rect::from_min_size(
                                 output.galley_pos + target.window_min,
                                 target.size,
                             );
-                            let visible = ui.clip_rect().intersect(texture_rect);
+                            // The scroll area clips its content to the
+                            // viewport vertically but to the parent's clip
+                            // rect horizontally; `max_rect` is the content
+                            // width, so the overscan cannot leak sideways.
+                            let visible = ui
+                                .clip_rect()
+                                .intersect(ui.max_rect())
+                                .intersect(texture_rect);
                             if visible.is_positive() {
                                 let uv = egui::Rect::from_min_max(
                                     ((visible.min - texture_rect.min) / texture_rect.size())
@@ -589,7 +597,7 @@ fn editor_ui(
                                     under,
                                     egui::epaint::RectShape::filled(
                                         visible,
-                                        egui::CornerRadius::same(theme::RADIUS),
+                                        egui::CornerRadius::ZERO,
                                         egui::Color32::WHITE,
                                     )
                                     .with_texture(target.texture, uv),
@@ -725,8 +733,12 @@ fn pane<R>(
     height: f32,
     body: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
+    // The card is the paper: the ink texture only covers the viewport,
+    // so the margin around it must be the same colour or a strip of card
+    // shows between the paper and the rounded border.
     palette
         .card()
+        .fill(palette.paper())
         .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
             ui.set_min_height(height - 26.0);
