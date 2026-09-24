@@ -21,7 +21,11 @@
 //
 // Coordinates: the core is canvas space (points, y down). `Viewport` maps
 // that onto the view through the scroll view's zoom and content offset,
-// so the Metal view stays pinned to the screen at any zoom.
+// so the Metal view stays pinned to the screen at any zoom. Page ink is
+// meshed in its line's anchor space and placed by an `origin` (the line's
+// top-left on the page): the offset is added while the vertex floats are
+// copied for upload, so a line that moves re-uploads but never
+// re-tessellates.
 
 import Metal
 import MetalKit
@@ -177,16 +181,17 @@ struct InkGeometry {
     init() {}
 
     @MainActor
-    init(_ mesh: InkMesh, depth: Float) {
-        append(mesh, depth: depth)
+    init(_ mesh: InkMesh, depth: Float, offset: CGPoint = .zero) {
+        append(mesh, depth: depth, offset: offset)
     }
 
     /// Append a mesh as one stroke at `depth`, offsetting its indices past
-    /// the vertices so far. Extends the last run when the pipeline state
-    /// matches, so consecutive same-brush strokes are one draw. The mesh
-    /// arrives as little-endian bytes; they are copied, not decoded.
+    /// the vertices so far and its positions by `offset` (anchor space to
+    /// page). Extends the last run when the pipeline state matches, so
+    /// consecutive same-brush strokes are one draw. The mesh arrives as
+    /// little-endian bytes; they are copied, not decoded.
     @MainActor
-    mutating func append(_ mesh: InkMesh, depth: Float) {
+    mutating func append(_ mesh: InkMesh, depth: Float, offset: CGPoint = .zero) {
         let count = Int(mesh.vertexCount)
         let indexCount = Int(mesh.indexCount)
         guard indexCount >= 3, count >= 3,
@@ -197,7 +202,20 @@ struct InkGeometry {
         let stroke = UInt32(styles.count)
         let style = StrokeStyle(mesh.style, depth: depth)
         styles.append(style)
-        vertices.append(contentsOf: mesh.vertices.floats)
+        if offset == .zero {
+            vertices.append(contentsOf: mesh.vertices.floats)
+        } else {
+            var floats = mesh.vertices.floats
+            let dx = Float(offset.x)
+            let dy = Float(offset.y)
+            var i = 0
+            while i + 1 < floats.count {
+                floats[i] += dx
+                floats[i + 1] += dy
+                i += Self.vertexFloats
+            }
+            vertices.append(contentsOf: floats)
+        }
         strokeIndex.append(contentsOf: repeatElement(stroke, count: count))
         let start = indices.count
         if base == 0 {
@@ -322,13 +340,25 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         let element: Element
         var z: Int
         var mesh: InkMesh
+        /// Where the element's anchor space sits on the page.
+        var origin: CGPoint
     }
 
     private struct Wet {
         let brush: BrushRef
         let color: UInt32
+        var origin: CGPoint
         var points: [StrokePoint] = []
         var end: StrokeEnd = .live
+        let geometry: GPUGeometry
+    }
+
+    /// A local stroke past pen-up whose commit waits for estimated-property
+    /// updates; drawn until `show` replaces it.
+    private struct Settling {
+        let mesh: InkMesh
+        var origin: CGPoint
+        let depth: Float
         let geometry: GPUGeometry
     }
 
@@ -346,11 +376,10 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     /// The Pencil Pro hover preview: one dab above everything.
     private let hover: GPUGeometry
     private var hasHover = false
-    private var localGeometry: InkGeometry?
+    private var localMesh: InkMesh?
+    private var localOrigin = CGPoint.zero
     private var hasLocal = false
-    /// Local strokes past pen-up whose commit is held for estimated-property
-    /// updates; drawn until `show` replaces them.
-    private var locals: [String: GPUGeometry] = [:]
+    private var locals: [String: Settling] = [:]
     private var localsOrder: [String] = []
     private var settled = 0
     /// Committed meshes are built for this zoom bucket; a bucket change
@@ -359,7 +388,8 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     private var committedStale = false
     private var loggedDrawable = false
 
-    /// Union of committed ink bounds, canvas units; drives canvas growth.
+    /// Union of committed ink bounds (origins applied), canvas units; the
+    /// brush lab sizes its canvas from it.
     private(set) var inkBounds = CGRect.null
 
     var viewport = Viewport() {
@@ -510,7 +540,7 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     /// The clear colour for a UIKit background: the framebuffer is sRGB,
     /// Metal takes clear values in linear light.
     ///
-    /// Pass [`UIColor.paper`] for sketches so both devices draw on the
+    /// Pass [`UIColor.paper`] for the page so both devices draw on the
     /// same colour.
     static func clearColor(for color: UIColor, trait: UITraitCollection) -> MTLClearColor {
         var r: CGFloat = 0
@@ -547,26 +577,53 @@ final class InkRenderer: NSObject, MTKViewDelegate {
 
     // MARK: committed ink
 
-    /// Show a committed element, stroke or shape (idempotent; re-show only
-    /// updates z). Replaces the settling local copy of the same id.
-    func show(_ element: Element, z: Int) {
+    /// Show a committed element, stroke or shape, meshed in its own space
+    /// and placed at `origin` (idempotent; re-show only updates z and
+    /// origin). Replaces the settling local copy of the same id.
+    func show(_ element: Element, z: Int, origin: CGPoint = .zero) {
         let id = element.id
         if locals.removeValue(forKey: id) != nil { localsOrder.removeAll { $0 == id } }
         if committed[id] != nil {
+            var changed = false
             if committed[id]?.z != z {
                 committed[id]?.z = z
-                resort()
+                changed = true
             }
+            if committed[id]?.origin != origin {
+                committed[id]?.origin = origin
+                changed = true
+            }
+            if changed { resort() }
             return
         }
         let mesh = elementMesh(element: element, tolerance: tolerance)
-        committed[id] = Committed(element: element, z: z, mesh: mesh)
-        inkBounds = inkBounds.union(mesh.bounds)
+        committed[id] = Committed(element: element, z: z, mesh: mesh, origin: origin)
+        inkBounds = inkBounds.union(mesh.bounds.offsetBy(dx: origin.x, dy: origin.y))
         resort()
     }
 
     func show(_ stroke: Stroke, z: Int) {
         show(.stroke(stroke), z: z)
+    }
+
+    /// Move committed elements (their lines moved); one re-upload when
+    /// anything changed. Ids not on screen are ignored.
+    func setOrigins(_ origins: [String: CGPoint]) {
+        var moved = false
+        for (id, origin) in origins where committed[id] != nil && committed[id]?.origin != origin {
+            committed[id]?.origin = origin
+            moved = true
+        }
+        guard moved else { return }
+        batchDirty = true
+        needsDisplay()
+    }
+
+    /// Where a committed element's ink is on the page; `nil` when not
+    /// shown.
+    func bounds(for id: String) -> CGRect? {
+        guard let entry = committed[id] else { return nil }
+        return entry.mesh.bounds.offsetBy(dx: entry.origin.x, dy: entry.origin.y)
     }
 
     func remove(_ id: String) {
@@ -583,7 +640,7 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         wet = [:]
         wetOrder = []
         hasLocal = false
-        localGeometry = nil
+        localMesh = nil
         locals = [:]
         localsOrder = []
         inkBounds = .null
@@ -612,17 +669,24 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         var geometry = InkGeometry()
         for (k, id) in order.enumerated() {
             guard let entry = committed[id] else { continue }
-            geometry.append(entry.mesh, depth: Self.committedDepth(k, of: order.count))
+            geometry.append(entry.mesh, depth: Self.committedDepth(k, of: order.count), offset: entry.origin)
         }
         batch.upload(geometry)
     }
 
     // MARK: remote wet ink
 
-    func wetBegin(_ id: String, brush: BrushRef, color: UInt32) {
+    func wetBegin(_ id: String, brush: BrushRef, color: UInt32, origin: CGPoint = .zero) {
         if wet[id] == nil { wetOrder.append(id) }
-        wet[id] = Wet(brush: brush, color: color, geometry: GPUGeometry(device: device))
+        wet[id] = Wet(brush: brush, color: color, origin: origin, geometry: GPUGeometry(device: device))
         needsDisplay()
+    }
+
+    /// The wet stroke's line moved.
+    func setWetOrigin(_ id: String, _ origin: CGPoint) {
+        guard wet[id] != nil, wet[id]?.origin != origin else { return }
+        wet[id]?.origin = origin
+        remeshWet(id)
     }
 
     /// Stored points the sender emitted; the mesh is the sender's own
@@ -646,7 +710,8 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         let mesh = pointsMesh(
             points: entry.points, brush: entry.brush, color: entry.color, end: entry.end,
             tolerance: tolerance)
-        entry.geometry.upload(InkGeometry(mesh, depth: Self.wetDepth(j, of: wetOrder.count)))
+        entry.geometry.upload(
+            InkGeometry(mesh, depth: Self.wetDepth(j, of: wetOrder.count), offset: entry.origin))
         needsDisplay()
     }
 
@@ -661,46 +726,62 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     // MARK: local live stroke
 
     /// Replace the live stroke's ink with a mesh the modeler built
-    /// (`BrushModeler.liveMesh` at `tolerance`).
-    func setLocal(mesh: InkMesh) {
-        setLocal(mesh)
+    /// (`BrushModeler.liveMesh` at `tolerance`) in its line's space,
+    /// placed at `origin`.
+    func setLocal(mesh: InkMesh, origin: CGPoint = .zero) {
+        setLocal(mesh, origin: origin)
     }
 
     /// Replace the live stroke's ink with a snapped shape's outline (the
     /// draw-and-hold preview), in the stroke's brush and colour.
-    func setLocalShape(_ shape: Shape, brush: BrushRef, color: UInt32) {
-        setLocal(shapeOutlineMesh(shape: shape, brush: brush, color: color, tolerance: tolerance))
+    func setLocalShape(_ shape: Shape, brush: BrushRef, color: UInt32, origin: CGPoint = .zero) {
+        setLocal(
+            shapeOutlineMesh(shape: shape, brush: brush, color: color, tolerance: tolerance),
+            origin: origin)
     }
 
-    private func setLocal(_ mesh: InkMesh) {
-        let geometry = InkGeometry(mesh, depth: Self.liveDepth)
-        local.upload(geometry)
-        localGeometry = geometry
+    private func setLocal(_ mesh: InkMesh, origin: CGPoint) {
+        local.upload(InkGeometry(mesh, depth: Self.liveDepth, offset: origin))
+        localMesh = mesh
+        localOrigin = origin
         hasLocal = true
         needsDisplay()
+    }
+
+    /// The live stroke's line moved: re-place what is drawn so far.
+    func setLocalOrigin(_ origin: CGPoint) {
+        guard hasLocal, let mesh = localMesh, origin != localOrigin else { return }
+        setLocal(mesh, origin: origin)
     }
 
     func clearLocal() {
         guard hasLocal else { return }
         hasLocal = false
-        localGeometry = nil
+        localMesh = nil
         needsDisplay()
     }
 
     /// Pen is up but the commit waits for estimated-property updates: keep
     /// the live ink on screen under `id` until `show` lands the element.
     func settleLocal(as id: String) {
-        guard hasLocal, var geometry = localGeometry else { return }
+        guard hasLocal, let mesh = localMesh else { return }
         hasLocal = false
-        localGeometry = nil
+        localMesh = nil
         // Distinct slots so two settling markers do not discard each other.
         settled = (settled + 1) % 40
         let depth = 0.05 - 0.001 * Float(settled)
-        for i in geometry.styles.indices { geometry.styles[i].depth = depth }
         let gpu = GPUGeometry(device: device)
-        gpu.upload(geometry)
+        gpu.upload(InkGeometry(mesh, depth: depth, offset: localOrigin))
         if locals[id] == nil { localsOrder.append(id) }
-        locals[id] = gpu
+        locals[id] = Settling(mesh: mesh, origin: localOrigin, depth: depth, geometry: gpu)
+        needsDisplay()
+    }
+
+    /// A settling stroke's line moved.
+    func setSettlingOrigin(_ id: String, _ origin: CGPoint) {
+        guard let entry = locals[id], entry.origin != origin else { return }
+        locals[id]?.origin = origin
+        entry.geometry.upload(InkGeometry(entry.mesh, depth: entry.depth, offset: origin))
         needsDisplay()
     }
 
@@ -771,7 +852,7 @@ final class InkRenderer: NSObject, MTKViewDelegate {
                 }
                 for id in localsOrder {
                     guard let entry = locals[id] else { continue }
-                    draw(entry)
+                    draw(entry.geometry)
                 }
                 if hasLocal { draw(local) }
                 if hasHover { draw(hover) }

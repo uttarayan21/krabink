@@ -1,14 +1,14 @@
 // iOS 17 has no custom tool-picker items, so library brushes are offered
 // from a sheet instead: pick one and the pen draws with it at the colour
 // and width the PencilKit picker last reported; picking any PencilKit
-// tool switches back. A pill in the sketch toolbar names the active
+// tool switches back. A pill in the note toolbar names the active
 // custom brush.
 
 import KrabinkCore
 import SwiftUI
 
 struct BrushSheet: View {
-    let model: SketchModel
+    let model: PageInkModel
     @State private var theme = ThemeStore.shared
     @Environment(\.dismiss) private var dismiss
 

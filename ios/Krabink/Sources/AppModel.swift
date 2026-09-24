@@ -214,7 +214,8 @@ final class AppModel {
     }
 }
 
-/// One open note: `text` mirrors the CRDT and drives the editor.
+/// One open note: `text` mirrors the CRDT and drives the editor; `ink`
+/// is the page ink drawn over it.
 @Observable @MainActor
 final class NoteModel: Identifiable {
     let session: NoteSession
@@ -223,18 +224,18 @@ final class NoteModel: Identifiable {
     /// remote changes update it first and the editor diffs against it.
     var text: String
     var synced = false
-    var sketchIds: [String] = []
+    /// The page ink layer: one model per note, kept with the note so ink
+    /// state (tool, counters) survives switching notes.
+    let ink: PageInkModel
     var onTitleChanged: (() -> Void)?
-    private var sketches: [String: SketchModel] = [:]
     private var titleTask: Task<Void, Never>?
 
     init(session: NoteSession) {
         self.session = session
         id = session.id()
         text = (try? session.text()) ?? ""
-        sketchIds = (try? session.sketchIds()) ?? []
+        ink = PageInkModel(session: session)
         session.setListener(listener: NoteEvents(model: self))
-        backfillEmbeds()
         scheduleTitleSync()
     }
 
@@ -277,75 +278,6 @@ final class NoteModel: Identifiable {
         onTitleChanged?()
     }
 
-    /// Splice an embed ref for any sketch the text doesn't mention — notes
-    /// from before embeds existed, or sketches a peer created without one.
-    private func backfillEmbeds() {
-        var current = (try? session.text()) ?? text
-        for sketchId in sketchIds where !current.contains("krabink://sketch/\(sketchId)") {
-            let embed = (current.isEmpty || current.hasSuffix("\n") ? "" : "\n")
-                + "![sketch](krabink://sketch/\(sketchId))\n"
-            try? session.applyTextEdit(
-                at: UInt64(current.unicodeScalars.count), del: 0, insert: embed)
-            current += embed
-        }
-        text = (try? session.text()) ?? text
-    }
-
-    func createSketch() -> String? {
-        guard let id = try? session.createSketch() else { return nil }
-        sketchIds = (try? session.sketchIds()) ?? sketchIds
-        // Splice an inline markdown image ref so the sketch renders in the
-        // preview and round-trips to the desktop (which rewrites the same
-        // krabink://sketch/<id> URI to an SVG on export).
-        let current = (try? session.text()) ?? text
-        let embed = (current.isEmpty || current.hasSuffix("\n") ? "" : "\n")
-            + "![sketch](krabink://sketch/\(id))\n"
-        let at = UInt64(current.unicodeScalars.count)
-        try? session.applyTextEdit(at: at, del: 0, insert: embed)
-        text = (try? session.text()) ?? text
-        return id
-    }
-
-    func sketch(for id: String) -> SketchModel {
-        if let model = sketches[id] { return model }
-        let model = SketchModel(session: session, sketchId: id)
-        sketches[id] = model
-        return model
-    }
-
-    /// Remote stroke change: refresh the sketch registry (a first stroke may
-    /// reveal a sketch created remotely) and route to the open canvas.
-    func remoteStrokes(sketch: String) {
-        sketchIds = (try? session.sketchIds()) ?? sketchIds
-        sketches[sketch]?.remoteChanged()
-    }
-
-    // Wet-ink routing: Begin carries the sketch id; Points/End only the
-    // stroke id, so remember the mapping for the stroke's lifetime.
-    private var wetStrokeSketch: [String: String] = [:]
-
-    func wetBegin(
-        sketch: String, stroke: String, tool: Tool, color: UInt32, baseWidth: Float, spec: Data?
-    ) {
-        wetStrokeSketch[stroke] = sketch
-        sketches[sketch]?.remoteWetBegin(
-            stroke: stroke, tool: tool, color: color, baseWidth: baseWidth, spec: spec)
-    }
-
-    func wetPoints(stroke: String, points: [StrokePoint]) {
-        guard let sketch = wetStrokeSketch[stroke] else { return }
-        sketches[sketch]?.remoteWetPoints(stroke: stroke, points: points)
-    }
-
-    func wetEnd(stroke: String) {
-        guard let sketch = wetStrokeSketch.removeValue(forKey: stroke) else { return }
-        sketches[sketch]?.remoteWetEnd(stroke: stroke)
-    }
-
-    func wetCancel(stroke: String) {
-        guard let sketch = wetStrokeSketch.removeValue(forKey: stroke) else { return }
-        sketches[sketch]?.remoteWetCancel(stroke: stroke)
-    }
 }
 
 // Nonisolated bridges: uniffi calls these from the Rust network thread.
@@ -422,30 +354,39 @@ private final class NoteEvents: NoteListener {
         }
     }
 
-    func strokesChanged(sketch: String) {
-        Task { @MainActor [weak model] in model?.remoteStrokes(sketch: sketch) }
+    func pageChanged() {
+        Task { @MainActor [weak model] in model?.ink.remoteChanged() }
     }
-    func wetBegin(
-        sketch: String, stroke: String, tool: Tool, color: UInt32, baseWidth: Float, spec: Data?
+
+    /// Embedded sketches are no longer shown (their data stays in the doc).
+    func strokesChanged(sketch: String) {}
+
+    func wetBeginAnchored(
+        stroke: String, anchor: Data, tool: Tool, color: UInt32, baseWidth: Float, spec: Data?
     ) {
         Task { @MainActor [weak model] in
-            model?.wetBegin(
-                sketch: sketch, stroke: stroke, tool: tool, color: color, baseWidth: baseWidth,
+            model?.ink.remoteWetBegin(
+                stroke: stroke, anchor: anchor, tool: tool, color: color, baseWidth: baseWidth,
                 spec: spec)
         }
     }
 
+    /// Sketch-keyed wet ink: nothing to draw it on.
+    func wetBegin(
+        sketch: String, stroke: String, tool: Tool, color: UInt32, baseWidth: Float, spec: Data?
+    ) {}
+
     func wetPoints(stroke: String, sentMs: UInt64, points: [StrokePoint]) {
         Task { @MainActor [weak model] in
-            model?.wetPoints(stroke: stroke, points: points)
+            model?.ink.remoteWetPoints(stroke: stroke, points: points)
         }
     }
 
     func wetEnd(stroke: String) {
-        Task { @MainActor [weak model] in model?.wetEnd(stroke: stroke) }
+        Task { @MainActor [weak model] in model?.ink.remoteWetEnd(stroke: stroke) }
     }
 
     func wetCancel(stroke: String) {
-        Task { @MainActor [weak model] in model?.wetCancel(stroke: stroke) }
+        Task { @MainActor [weak model] in model?.ink.remoteWetCancel(stroke: stroke) }
     }
 }

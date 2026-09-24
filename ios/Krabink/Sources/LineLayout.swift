@@ -1,0 +1,137 @@
+// Where the text's lines are, for ink anchored to them.
+//
+// The CRDT, anchors and style runs index the text by unicode scalar;
+// UIKit by UTF-16 code unit. `ScalarIndex` is the table between the two,
+// rebuilt whenever the text changes. `LineLayout` maps a scalar to the top
+// of its source line's first line fragment (forward, for placing ink) and
+// a point on the page back to the line under it (inverse, for pen-down).
+//
+// TextKit 1 on purpose (`UITextView(usingTextLayoutManager: false)`):
+// its layout is eager and deterministic, so `lineFragmentRect` is exact.
+// TextKit 2 estimates off-screen heights and would make ink jump as the
+// estimates settle.
+
+import UIKit
+
+/// Unicode-scalar index ↔ UTF-16 offset for one text.
+struct ScalarIndex {
+    /// `utf16[i]` is the UTF-16 offset of scalar `i`; one extra entry for
+    /// the end of the text.
+    private var utf16Offsets: [Int]
+
+    init(_ text: String) {
+        var offsets: [Int] = []
+        offsets.reserveCapacity(text.unicodeScalars.count + 1)
+        var offset = 0
+        for scalar in text.unicodeScalars {
+            offsets.append(offset)
+            offset += scalar.utf16.count
+        }
+        offsets.append(offset)
+        utf16Offsets = offsets
+    }
+
+    var scalarCount: Int { utf16Offsets.count - 1 }
+    var utf16Count: Int { utf16Offsets[utf16Offsets.count - 1] }
+
+    /// UTF-16 offset of scalar `i` (clamped to the text).
+    func utf16(ofScalar i: Int) -> Int {
+        utf16Offsets[max(0, min(i, scalarCount))]
+    }
+
+    /// The scalar containing UTF-16 offset `u` (a low surrogate maps to
+    /// its pair's scalar; clamped to the text).
+    func scalar(ofUTF16 u: Int) -> Int {
+        let u = max(0, min(u, utf16Count))
+        // Last offset ≤ u.
+        var low = 0
+        var high = scalarCount
+        while low < high {
+            let mid = (low + high + 1) / 2
+            if utf16Offsets[mid] <= u { low = mid } else { high = mid - 1 }
+        }
+        return low
+    }
+}
+
+/// What the ink model needs from the editor's layout.
+@MainActor
+protocol LineLayoutProvider: AnyObject {
+    /// The source line under `point` (text view content space): the
+    /// scalar index of its first char and its ink origin.
+    func line(at point: CGPoint) -> (scalar: Int, origin: CGPoint)
+    /// Ink origin of the line containing scalar `scalar` (past the end:
+    /// the last line). Content space.
+    func origin(forScalar scalar: Int) -> CGPoint
+}
+
+/// Line geometry of a TextKit 1 text view.
+@MainActor
+struct LineLayout {
+    let textView: UITextView
+    let index: ScalarIndex
+
+    private var layoutManager: NSLayoutManager { textView.layoutManager }
+    private var container: NSTextContainer { textView.textContainer }
+    private var text: NSString { textView.textStorage.string as NSString }
+
+    /// Ink x origin: where a line's glyphs start at zero indent.
+    var anchorLeft: CGFloat {
+        textView.textContainerInset.left + container.lineFragmentPadding
+    }
+
+    /// Start (UTF-16) of the source line containing UTF-16 offset `u`;
+    /// `text.length` for the empty line after a trailing newline.
+    private func lineStart(utf16 u: Int) -> Int {
+        let length = text.length
+        let u = max(0, min(u, length))
+        return text.lineRange(for: NSRange(location: u, length: 0)).location
+    }
+
+    /// Top of the first line fragment of the line starting at `start`,
+    /// text container coordinates.
+    private func fragmentTop(lineStart start: Int) -> CGFloat {
+        let length = text.length
+        layoutManager.ensureLayout(for: container)
+        if start >= length {
+            let extra = layoutManager.extraLineFragmentRect
+            if !extra.isEmpty { return extra.minY }
+            // No extra fragment: the text does not end in a newline, so
+            // the last line is a real fragment (or the text is empty).
+            guard length > 0 else { return 0 }
+            let glyph = layoutManager.glyphIndexForCharacter(at: length - 1)
+            return layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil).minY
+        }
+        let glyph = layoutManager.glyphIndexForCharacter(at: start)
+        return layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil).minY
+    }
+
+    private func origin(lineStart start: Int) -> CGPoint {
+        CGPoint(x: anchorLeft, y: textView.textContainerInset.top + fragmentTop(lineStart: start))
+    }
+
+    func origin(forScalar scalar: Int) -> CGPoint {
+        origin(lineStart: lineStart(utf16: index.utf16(ofScalar: scalar)))
+    }
+
+    func line(at point: CGPoint) -> (scalar: Int, origin: CGPoint) {
+        layoutManager.ensureLayout(for: container)
+        let inset = textView.textContainerInset
+        let local = CGPoint(x: point.x - inset.left, y: point.y - inset.top)
+        let length = text.length
+        let used = layoutManager.usedRect(for: container)
+        let extra = layoutManager.extraLineFragmentRect
+        let start: Int
+        if length == 0 || local.y >= used.maxY || (!extra.isEmpty && local.y >= extra.minY) {
+            // Below the text, or in the empty last line: the last line.
+            start = lineStart(utf16: length)
+        } else {
+            let glyph = layoutManager.glyphIndex(
+                for: CGPoint(x: max(0, local.x), y: max(0, local.y)), in: container,
+                fractionOfDistanceThroughGlyph: nil)
+            let char = layoutManager.characterIndexForGlyph(at: glyph)
+            start = lineStart(utf16: char)
+        }
+        return (index.scalar(ofUTF16: start), origin(lineStart: start))
+    }
+}

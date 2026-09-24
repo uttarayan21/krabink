@@ -161,19 +161,22 @@ extension Color {
     }
 }
 
-/// UIKit twins for the UIView-backed editor and preview.
+/// UIKit twins for the UIView-backed note canvas.
 extension UIColor {
     static var themeBg: UIColor { UIColor(Theme.bg) }
     static var themeSurface: UIColor { UIColor(Theme.surface) }
+    /// Code spans and blocks in the editor.
+    static var themeSurfaceRaised: UIColor { UIColor(Theme.surfaceRaised) }
     static var themeText: UIColor { UIColor(Theme.text) }
     static var themeMuted: UIColor { UIColor(Theme.muted) }
     static var themeBorder: UIColor { UIColor(Theme.border) }
     static var themeAccent: UIColor { UIColor(Theme.accent) }
 
-    /// Sketch paper: the flavour's card colour, the desktop's
+    /// Page paper: the flavour's card colour, the desktop's
     /// `Palette::paper` in crates/krabink/src/theme.rs. Both platforms
-    /// clear the canvas to this so ink reads alike everywhere; the
-    /// renderer picks the highlighter blend from its luminance.
+    /// clear the ink layer to this, under the text, so ink reads alike
+    /// everywhere; the renderer picks the highlighter blend from its
+    /// luminance.
     static var paper: UIColor { UIColor(Theme.surface) }
 }
 

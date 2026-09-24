@@ -1,4 +1,5 @@
-// krabink for iPad: note list + live-synced markdown editor (iM1).
+// krabink for iPad: note list + one live-synced note surface the keyboard
+// types into and the Pencil draws on.
 
 import KrabinkCore
 import SwiftUI
@@ -42,16 +43,11 @@ struct KrabinkApp: App {
                 // Scanned pairing QR / deep link: adopt server+token.
                 _ = model.adoptPair(uri: url.absoluteString)
             }
-            // Light or dark follows the Catppuccin flavour; the sketch
+            // Light or dark follows the Catppuccin flavour; the page
             // paper is the flavour's card colour on both platforms.
             .preferredColorScheme(theme.flavor.colorScheme)
             .tint(Theme.accent)
     }
-}
-
-/// Identifiable wrapper so a sketch id can drive fullScreenCover(item:).
-struct SketchRef: Identifiable {
-    let id: String
 }
 
 struct ContentView: View {
@@ -60,8 +56,6 @@ struct ContentView: View {
     // row (drives the detail pane); edit mode turns it into multi-select.
     @State private var selection = Set<String>()
     @State private var editMode: EditMode = .inactive
-    @State private var openSketch: SketchRef?
-    @State private var preview = false
     @State private var showSettings = false
     @State private var confirmBulkDelete = false
     @State private var confirmBulkDeleteFinal = false
@@ -259,8 +253,7 @@ struct ContentView: View {
     @ViewBuilder
     private var detail: some View {
         if selection.count == 1, let id = selection.first, let note = model.note(for: id) {
-            NoteDetail(
-                model: model, note: note, preview: $preview, openSketch: $openSketch)
+            NoteDetail(model: model, note: note)
         } else {
             emptyDetail
         }
@@ -335,30 +328,22 @@ private struct NoteRow: View {
     }
 }
 
-/// Editor or preview for the selected note, on a card under a title header
-/// with the live-sync dot, matching the desktop layout.
+/// The selected note's page (styled markdown source with ink drawn over
+/// it) on a card under a title header with the live-sync dot, matching
+/// the desktop layout.
 private struct NoteDetail: View {
     let model: AppModel
     let note: NoteModel
     @State private var theme = ThemeStore.shared
-    @SwiftUI.Binding var preview: Bool
-    @SwiftUI.Binding var openSketch: SketchRef?
+    @State private var showBrushes = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
-            Group {
-                if preview {
-                    SketchPreview(model: note, flavor: theme.flavor) { sketchId in
-                        openSketch = SketchRef(id: sketchId)
-                    }
-                } else {
-                    MarkdownTextView(model: note, flavor: theme.flavor)
-                }
-            }
-            .card()
-            .padding(.horizontal, Theme.pagePadding)
-            .padding(.bottom, Theme.pagePadding)
+            NoteCanvas(model: note, flavor: theme.flavor)
+                .card()
+                .padding(.horizontal, Theme.pagePadding)
+                .padding(.bottom, Theme.pagePadding)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.bg)
@@ -366,40 +351,40 @@ private struct NoteDetail: View {
         .toolbarBackground(Theme.bg, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbar {
+            if #unavailable(iOS 18.0) {
+                // iOS 17 has no custom picker items: library brushes come
+                // from a sheet, and a pill names the active one.
+                ToolbarItem(placement: .primaryAction) {
+                    HStack(spacing: 8) {
+                        if let active = note.ink.activeCustomBrush {
+                            Text(BrushLibrary.shared.brush(id: active)?.name ?? active)
+                                .font(.caption)
+                                .foregroundStyle(Theme.text)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(Theme.accentSoft))
+                                .accessibilityIdentifier("activeBrush")
+                        }
+                        Button {
+                            showBrushes = true
+                        } label: {
+                            Label("brushes", systemImage: "paintbrush.pointed")
+                        }
+                        .accessibilityIdentifier("brushes")
+                    }
+                }
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button {
-                    preview.toggle()
+                    note.ink.eraseLast()
                 } label: {
-                    Label(preview ? "Edit" : "Preview", systemImage: preview ? "pencil" : "eye")
+                    Label("erase last", systemImage: "arrow.uturn.backward")
                 }
-                .accessibilityIdentifier("previewToggle")
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Menu {
-                    ForEach(Array(note.sketchIds.enumerated()), id: \.element) {
-                        index, sketchId in
-                        Button("sketch \(index)") {
-                            openSketch = SketchRef(id: sketchId)
-                        }
-                        .accessibilityIdentifier("sketch-\(index)")
-                    }
-                    Button("new sketch") {
-                        if let sketchId = note.createSketch() {
-                            openSketch = SketchRef(id: sketchId)
-                        }
-                    }
-                    .accessibilityIdentifier("newSketch")
-                } label: {
-                    Label("sketches", systemImage: "scribble.variable")
-                }
-                .accessibilityIdentifier("sketchMenu")
+                .accessibilityIdentifier("eraseLast")
             }
         }
-        .fullScreenCover(item: $openSketch) { ref in
-            SketchScreen(model: note.sketch(for: ref.id)) {
-                openSketch = nil
-            }
-        }
+        .sheet(isPresented: $showBrushes) { BrushSheet(model: note.ink) }
+        .onDisappear { note.ink.pointerGone() }
     }
 
     private var header: some View {
@@ -417,7 +402,12 @@ private struct NoteDetail: View {
                     .font(.caption)
                     .foregroundStyle(Theme.muted)
             }
-            Caption(preview ? "preview" : "markdown")
+            // Live ink counters: what the UI tests and on-device checks read.
+            Text(note.ink.status)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(Theme.muted)
+                .lineLimit(1)
+                .accessibilityIdentifier("sketchStatus")
         }
         .padding(.horizontal, Theme.pagePadding + 4)
         .padding(.top, 8)

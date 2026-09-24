@@ -241,21 +241,122 @@ struct CorpusReplay: View {
     }
 }
 
-/// A sketch canvas showing fixed elements (pan and zoom still work).
+/// A canvas showing fixed elements; fingers pan and zoom.
 struct LabCanvas: UIViewRepresentable {
     let elements: [Element]
 
     func makeUIView(context: Context) -> UIView {
-        guard let canvas = SketchCanvasView(policy: .anyInput) else {
+        guard let canvas = LabCanvasView.make() else {
             let label = UILabel()
             label.text = "Metal is unavailable"
             return label
         }
         for (z, element) in elements.enumerated() { canvas.renderer.show(element, z: z) }
+        canvas.fitCanvas()
         return canvas
     }
 
     func updateUIView(_ view: UIView, context: Context) {}
+}
+
+/// Scroll view (pan/zoom/inertia) under a pinned Metal view that reads the
+/// scroll state into its viewport; the lab's stand-in for the note page.
+@MainActor
+final class LabCanvasView: UIView, UIScrollViewDelegate {
+    let scroll = UIScrollView()
+    /// Zoomable, empty; its frame is the canvas.
+    let content = UIView()
+    let metal: MTKView
+    let renderer: InkRenderer
+    private let margin: CGFloat = 400
+
+    /// `nil` without a Metal device.
+    static func make() -> LabCanvasView? {
+        let metal = MTKView(frame: .zero, device: MTLCreateSystemDefaultDevice())
+        guard let renderer = InkRenderer(view: metal) else { return nil }
+        return LabCanvasView(metal: metal, renderer: renderer)
+    }
+
+    private init(metal: MTKView, renderer: InkRenderer) {
+        self.metal = metal
+        self.renderer = renderer
+        super.init(frame: .zero)
+
+        scroll.delegate = self
+        scroll.minimumZoomScale = 0.5
+        scroll.maximumZoomScale = 8
+        scroll.bouncesZoom = true
+        scroll.contentInsetAdjustmentBehavior = .never
+        scroll.showsVerticalScrollIndicator = false
+        scroll.showsHorizontalScrollIndicator = false
+        scroll.backgroundColor = .clear
+        content.isUserInteractionEnabled = false
+        scroll.addSubview(content)
+        addSubview(scroll)
+
+        metal.delegate = renderer
+        metal.isPaused = true
+        metal.enableSetNeedsDisplay = true
+        metal.isUserInteractionEnabled = false
+        metal.isOpaque = true
+        metal.clearColor = InkRenderer.clearColor(for: .paper, trait: traitCollection)
+        renderer.darkPaper = InkRenderer.isDark(metal.clearColor)
+        addSubview(metal)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        applyDrawableScale()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        scroll.frame = bounds
+        metal.frame = bounds
+        applyDrawableScale()
+        fitCanvas()
+        pushViewport()
+    }
+
+    private func applyDrawableScale() {
+        let scale = window?.screen.nativeScale ?? traitCollection.displayScale
+        guard scale > 0, metal.contentScaleFactor != scale else { return }
+        metal.contentScaleFactor = scale
+        renderer.needsDisplay()
+    }
+
+    /// Size the canvas to the ink plus a margin (never below the view).
+    func fitCanvas() {
+        let drawn = renderer.inkBounds
+        var needed = bounds.size
+        if !drawn.isNull {
+            needed.width = max(needed.width, drawn.maxX + margin)
+            needed.height = max(needed.height, drawn.maxY + margin)
+        }
+        guard needed != content.bounds.size else { return }
+        content.frame = CGRect(origin: .zero, size: needed)
+        scroll.contentSize = CGSize(
+            width: needed.width * scroll.zoomScale, height: needed.height * scroll.zoomScale)
+    }
+
+    private func pushViewport() {
+        renderer.viewport = Viewport(
+            zoom: scroll.zoomScale, offset: scroll.contentOffset, size: bounds.size)
+    }
+
+    nonisolated func viewForZooming(in scrollView: UIScrollView) -> UIView? {
+        MainActor.assumeIsolated { content }
+    }
+
+    nonisolated func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        MainActor.assumeIsolated { pushViewport() }
+    }
+
+    nonisolated func scrollViewDidZoom(_ scrollView: UIScrollView) {
+        MainActor.assumeIsolated { pushViewport() }
+    }
 }
 
 /// PencilKit above, ours below, same stroke, same tool.
