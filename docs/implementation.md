@@ -442,7 +442,9 @@ Open, in priority order:
 - Pencil Pro hover dab unverified on hardware.
 - PencilKit width and opacity calibration ratios still 1.0; measurement is
   by eye in the brush lab.
-- Desktop has no dark theme, so only the multiply highlighter pipeline.
+- Both apps ship the four Catppuccin flavours (Settings, "Appearance");
+  the highlighter multiplies on Latte's light paper and screens on the
+  dark ones, re-specialised on switch.
 - Recogniser proptest `clean_shapes_are_recognised_equivariantly` has a
   known failing shrunk case (vertical line scaled and moved); reproduces
   before any brush work and is not in the regression file.

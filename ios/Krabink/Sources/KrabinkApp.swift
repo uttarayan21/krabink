@@ -6,6 +6,7 @@ import SwiftUI
 @main
 struct KrabinkApp: App {
     @State private var model = AppModel()
+    @State private var theme = ThemeStore.shared
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
@@ -41,9 +42,9 @@ struct KrabinkApp: App {
                 // Scanned pairing QR / deep link: adopt server+token.
                 _ = model.adoptPair(uri: url.absoluteString)
             }
-            // Dark-only, like the desktop: the sketch paper is
-            // pinned dark on both, so the chrome around it is too.
-            .preferredColorScheme(.dark)
+            // Light or dark follows the Catppuccin flavour; the sketch
+            // paper is the flavour's card colour on both platforms.
+            .preferredColorScheme(theme.flavor.colorScheme)
             .tint(Theme.accent)
     }
 }
@@ -188,14 +189,6 @@ struct ContentView: View {
                 }
                 .accessibilityIdentifier("newNote")
             }
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    showSettings = true
-                } label: {
-                    Image(systemName: "gearshape")
-                }
-                .accessibilityIdentifier("settings")
-            }
         }
     }
 
@@ -219,15 +212,15 @@ struct ContentView: View {
                 createNote()
             } label: {
                 Label("Create a note", systemImage: "plus")
-                    .font(.subheadline.weight(.semibold))
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(.primary)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 32)
     }
 
-    /// Full sync status, the text UI tests read (`syncState`).
+    /// Full sync status, the text UI tests read (`syncState`), with the
+    /// settings button beside it, as on the desktop sidebar.
     private var syncFooter: some View {
         let tone = SyncTone(model.syncState)
         return HStack(spacing: 8) {
@@ -239,9 +232,22 @@ struct ContentView: View {
                 .truncationMode(.middle)
                 .accessibilityIdentifier("syncState")
             Spacer(minLength: 0)
+            Button {
+                showSettings = true
+            } label: {
+                Image(systemName: "gearshape")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(Theme.muted)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("settings")
+            .accessibilityIdentifier("settings")
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.leading, 12)
+        .padding(.trailing, 4)
+        .padding(.vertical, 4)
         .card(fill: Theme.surface)
         .padding(.horizontal, 12)
         .padding(.bottom, 8)
@@ -273,9 +279,8 @@ struct ContentView: View {
                 createNote()
             } label: {
                 Label("New note", systemImage: "square.and.pencil")
-                    .font(.subheadline.weight(.semibold))
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(.primary)
             .padding(.top, 4)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -335,6 +340,7 @@ private struct NoteRow: View {
 private struct NoteDetail: View {
     let model: AppModel
     let note: NoteModel
+    @State private var theme = ThemeStore.shared
     @SwiftUI.Binding var preview: Bool
     @SwiftUI.Binding var openSketch: SketchRef?
 
@@ -343,11 +349,11 @@ private struct NoteDetail: View {
             header
             Group {
                 if preview {
-                    SketchPreview(model: note) { sketchId in
+                    SketchPreview(model: note, flavor: theme.flavor) { sketchId in
                         openSketch = SketchRef(id: sketchId)
                     }
                 } else {
-                    MarkdownTextView(model: note)
+                    MarkdownTextView(model: note, flavor: theme.flavor)
                 }
             }
             .card()

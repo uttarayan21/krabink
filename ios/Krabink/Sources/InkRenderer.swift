@@ -908,11 +908,3 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         return UIImage(cgImage: image, scale: pixelScale, orientation: .up)
     }
 }
-
-extension UIColor {
-    /// Sketch paper, `#1D2029`: the desktop's card surface (`theme::PAPER`
-    /// in crates/krabink/src/theme.rs). Both platforms clear the canvas to
-    /// this so ink reads alike everywhere; it is dark, so the highlighter
-    /// screens rather than multiplies.
-    static let paper = UIColor(red: 0x1D / 255.0, green: 0x20 / 255.0, blue: 0x29 / 255.0, alpha: 1)
-}

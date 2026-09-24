@@ -10,6 +10,7 @@ use krabink_core::{DeviceId, PairInfo};
 use krabink_local::{EndpointId, PeerKind, PeerTarget, RelayTarget, RelayUrl};
 
 use crate::errors::{Error, Report, Result, ResultExt};
+use crate::theme::Flavor;
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct FileConfig {
@@ -22,6 +23,8 @@ struct FileConfig {
     token: Option<String>,
     /// Endpoint id of the workspace's cloud replica.
     replica: Option<String>,
+    /// Catppuccin flavour the UI is drawn in; Mocha when unset.
+    theme: Option<Flavor>,
     /// Nodes this desktop dials.
     #[serde(default)]
     peers: Vec<PeerFile>,
@@ -52,6 +55,8 @@ pub struct RuntimeConfig {
     pub replica: Option<EndpointId>,
     /// Peers from the config, without the replica.
     pub peers: Vec<PeerTarget>,
+    /// Catppuccin flavour the UI starts in.
+    pub theme: Flavor,
 }
 
 impl RuntimeConfig {
@@ -115,6 +120,7 @@ impl RuntimeConfig {
             token,
             replica,
             peers,
+            theme: file.theme.unwrap_or_default(),
         })
     }
 
@@ -205,6 +211,11 @@ pub fn persist_unpair() -> Result<std::path::PathBuf> {
 pub fn persist_device_name(name: &str) -> Result<std::path::PathBuf> {
     let name = name.trim();
     update_config(|file| file.device_name = (!name.is_empty()).then(|| name.to_string()))
+}
+
+/// Remember the chosen Catppuccin flavour across launches.
+pub fn persist_theme(theme: Flavor) -> Result<std::path::PathBuf> {
+    update_config(|file| file.theme = Some(theme))
 }
 
 /// The machine's hostname: what a desktop is called until renamed.

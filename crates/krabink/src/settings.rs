@@ -9,7 +9,7 @@ use krabink_local::{PeerKind, PeerState, PeerStatus, PeerTarget, RelayHealth, Re
 
 use crate::node::SyncNode;
 use crate::sync::{LOCAL_PLATFORM, local_device_name};
-use crate::theme;
+use crate::theme::{Flavor, Palette};
 
 /// Quiet-zone border around the QR matrix, in modules (spec minimum is 4).
 const QUIET_ZONE: usize = 4;
@@ -97,6 +97,8 @@ pub enum SettingsAction {
     Rename(String),
     /// Leave the adopted workspace (our row goes, peers are dropped).
     Unpair,
+    /// Draw the app in another Catppuccin flavour.
+    Theme(Flavor),
 }
 
 /// Read-only snapshot the window renders each frame; gathered by the
@@ -108,6 +110,10 @@ pub struct SettingsView {
     pub this_device: DeviceId,
     pub devices: Vec<DeviceMeta>,
     pub now_ms: u64,
+    /// The flavour currently applied (the picker's selection).
+    pub flavor: Flavor,
+    /// Its colours, for the window's own chrome.
+    pub palette: Palette,
 }
 
 #[derive(Resource)]
@@ -219,14 +225,17 @@ impl Settings {
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.add_space(6.0);
+                        if let Some(flavor) = Self::appearance_section(ui, view) {
+                            action = Some(SettingsAction::Theme(flavor));
+                        }
                         if let Some(asked) = self.sync_section(ui, view) {
                             action = Some(asked);
                         }
                         if let Some(id) = self.devices_section(ui, view) {
                             action = Some(SettingsAction::RemoveDevice(id));
                         }
-                        self.pair_section(ui, texture.as_ref());
-                        if let Some(info) = self.join_section(ui) {
+                        self.pair_section(ui, &view.palette, texture.as_ref());
+                        if let Some(info) = self.join_section(ui, &view.palette) {
                             action = Some(SettingsAction::Join(info));
                         }
                     });
@@ -235,13 +244,52 @@ impl Settings {
         action
     }
 
+    /// One button per Catppuccin flavour; returns a newly picked one.
+    fn appearance_section(ui: &mut egui::Ui, view: &SettingsView) -> Option<Flavor> {
+        let palette = &view.palette;
+        palette.section(ui, "Appearance", |ui| {
+            let mut picked = None;
+            ui.horizontal(|ui| {
+                for flavor in Flavor::ALL {
+                    let swatch = flavor.palette();
+                    let selected = flavor == view.flavor;
+                    let button = egui::Button::new(
+                        egui::RichText::new(flavor.label())
+                            .strong()
+                            .color(swatch.text),
+                    )
+                    .fill(swatch.bg)
+                    .stroke(egui::Stroke::new(
+                        if selected { 2.0 } else { 1.0 },
+                        if selected {
+                            palette.accent
+                        } else {
+                            swatch.border
+                        },
+                    ))
+                    .corner_radius(egui::CornerRadius::same(crate::theme::RADIUS))
+                    .min_size(egui::Vec2::new(96.0, 34.0));
+                    if ui.add(button).clicked() && !selected {
+                        picked = Some(flavor);
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            ui.weak(
+                "Catppuccin flavours, lightest to darkest. Sketch paper follows the card colour.",
+            );
+            picked
+        })
+    }
+
     /// Peers, relay, this device (with its editable name) and, when a
     /// workspace is adopted, the way out of it.
     fn sync_section(&mut self, ui: &mut egui::Ui, view: &SettingsView) -> Option<SettingsAction> {
         let mut action = None;
         let paired = self.paired();
         let mut pending_unpair = self.pending_unpair;
-        theme::section(ui, "Sync", |ui| {
+        let palette = &view.palette;
+        palette.section(ui, "Sync", |ui| {
             let peers: Vec<&PeerStatus> = view
                 .peers
                 .iter()
@@ -258,15 +306,15 @@ impl Settings {
                         let (dot, label) = match &peer.state {
                             PeerState::Connected {
                                 route: Some(Route::Direct(_)),
-                            } => (theme::SUCCESS, "direct"),
+                            } => (palette.success, "direct"),
                             PeerState::Connected {
                                 route: Some(Route::Relay(_)),
-                            } => (theme::SUCCESS, "via relay"),
-                            PeerState::Connected { route: None } => (theme::SUCCESS, "connected"),
-                            PeerState::Connecting => (theme::WARN, "connecting…"),
-                            PeerState::Fatal { .. } => (theme::DANGER, "rejected"),
+                            } => (palette.success, "via relay"),
+                            PeerState::Connected { route: None } => (palette.success, "connected"),
+                            PeerState::Connecting => (palette.warn, "connecting…"),
+                            PeerState::Fatal { .. } => (palette.danger, "rejected"),
                         };
-                        theme::status_dot(ui, dot, label);
+                        palette.status_dot(ui, dot, label);
                         ui.label(match peer.kind {
                             PeerKind::Replica => "cloud replica",
                             PeerKind::Desktop => "desktop",
@@ -292,7 +340,7 @@ impl Settings {
                                 .map(|id| id.fmt_short().to_string())
                                 .unwrap_or_default(),
                         };
-                        ui.monospace(egui::RichText::new(detail).color(theme::MUTED));
+                        ui.monospace(egui::RichText::new(detail).color(palette.muted));
                         ui.end_row();
                     }
                 });
@@ -313,7 +361,7 @@ impl Settings {
                 ui.add_space(4.0);
                 ui.weak("direct addresses:");
                 for addr in &self.info.addrs {
-                    ui.monospace(egui::RichText::new(addr).color(theme::MUTED));
+                    ui.monospace(egui::RichText::new(addr).color(palette.muted));
                 }
             }
             if self.info.relay.is_none() {
@@ -323,14 +371,14 @@ impl Settings {
                         "No relay: devices must reach this desktop on the LAN. \
                          Add one with --relay or by joining a workspace to sync across networks.",
                     )
-                    .color(theme::WARN),
+                    .color(palette.warn),
                 );
             }
             if paired {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if pending_unpair {
-                        if ui.add(theme::danger_button("confirm leave")).clicked() {
+                        if ui.add(palette.danger_button("confirm leave")).clicked() {
                             action = Some(SettingsAction::Unpair);
                         }
                         if ui.small_button("cancel").clicked() {
@@ -349,7 +397,7 @@ impl Settings {
         self.pending_unpair = pending_unpair && action.is_none();
 
         let current_name = local_device_name();
-        theme::section(ui, "This device", |ui| {
+        palette.section(ui, "This device", |ui| {
             egui::Grid::new("this-device")
                 .num_columns(2)
                 .spacing([24.0, 8.0])
@@ -366,7 +414,7 @@ impl Settings {
                         let submitted =
                             edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         if ui
-                            .add_enabled(changed, theme::primary_button("Save"))
+                            .add_enabled(changed, palette.primary_button("Save"))
                             .clicked()
                             || (submitted && changed)
                         {
@@ -379,11 +427,11 @@ impl Settings {
                     ui.end_row();
                     ui.weak("id");
                     ui.monospace(
-                        egui::RichText::new(view.this_device.to_string()).color(theme::MUTED),
+                        egui::RichText::new(view.this_device.to_string()).color(palette.muted),
                     );
                     ui.end_row();
                     ui.weak("node");
-                    ui.monospace(egui::RichText::new(&self.info.node).color(theme::MUTED));
+                    ui.monospace(egui::RichText::new(&self.info.node).color(palette.muted));
                     ui.end_row();
                 });
             ui.weak("Every paired device shows this name in its list.");
@@ -406,7 +454,8 @@ impl Settings {
         }
         let mut removed = None;
         let mut pending = self.pending_remove;
-        theme::section(ui, "Paired devices", |ui| {
+        let palette = &view.palette;
+        palette.section(ui, "Paired devices", |ui| {
             if others.is_empty() {
                 ui.weak("None yet. Devices appear here once they connect to the same workspace.");
                 return;
@@ -422,7 +471,7 @@ impl Settings {
                         ui.weak(format!("seen {}", ago(view.now_ms, d.last_seen_ms)));
                         if pending == Some(d.id) {
                             ui.horizontal(|ui| {
-                                if ui.add(theme::danger_button("confirm remove")).clicked() {
+                                if ui.add(palette.danger_button("confirm remove")).clicked() {
                                     removed = Some(d.id);
                                 }
                                 if ui.small_button("cancel").clicked() {
@@ -442,8 +491,13 @@ impl Settings {
         removed
     }
 
-    fn pair_section(&self, ui: &mut egui::Ui, texture: Option<&egui::TextureHandle>) {
-        theme::section(ui, "Pair a device", |ui| {
+    fn pair_section(
+        &self,
+        ui: &mut egui::Ui,
+        palette: &Palette,
+        texture: Option<&egui::TextureHandle>,
+    ) {
+        palette.section(ui, "Pair a device", |ui| {
             ui.label(
                 "Scan with the other device's camera (iPad: Settings, then Scan pairing code), \
                  or run: krabink pair '<uri below>'.",
@@ -465,7 +519,7 @@ impl Settings {
                     ui.vertical_centered(|ui| {
                         egui::Frame::new()
                             .fill(egui::Color32::WHITE)
-                            .corner_radius(egui::CornerRadius::same(theme::RADIUS))
+                            .corner_radius(egui::CornerRadius::same(crate::theme::RADIUS))
                             .inner_margin(egui::Margin::same(6))
                             .show(ui, |ui| {
                                 ui.image((texture.id(), egui::Vec2::splat(side)));
@@ -473,7 +527,7 @@ impl Settings {
                     });
                 }
                 None => {
-                    ui.colored_label(theme::DANGER, "pairing uri too long for a QR");
+                    ui.colored_label(palette.danger, "pairing uri too long for a QR");
                 }
             }
             ui.add_space(10.0);
@@ -482,17 +536,17 @@ impl Settings {
                     ui.ctx().copy_text(uri.clone());
                 }
                 ui.add(
-                    egui::Label::new(egui::RichText::new(&uri).monospace().color(theme::MUTED))
+                    egui::Label::new(egui::RichText::new(&uri).monospace().color(palette.muted))
                         .truncate(),
                 );
             });
         });
     }
 
-    fn join_section(&mut self, ui: &mut egui::Ui) -> Option<PairInfo> {
+    fn join_section(&mut self, ui: &mut egui::Ui, palette: &Palette) -> Option<PairInfo> {
         let mut joined = None;
         let mut join_error = self.join_error;
-        theme::section(ui, "Join another workspace", |ui| {
+        palette.section(ui, "Join another workspace", |ui| {
             ui.weak("Paste a pairing URI from another desktop.");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -502,7 +556,7 @@ impl Settings {
                         .hint_text("krabink://pair?…")
                         .desired_width(width),
                 );
-                if ui.add(theme::primary_button("Join")).clicked() {
+                if ui.add(palette.primary_button("Join")).clicked() {
                     match PairInfo::parse(self.join_uri.trim()) {
                         Some(info) => {
                             join_error = false;
@@ -513,7 +567,7 @@ impl Settings {
                 }
             });
             if join_error {
-                ui.colored_label(theme::DANGER, "not a krabink://pair URI");
+                ui.colored_label(palette.danger, "not a krabink://pair URI");
             }
         });
         self.join_error = join_error;

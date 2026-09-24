@@ -12,6 +12,9 @@ import UIKit
 
 struct MarkdownTextView: UIViewRepresentable {
     let model: NoteModel
+    /// Passed in (not read from the store) so a switch re-runs
+    /// `updateUIView` and the colours follow.
+    let flavor: ThemeFlavor
 
     func makeCoordinator() -> Coordinator {
         Coordinator(model: model)
@@ -20,10 +23,7 @@ struct MarkdownTextView: UIViewRepresentable {
     func makeUIView(context: Context) -> UITextView {
         let view = UITextView()
         view.font = .monospacedSystemFont(ofSize: 16, weight: .regular)
-        view.backgroundColor = .themeSurface
-        view.textColor = .themeText
-        view.tintColor = .themeAccent
-        view.keyboardAppearance = .dark
+        applyTheme(to: view)
         view.textContainerInset = UIEdgeInsets(top: 16, left: 14, bottom: 16, right: 14)
         view.autocapitalizationType = .none
         view.autocorrectionType = .no
@@ -37,9 +37,17 @@ struct MarkdownTextView: UIViewRepresentable {
 
     func updateUIView(_ view: UITextView, context: Context) {
         context.coordinator.model = model
+        applyTheme(to: view)
         let target = model.text
         guard view.text != target else { return }
         applyRemote(target, to: view)
+    }
+
+    private func applyTheme(to view: UITextView) {
+        view.backgroundColor = .themeSurface
+        view.textColor = .themeText
+        view.tintColor = .themeAccent
+        view.keyboardAppearance = flavor.colorScheme == .dark ? .dark : .light
     }
 
     /// Replace only the changed range so the local cursor survives.

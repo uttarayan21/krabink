@@ -1,34 +1,150 @@
 // Shared look for the iPad app, mirroring the desktop theme
-// (crates/krabink/src/theme.rs): a dark palette with an indigo accent,
-// cards on a darker page, roomier padding. The app is dark-only like the
-// desktop, so the sketch paper (`UIColor.paper`, the same value as
-// `Theme.surface`) never sits on a white page.
+// (crates/krabink/src/theme.rs): the four Catppuccin flavours with
+// lavender as the accent, cards on a page, roomier padding. The chosen
+// flavour lives in `ThemeStore.shared` (persisted in UserDefaults); every
+// `Theme.*` colour reads it, so views observing the store restyle at once.
+// The sketch paper (`UIColor.paper`) is the flavour's card colour, the
+// same value the desktop clears its render targets to.
 
 import SwiftUI
 import UIKit
 
-enum Theme {
-    /// Window background.
-    static let bg = Color(hex: 0x1111_17)
-    /// Note list and toolbars.
-    static let sidebar = Color(hex: 0x1719_20)
-    /// Cards, editor, inputs. Equal to `UIColor.paper`.
-    static let surface = Color(hex: 0x1D20_29)
-    /// Hovered or selected rows, code.
-    static let surfaceRaised = Color(hex: 0x262A_36)
-    /// Hairlines around cards.
-    static let border = Color(hex: 0x2B30_3D)
-    /// Primary text.
-    static let text = Color(hex: 0xE7E9_F0)
-    /// Secondary text, captions, hints.
-    static let muted = Color(hex: 0x8D94_A8)
-    /// Brand accent: buttons, selection, links.
-    static let accent = Color(hex: 0x7C8C_FF)
+/// One of the Catppuccin flavours: https://catppuccin.com/palette
+enum ThemeFlavor: String, CaseIterable, Identifiable {
+    case latte, frappe, macchiato, mocha
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .latte: "Latte"
+        case .frappe: "Frappé"
+        case .macchiato: "Macchiato"
+        case .mocha: "Mocha"
+        }
+    }
+
+    /// Latte is the light flavour; the rest are dark.
+    var colorScheme: ColorScheme {
+        self == .latte ? .light : .dark
+    }
+
+    var palette: Palette {
+        switch self {
+        case .latte: Palette.latte
+        case .frappe: Palette.frappe
+        case .macchiato: Palette.macchiato
+        case .mocha: Palette.mocha
+        }
+    }
+}
+
+/// Every colour the app uses, by role. Catppuccin roles in brackets.
+struct Palette {
+    /// Window background [base].
+    let bg: Color
+    /// Note list and toolbars [mantle].
+    let sidebar: Color
+    /// Cards, editor, inputs and sketch paper [surface0].
+    let surface: Color
+    /// Hovered or selected rows, code [surface1].
+    let surfaceRaised: Color
+    /// Hairlines around cards [surface1].
+    let border: Color
+    /// Primary text [text].
+    let text: Color
+    /// Secondary text, captions, hints [subtext0].
+    let muted: Color
+    /// Brand accent: buttons, selection, links [lavender].
+    let accent: Color
+    /// Text on an accent-filled button [base].
+    let onAccent: Color
+    let success: Color
+    let warn: Color
+    let danger: Color
+
     /// Translucent accent behind the selected note.
-    static let accentSoft = Color(hex: 0x2A2F_5A).opacity(0.8)
-    static let success = Color(hex: 0x4ADE_80)
-    static let warn = Color(hex: 0xFBBF_24)
-    static let danger = Color(hex: 0xF871_71)
+    var accentSoft: Color { accent.opacity(0.28) }
+
+    static let latte = Palette(
+        bg: Color(hex: 0xEFF1F5), sidebar: Color(hex: 0xE6E9EF),
+        surface: Color(hex: 0xCCD0DA), surfaceRaised: Color(hex: 0xBCC0CC),
+        border: Color(hex: 0xBCC0CC), text: Color(hex: 0x4C4F69),
+        muted: Color(hex: 0x6C6F85), accent: Color(hex: 0x7287FD),
+        onAccent: Color(hex: 0xEFF1F5), success: Color(hex: 0x40A02B),
+        warn: Color(hex: 0xDF8E1D), danger: Color(hex: 0xD20F39))
+
+    static let frappe = Palette(
+        bg: Color(hex: 0x303446), sidebar: Color(hex: 0x292C3C),
+        surface: Color(hex: 0x414559), surfaceRaised: Color(hex: 0x51576D),
+        border: Color(hex: 0x51576D), text: Color(hex: 0xC6D0F5),
+        muted: Color(hex: 0xA5ADCE), accent: Color(hex: 0xBABBF1),
+        onAccent: Color(hex: 0x303446), success: Color(hex: 0xA6D189),
+        warn: Color(hex: 0xE5C890), danger: Color(hex: 0xE78284))
+
+    static let macchiato = Palette(
+        bg: Color(hex: 0x24273A), sidebar: Color(hex: 0x1E2030),
+        surface: Color(hex: 0x363A4F), surfaceRaised: Color(hex: 0x494D64),
+        border: Color(hex: 0x494D64), text: Color(hex: 0xCAD3F5),
+        muted: Color(hex: 0xA5ADCB), accent: Color(hex: 0xB7BDF8),
+        onAccent: Color(hex: 0x24273A), success: Color(hex: 0xA6DA95),
+        warn: Color(hex: 0xEED49F), danger: Color(hex: 0xED8796))
+
+    static let mocha = Palette(
+        bg: Color(hex: 0x1E1E2E), sidebar: Color(hex: 0x181825),
+        surface: Color(hex: 0x313244), surfaceRaised: Color(hex: 0x45475A),
+        border: Color(hex: 0x45475A), text: Color(hex: 0xCDD6F4),
+        muted: Color(hex: 0xA6ADC8), accent: Color(hex: 0xB4BEFE),
+        onAccent: Color(hex: 0x1E1E2E), success: Color(hex: 0xA6E3A1),
+        warn: Color(hex: 0xF9E2AF), danger: Color(hex: 0xF38BA8))
+}
+
+/// The chosen flavour, persisted as `theme` in UserDefaults. Views that
+/// read any `Theme.*` colour in their body observe it and restyle when it
+/// changes; UIKit-backed views take the flavour as an input so their
+/// `updateUIView` runs too.
+@Observable
+final class ThemeStore {
+    static let shared = ThemeStore()
+
+    var flavor: ThemeFlavor {
+        didSet { UserDefaults.standard.set(flavor.rawValue, forKey: "theme") }
+    }
+
+    var palette: Palette { flavor.palette }
+
+    private init() {
+        let stored = UserDefaults.standard.string(forKey: "theme") ?? ""
+        flavor = ThemeFlavor(rawValue: stored) ?? .mocha
+    }
+}
+
+enum Theme {
+    private static var palette: Palette { ThemeStore.shared.palette }
+
+    /// Window background.
+    static var bg: Color { palette.bg }
+    /// Note list and toolbars.
+    static var sidebar: Color { palette.sidebar }
+    /// Cards, editor, inputs. Equal to `UIColor.paper`.
+    static var surface: Color { palette.surface }
+    /// Hovered or selected rows, code.
+    static var surfaceRaised: Color { palette.surfaceRaised }
+    /// Hairlines around cards.
+    static var border: Color { palette.border }
+    /// Primary text.
+    static var text: Color { palette.text }
+    /// Secondary text, captions, hints.
+    static var muted: Color { palette.muted }
+    /// Brand accent: buttons, selection, links.
+    static var accent: Color { palette.accent }
+    /// Text on an accent-filled button.
+    static var onAccent: Color { palette.onAccent }
+    /// Translucent accent behind the selected note.
+    static var accentSoft: Color { palette.accentSoft }
+    static var success: Color { palette.success }
+    static var warn: Color { palette.warn }
+    static var danger: Color { palette.danger }
 
     /// Corner radius shared by cards, tiles and buttons.
     static let radius: CGFloat = 10
@@ -47,12 +163,18 @@ extension Color {
 
 /// UIKit twins for the UIView-backed editor and preview.
 extension UIColor {
-    static let themeBg = UIColor(Theme.bg)
-    static let themeSurface = UIColor(Theme.surface)
-    static let themeText = UIColor(Theme.text)
-    static let themeMuted = UIColor(Theme.muted)
-    static let themeBorder = UIColor(Theme.border)
-    static let themeAccent = UIColor(Theme.accent)
+    static var themeBg: UIColor { UIColor(Theme.bg) }
+    static var themeSurface: UIColor { UIColor(Theme.surface) }
+    static var themeText: UIColor { UIColor(Theme.text) }
+    static var themeMuted: UIColor { UIColor(Theme.muted) }
+    static var themeBorder: UIColor { UIColor(Theme.border) }
+    static var themeAccent: UIColor { UIColor(Theme.accent) }
+
+    /// Sketch paper: the flavour's card colour, the desktop's
+    /// `Palette::paper` in crates/krabink/src/theme.rs. Both platforms
+    /// clear the canvas to this so ink reads alike everywhere; the
+    /// renderer picks the highlighter blend from its luminance.
+    static var paper: UIColor { UIColor(Theme.surface) }
 }
 
 /// How the app reads a sync status line (`AppModel.syncState`).
@@ -133,10 +255,33 @@ struct LogoMark: View {
             .overlay {
                 Image(systemName: "pencil.tip")
                     .font(.system(size: size * 0.5, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(Theme.onAccent)
             }
             .shadow(color: Theme.accent.opacity(0.35), radius: 6, y: 2)
     }
+}
+
+/// Filled accent button with the palette's on-accent text (SwiftUI's
+/// `.borderedProminent` insists on white, unreadable on pale lavender).
+struct PrimaryButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var enabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(Theme.onAccent)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
+                    .fill(Theme.accent)
+            )
+            .opacity(enabled ? (configuration.isPressed ? 0.75 : 1) : 0.45)
+    }
+}
+
+extension ButtonStyle where Self == PrimaryButtonStyle {
+    static var primary: PrimaryButtonStyle { PrimaryButtonStyle() }
 }
 
 /// Bordered, rounded surface that editor, preview and settings rows sit on.

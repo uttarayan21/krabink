@@ -25,6 +25,9 @@ private func sketchId(_ url: URL) -> String? {
 
 struct SketchPreview: UIViewRepresentable {
     let model: NoteModel
+    /// Passed in (not read from the store) so a switch re-runs
+    /// `updateUIView`: colours, thumbnails and paper follow.
+    let flavor: ThemeFlavor
     let openSketch: (String) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(open: openSketch) }
@@ -48,7 +51,7 @@ struct SketchPreview: UIViewRepresentable {
 
     func updateUIView(_ view: UITextView, context: Context) {
         context.coordinator.open = openSketch
-        context.coordinator.render(model)
+        context.coordinator.render(model, flavor: flavor)
     }
 
     @MainActor
@@ -60,14 +63,25 @@ struct SketchPreview: UIViewRepresentable {
         /// Cache thumbnails by id+stroke count so re-render is cheap.
         private var thumbCache: [String: (count: Int, image: UIImage)] = [:]
         private var lastRendered = ""
+        /// The flavour the attributed text and thumbnails were built for.
+        private var lastFlavor: ThemeFlavor?
         /// Offscreen ink renderer: thumbnails are the canvas's own pipeline.
         private lazy var renderer = InkRenderer(
             view: MTKView(frame: .zero, device: MTLCreateSystemDefaultDevice()))
 
         init(open: @escaping (String) -> Void) { self.open = open }
 
-        func render(_ model: NoteModel) {
+        func render(_ model: NoteModel, flavor: ThemeFlavor) {
             guard let view else { return }
+            if flavor != lastFlavor {
+                // New colours and paper: rebuild everything.
+                lastFlavor = flavor
+                lastRendered = ""
+                thumbCache.removeAll()
+                view.backgroundColor = .themeSurface
+                view.textColor = .themeText
+                view.tintColor = .themeAccent
+            }
             let source = model.text
             // Re-render only when text changed (thumbnails refresh via the
             // stroke-count key inside buildAttributed).

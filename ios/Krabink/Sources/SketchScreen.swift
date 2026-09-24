@@ -1035,7 +1035,15 @@ final class SketchCanvasView: UIView, UIScrollViewDelegate {
             zoom: scroll.zoomScale, offset: scroll.contentOffset, size: bounds.size)
     }
 
-    private func applyBackground() {
+    /// The flavour the paper was last cleared for.
+    private var paperFlavor: ThemeFlavor?
+
+    /// Clear to the current flavour's paper and pick the highlighter
+    /// blend for it; a no-op while the flavour is unchanged.
+    func applyBackground() {
+        let flavor = ThemeStore.shared.flavor
+        guard flavor != paperFlavor else { return }
+        paperFlavor = flavor
         metal.clearColor = InkRenderer.clearColor(for: .paper, trait: traitCollection)
         renderer.darkPaper = InkRenderer.isDark(metal.clearColor)
         renderer.needsDisplay()
@@ -1043,7 +1051,10 @@ final class SketchCanvasView: UIView, UIScrollViewDelegate {
 
     override func traitCollectionDidChange(_ previous: UITraitCollection?) {
         super.traitCollectionDidChange(previous)
-        if traitCollection.hasDifferentColorAppearance(comparedTo: previous) { applyBackground() }
+        if traitCollection.hasDifferentColorAppearance(comparedTo: previous) {
+            paperFlavor = nil
+            applyBackground()
+        }
     }
 
     // MARK: UIScrollViewDelegate
@@ -1065,6 +1076,7 @@ struct SketchScreen: View {
     let model: SketchModel
     let done: () -> Void
     @State private var showBrushes = false
+    @State private var theme = ThemeStore.shared
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1107,9 +1119,8 @@ struct SketchScreen: View {
                     done()
                 } label: {
                     Label("done", systemImage: "checkmark")
-                        .font(.subheadline.weight(.semibold))
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.primary)
                 .accessibilityIdentifier("sketchDone")
             }
             .padding(.horizontal, 14)
@@ -1118,10 +1129,10 @@ struct SketchScreen: View {
             .overlay(alignment: .bottom) {
                 Rectangle().fill(Theme.border).frame(height: 1)
             }
-            SketchCanvas(model: model)
+            SketchCanvas(model: model, flavor: theme.flavor)
         }
         .background(Theme.bg)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(theme.flavor.colorScheme)
         .tint(Theme.accent)
         .onDisappear { model.pointerGone() }
     }
@@ -1129,6 +1140,9 @@ struct SketchScreen: View {
 
 struct SketchCanvas: UIViewRepresentable {
     let model: SketchModel
+    /// Passed in (not read from the store) so a switch re-runs
+    /// `updateUIView` and the paper follows.
+    let flavor: ThemeFlavor
 
     func makeCoordinator() -> Coordinator { Coordinator(model: model) }
 
@@ -1171,7 +1185,9 @@ struct SketchCanvas: UIViewRepresentable {
         return canvas
     }
 
-    func updateUIView(_ view: UIView, context: Context) {}
+    func updateUIView(_ view: UIView, context: Context) {
+        (view as? SketchCanvasView)?.applyBackground()
+    }
 
     /// iOS 18: our own item list — every ink the core honours plus the
     /// vector eraser; watercolour is left out rather than faked. iOS 17:

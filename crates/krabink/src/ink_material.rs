@@ -30,6 +30,7 @@ use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dKey, Material2dPlug
 use krabink_core::{Blend, GrainMapping, InkStyle, MaskStyle, Overlap, Rgba};
 
 use crate::ink_assets::InkAssets;
+use crate::theme::PaperTone;
 
 /// Stroke-space uv: `u` arc length in canvas units, `v` the side in -1..1.
 pub const ATTRIBUTE_INK_UV: MeshVertexAttribute =
@@ -208,8 +209,8 @@ impl InkCombo {
         usize::from(self.multiply) | (usize::from(self.discard) << 1)
     }
 
-    fn blend_state(self) -> BlendState {
-        if self.multiply && crate::theme::PAPER_IS_DARK {
+    fn blend_state(self, paper: PaperTone) -> BlendState {
+        if self.multiply && paper == PaperTone::Dark {
             // Screen: out = src * (1 - dst) + dst, the highlighter on dark
             // paper (mirrors `psoScreen` in InkRenderer.swift). Multiply
             // would only darken, and darkening dark paper shows nothing.
@@ -254,9 +255,20 @@ impl InkCombo {
     }
 }
 
-impl From<&InkMaterial> for InkCombo {
+/// The material's specialisation key: the run's [`InkCombo`] and the
+/// paper it lands on (the highlighter's blend depends on both).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct InkKey {
+    pub combo: InkCombo,
+    pub paper: PaperTone,
+}
+
+impl From<&InkMaterial> for InkKey {
     fn from(material: &InkMaterial) -> Self {
-        material.combo
+        Self {
+            combo: material.combo,
+            paper: material.paper,
+        }
     }
 }
 
@@ -280,7 +292,7 @@ impl InkParams {
 }
 
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-#[bind_group_data(InkCombo)]
+#[bind_group_data(InkKey)]
 pub struct InkMaterial {
     /// `array<StrokeStyle>`, indexed by each entity's [`MeshTag`].
     #[storage(0, read_only)]
@@ -295,8 +307,10 @@ pub struct InkMaterial {
     #[texture(4, dimension = "2d_array")]
     #[sampler(5)]
     pub grains: Handle<Image>,
-    /// Blend and depth state; the specialisation key.
+    /// Blend and depth state; half the specialisation key.
     pub combo: InkCombo,
+    /// Light or dark paper under the ink; the other half of the key.
+    pub paper: PaperTone,
 }
 
 fn shader() -> ShaderRef {
@@ -326,13 +340,13 @@ impl Material2d for InkMaterial {
             ATTRIBUTE_INK_UV.at_shader_location(1),
             ATTRIBUTE_INK_OPACITY.at_shader_location(2),
         ])?];
-        let combo = key.bind_group_data;
+        let InkKey { combo, paper } = key.bind_group_data;
         if let Some(fragment) = descriptor.fragment.as_mut() {
             fragment
                 .targets
                 .iter_mut()
                 .flatten()
-                .for_each(|target| target.blend = Some(combo.blend_state()));
+                .for_each(|target| target.blend = Some(combo.blend_state(paper)));
         }
         // The transparent 2D pipeline disables depth writes; ink relies on
         // them for draw order and write-once overlap.
@@ -342,12 +356,16 @@ impl Material2d for InkMaterial {
         }
         descriptor.label = Some(
             format!(
-                "ink_pipeline_{}_{}",
+                "ink_pipeline_{}_{}_{}",
                 if combo.multiply { "multiply" } else { "normal" },
                 if combo.discard {
                     "discard"
                 } else {
                     "accumulate"
+                },
+                match paper {
+                    PaperTone::Light => "light",
+                    PaperTone::Dark => "dark",
                 }
             )
             .into(),
@@ -387,6 +405,7 @@ impl InkPalette {
         materials: &mut Assets<InkMaterial>,
         params: InkParams,
         assets: &InkAssets,
+        paper: PaperTone,
     ) -> Self {
         let capacity = Self::INITIAL_CAPACITY;
         let mut buffer = ShaderBuffer::default();
@@ -399,6 +418,7 @@ impl InkPalette {
                 masks: assets.masks.clone(),
                 grains: assets.grains.clone(),
                 combo,
+                paper,
             })
         });
         Self {
@@ -417,6 +437,15 @@ impl InkPalette {
             if let Some(mut material) = materials.get_mut(handle) {
                 material.masks = assets.masks.clone();
                 material.grains = assets.grains.clone();
+            }
+        }
+    }
+
+    /// The paper changed tone (theme switch): re-specialise the blends.
+    pub fn set_paper(&self, materials: &mut Assets<InkMaterial>, paper: PaperTone) {
+        for handle in &self.materials {
+            if let Some(mut material) = materials.get_mut(handle) {
+                material.paper = paper;
             }
         }
     }

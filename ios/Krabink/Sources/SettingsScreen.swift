@@ -8,6 +8,7 @@ import SwiftUI
 
 struct SettingsScreen: View {
     @Bindable var model: AppModel
+    @State private var theme = ThemeStore.shared
     @Environment(\.dismiss) private var dismiss
     @State private var deviceToRemove: DeviceInfo?
     @State private var confirmUnpair = false
@@ -20,6 +21,27 @@ struct SettingsScreen: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    HStack(spacing: 14) {
+                        ForEach(ThemeFlavor.allCases) { flavor in
+                            Button {
+                                theme.flavor = flavor
+                            } label: {
+                                ThemeSwatch(flavor: flavor, selected: flavor == theme.flavor)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("theme-\(flavor.rawValue)")
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+                } header: {
+                    Caption("Appearance")
+                } footer: {
+                    Text("Catppuccin flavours, lightest to darkest. Sketch paper follows the card colour on every device.")
+                        .foregroundStyle(Theme.muted)
+                }
+
                 Section {
                     LabeledContent("state") {
                         HStack(spacing: 6) {
@@ -74,8 +96,7 @@ struct SettingsScreen: View {
                             && !nameEdit.trimmingCharacters(in: .whitespaces).isEmpty
                         {
                             Button("save", action: saveName)
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
+                                .buttonStyle(.primary)
                                 .accessibilityIdentifier("saveDeviceName")
                         }
                     }
@@ -170,10 +191,9 @@ struct SettingsScreen: View {
                         }
                     } label: {
                         Text("join")
-                            .font(.subheadline.weight(.semibold))
                             .frame(maxWidth: .infinity)
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.primary)
                     .disabled(joinURI.isEmpty)
                     .accessibilityIdentifier("joinWorkspace")
                     if joinFailed {
@@ -238,7 +258,7 @@ struct SettingsScreen: View {
                 }
             }
         }
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(theme.flavor.colorScheme)
         .tint(Theme.accent)
     }
 
@@ -299,5 +319,40 @@ struct SettingsScreen: View {
         guard ms > 0 else { return "never" }
         let date = Date(timeIntervalSince1970: TimeInterval(ms) / 1000)
         return date.formatted(.relative(presentation: .named))
+    }
+}
+
+/// A flavour's page, card and accent as a small tile; the selected one
+/// gets the current accent as its ring.
+private struct ThemeSwatch: View {
+    let flavor: ThemeFlavor
+    let selected: Bool
+
+    var body: some View {
+        let p = flavor.palette
+        VStack(spacing: 6) {
+            ZStack(alignment: .bottomTrailing) {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(p.bg)
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(p.surface)
+                    .padding(6)
+                Circle()
+                    .fill(p.accent)
+                    .frame(width: 12, height: 12)
+                    .padding(10)
+            }
+            .frame(width: 64, height: 44)
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(selected ? Theme.accent : p.border, lineWidth: selected ? 2 : 1)
+            }
+            Text(flavor.label)
+                .font(.caption2)
+                .foregroundStyle(selected ? Theme.text : Theme.muted)
+        }
+        .contentShape(Rectangle())
+        .accessibilityLabel(flavor.label)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }

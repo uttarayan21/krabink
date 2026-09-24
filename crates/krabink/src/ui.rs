@@ -10,7 +10,7 @@ use crate::docs::Docs;
 use crate::settings::Settings;
 use crate::sync::SyncTransport;
 use crate::sync::{LocalCommit, SubscribeNeeded};
-use crate::theme;
+use crate::theme::{self, Palette, Theme};
 
 /// When set, the newest note auto-opens as the library changes (replay rig).
 #[derive(Resource, Default)]
@@ -38,7 +38,7 @@ impl Plugin for EditorUiPlugin {
             .init_resource::<FollowLatest>()
             .init_non_send::<MarkdownCache>()
             // Theme first so the very first frame already renders styled.
-            .add_systems(EguiPrimaryContextPass, editor_ui.after(theme::install_once));
+            .add_systems(EguiPrimaryContextPass, editor_ui.after(theme::apply));
     }
 }
 
@@ -84,8 +84,12 @@ fn editor_ui(
     runtime: Res<crate::Runtime>,
     mut adopted: MessageWriter<crate::settings::PairAdopted>,
     follow: Res<FollowLatest>,
+    mut theme: ResMut<Theme>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
+    // Copied out: the resource is only written back on a theme action, so
+    // change detection stays quiet on ordinary frames.
+    let palette = *theme.palette();
     let view = crate::settings::SettingsView {
         peers: sync.node.peers(),
         relay: sync.node.relay_health(),
@@ -93,6 +97,8 @@ fn editor_ui(
         this_device: transport.device(),
         devices: docs.workspace.devices(),
         now_ms: crate::docs::now_ms(),
+        flavor: theme.flavor(),
+        palette,
     };
     match settings.window(ctx, &view) {
         Some(crate::settings::SettingsAction::Join(info)) => {
@@ -161,6 +167,12 @@ fn editor_ui(
             });
             settings.adopt(own);
         }
+        Some(crate::settings::SettingsAction::Theme(flavor)) => {
+            theme.set_flavor(flavor);
+            if let Err(err) = crate::config::persist_theme(flavor) {
+                tracing::error!(%err, "persisting theme failed");
+            }
+        }
         None => {}
     }
 
@@ -204,16 +216,16 @@ fn editor_ui(
         .min_size(200.0)
         .frame(
             egui::Frame::new()
-                .fill(theme::SIDEBAR)
+                .fill(palette.sidebar)
                 .inner_margin(egui::Margin::symmetric(12, 16)),
         )
         .show(&mut root, |ui| {
-            brand(ui);
+            brand(ui, &palette);
             ui.add_space(14.0);
             if ui
                 .add_sized(
                     [ui.available_width(), 34.0],
-                    theme::primary_button("+  New note"),
+                    palette.primary_button("+  New note"),
                 )
                 .clicked()
             {
@@ -223,12 +235,12 @@ fn editor_ui(
 
             let notes = docs.workspace.notes();
             ui.horizontal(|ui| {
-                theme::caption(ui, "Notes");
+                palette.caption(ui, "Notes");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(notes.len().to_string())
                             .small()
-                            .color(theme::MUTED),
+                            .color(palette.muted),
                     );
                 });
             });
@@ -246,12 +258,12 @@ fn editor_ui(
                         ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new("No notes yet. Create one above.")
-                                .color(theme::MUTED),
+                                .color(palette.muted),
                         );
                     }
                     for meta in notes {
                         let selected = editor.open == Some(meta.id);
-                        if note_row(ui, &meta.title, selected).clicked() && !selected {
+                        if note_row(ui, &palette, &meta.title, selected).clicked() && !selected {
                             match docs.open_note(meta.id) {
                                 Ok(_) => {
                                     subscribes.write(SubscribeNeeded(DocKey::from(meta.id)));
@@ -264,7 +276,7 @@ fn editor_ui(
                 });
 
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                let label = egui::RichText::new("⚙  Settings").color(theme::MUTED);
+                let label = egui::RichText::new("⚙  Settings").color(palette.muted);
                 let button = egui::Button::new(label)
                     .fill(egui::Color32::TRANSPARENT)
                     .stroke(egui::Stroke::NONE)
@@ -278,12 +290,19 @@ fn editor_ui(
     egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
-                .fill(theme::BG)
+                .fill(palette.bg)
                 .inner_margin(egui::Margin::same(18)),
         )
         .show(&mut root, |ui| {
             let Some(id) = editor.open else {
-                empty_state(ui, &mut docs, &mut editor, &mut commits, &mut subscribes);
+                empty_state(
+                    ui,
+                    &palette,
+                    &mut docs,
+                    &mut editor,
+                    &mut commits,
+                    &mut subscribes,
+                );
                 return;
             };
 
@@ -296,7 +315,7 @@ fn editor_ui(
                 .filter(|t| !t.trim().is_empty())
                 .unwrap_or_else(|| "Untitled".to_owned());
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(title).heading().color(theme::TEXT));
+                ui.label(egui::RichText::new(title).heading().color(palette.text));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let remote: Vec<_> = view
                         .peers
@@ -307,20 +326,20 @@ fn editor_ui(
                         .iter()
                         .all(|p| matches!(p.state, krabink_local::PeerState::Connected { .. }));
                     let (color, label) = if remote.is_empty() {
-                        (theme::MUTED, "no peers")
+                        (palette.muted, "no peers")
                     } else if all_up {
-                        (theme::SUCCESS, "live sync")
+                        (palette.success, "live sync")
                     } else {
-                        (theme::WARN, "sync connecting…")
+                        (palette.warn, "sync connecting…")
                     };
-                    theme::status_dot(ui, color, label);
+                    palette.status_dot(ui, color, label);
                 });
             });
             ui.add_space(12.0);
 
             let pane_height = ui.available_height();
             ui.columns(2, |columns| {
-                let response = pane(&mut columns[0], "Markdown", pane_height, |ui| {
+                let response = pane(&mut columns[0], &palette, "Markdown", pane_height, |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("editor")
                         .auto_shrink([false, false])
@@ -370,7 +389,7 @@ fn editor_ui(
                     }
                 }
 
-                pane(&mut columns[1], "Preview", pane_height, |ui| {
+                pane(&mut columns[1], &palette, "Preview", pane_height, |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("preview")
                         .auto_shrink([false, false])
@@ -386,32 +405,32 @@ fn editor_ui(
 }
 
 /// Logo mark + app name at the top of the sidebar.
-fn brand(ui: &mut egui::Ui) {
+fn brand(ui: &mut egui::Ui, palette: &Palette) {
     ui.horizontal(|ui| {
-        logo(ui, 26.0, theme::SIDEBAR);
+        logo(ui, palette, 26.0, palette.sidebar);
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new("krabink")
                 .size(21.0)
                 .strong()
-                .color(theme::TEXT),
+                .color(palette.text),
         );
     });
 }
 
 /// The ring logo mark, `size` wide, with `bg` as the ring's inner colour.
-fn logo(ui: &mut egui::Ui, size: f32, bg: egui::Color32) {
+fn logo(ui: &mut egui::Ui, palette: &Palette, size: f32, bg: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
     let painter = ui.painter();
     let c = rect.center();
-    painter.circle_filled(c, size * 0.46, theme::ACCENT);
+    painter.circle_filled(c, size * 0.46, palette.accent);
     painter.circle_filled(c, size * 0.25, bg);
-    painter.circle_filled(c, size * 0.1, theme::ACCENT);
+    painter.circle_filled(c, size * 0.1, palette.accent);
 }
 
 /// One entry in the library list: rounded hover/selection background with
 /// an accent bar on the selected row, title truncated to one line.
-fn note_row(ui: &mut egui::Ui, title: &str, selected: bool) -> egui::Response {
+fn note_row(ui: &mut egui::Ui, palette: &Palette, title: &str, selected: bool) -> egui::Response {
     let height = 34.0;
     let (rect, response) = ui.allocate_exact_size(
         egui::Vec2::new(ui.available_width(), height),
@@ -422,9 +441,9 @@ fn note_row(ui: &mut egui::Ui, title: &str, selected: bool) -> egui::Response {
         return response;
     }
     let fill = if selected {
-        theme::ACCENT_SOFT
+        palette.accent_soft()
     } else if response.hovered() {
-        theme::SURFACE_RAISED
+        palette.surface_raised
     } else {
         egui::Color32::TRANSPARENT
     };
@@ -435,7 +454,7 @@ fn note_row(ui: &mut egui::Ui, title: &str, selected: bool) -> egui::Response {
             rect.left_top() + egui::Vec2::new(0.0, 9.0),
             egui::Vec2::new(3.0, height - 18.0),
         );
-        painter.rect_filled(bar, egui::CornerRadius::same(2), theme::ACCENT);
+        painter.rect_filled(bar, egui::CornerRadius::same(2), palette.accent);
     }
     let shown = if title.trim().is_empty() {
         "Untitled"
@@ -443,9 +462,9 @@ fn note_row(ui: &mut egui::Ui, title: &str, selected: bool) -> egui::Response {
         title
     };
     let color = if selected || response.hovered() {
-        theme::TEXT
+        palette.text
     } else {
-        theme::MUTED
+        palette.muted
     };
     let text_width = rect.width() - 24.0;
     let galley = egui::WidgetText::from(egui::RichText::new(shown).color(color)).into_galley(
@@ -462,16 +481,18 @@ fn note_row(ui: &mut egui::Ui, title: &str, selected: bool) -> egui::Response {
 /// Titled card filling `height`, used for the editor and preview columns.
 fn pane<R>(
     ui: &mut egui::Ui,
+    palette: &Palette,
     title: &str,
     height: f32,
     body: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
-    theme::card()
+    palette
+        .card()
         .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
             ui.set_min_height(height - 26.0);
             ui.set_width(ui.available_width());
-            theme::caption(ui, title);
+            palette.caption(ui, title);
             ui.add_space(6.0);
             body(ui)
         })
@@ -481,6 +502,7 @@ fn pane<R>(
 /// What the central area shows when no note is open.
 fn empty_state(
     ui: &mut egui::Ui,
+    palette: &Palette,
     docs: &mut Docs,
     editor: &mut EditorState,
     commits: &mut MessageWriter<LocalCommit>,
@@ -490,22 +512,22 @@ fn empty_state(
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
         ui.add_space((rect.height() / 2.0 - 90.0).max(0.0));
         ui.vertical_centered(|ui| {
-            logo(ui, 48.0, theme::BG);
+            logo(ui, palette, 48.0, palette.bg);
             ui.add_space(8.0);
             ui.label(
                 egui::RichText::new("No note open")
                     .size(22.0)
                     .strong()
-                    .color(theme::TEXT),
+                    .color(palette.text),
             );
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new("Pick a note from the library, or start a fresh one.")
-                    .color(theme::MUTED),
+                    .color(palette.muted),
             );
             ui.add_space(16.0);
             if ui
-                .add_sized([160.0, 34.0], theme::primary_button("Create a note"))
+                .add_sized([160.0, 34.0], palette.primary_button("Create a note"))
                 .clicked()
             {
                 create_note(docs, editor, commits, subscribes);

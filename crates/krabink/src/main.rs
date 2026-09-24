@@ -126,6 +126,7 @@ fn run_app(args: cli::Cli) -> Result<()> {
         replica: config.replica.map(|id| id.to_string()),
     };
     let sync_node = SyncNode::new(node, &runtime);
+    let theme = theme::Theme::new(config.theme);
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -145,6 +146,8 @@ fn run_app(args: cli::Cli) -> Result<()> {
         node::NodePlugin,
     ))
     .insert_resource(docs)
+    .insert_resource(theme.clear_color())
+    .insert_resource(theme)
     .insert_resource(Runtime(runtime))
     .insert_resource(sync_node)
     .insert_resource(transport)

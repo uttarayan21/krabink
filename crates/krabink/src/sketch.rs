@@ -37,6 +37,7 @@ use crate::ink_material::{
     ATTRIBUTE_INK_OPACITY, ATTRIBUTE_INK_UV, InkMaterial, InkMaterialPlugin, InkPalette, InkParams,
     InkSlot,
 };
+use crate::theme::{Palette, Theme};
 use crate::ui::EditorState;
 
 /// Wet ink lingers this long after `End` if the committed stroke never shows.
@@ -343,6 +344,7 @@ impl Plugin for SketchPlugin {
                 Update,
                 (
                     sync_assets,
+                    apply_theme,
                     sync_sketch_scenes,
                     apply_wet_ink,
                     flush_palettes,
@@ -424,6 +426,7 @@ fn sync_sketch_scenes(
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut egui_textures: ResMut<EguiUserTextures>,
     ink_assets: Res<InkAssets>,
+    theme: Res<Theme>,
 ) {
     let Some(note_id) = editor.open else { return };
     let Some(note) = docs.note(note_id) else {
@@ -461,12 +464,14 @@ fn sync_sketch_scenes(
                 sketch,
                 layer,
                 desired,
+                theme.palette(),
             );
             let palette = InkPalette::new(
                 &mut buffers,
                 &mut materials,
                 InkParams::new(ZOOM),
                 &ink_assets,
+                theme.palette().paper_tone(),
             );
             scenes.scenes.insert(
                 sketch,
@@ -494,6 +499,7 @@ fn sync_sketch_scenes(
                 sketch,
                 scene.layer,
                 desired,
+                theme.palette(),
             );
         }
 
@@ -574,6 +580,32 @@ fn wet_z(j: u16) -> f32 {
     WET_Z_BASE + f32::from(j) * Z_STEP
 }
 
+/// The theme changed: every sketch's paper takes the new colour and the
+/// highlighter re-specialises for its tone.
+fn apply_theme(
+    theme: Res<Theme>,
+    scenes: Res<SketchScenes>,
+    mut cameras: Query<&mut Camera>,
+    mut materials: ResMut<Assets<InkMaterial>>,
+) {
+    if !theme.is_changed() {
+        return;
+    }
+    let palette = theme.palette();
+    for scene in scenes.scenes.values() {
+        if let Ok(mut camera) = cameras.get_mut(scene.target.camera) {
+            camera.clear_color = ClearColorConfig::Custom(palette.paper_color());
+        }
+        scene
+            .palette
+            .set_paper(&mut materials, palette.paper_tone());
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every ECS handle a render target needs, threaded from one system"
+)]
 fn new_target(
     commands: &mut Commands,
     images: &mut Assets<Image>,
@@ -582,6 +614,7 @@ fn new_target(
     sketch: SketchId,
     layer: usize,
     size: UVec2,
+    palette: &Palette,
 ) -> SceneTarget {
     let mut image = Image::new_fill(
         bevy::render::render_resource::Extent3d {
@@ -590,7 +623,7 @@ fn new_target(
             depth_or_array_layers: 1,
         },
         bevy::render::render_resource::TextureDimension::D2,
-        &crate::theme::paper_bytes(),
+        &palette.paper_bytes(),
         bevy::render::render_resource::TextureFormat::Bgra8UnormSrgb,
         RenderAssetUsages::default(),
     );
@@ -609,7 +642,7 @@ fn new_target(
         .spawn((
             Camera2d,
             Camera {
-                clear_color: ClearColorConfig::Custom(crate::theme::paper_color()),
+                clear_color: ClearColorConfig::Custom(palette.paper_color()),
                 order: -1,
                 ..default()
             },

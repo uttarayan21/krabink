@@ -9,6 +9,7 @@ import SwiftUI
 
 struct BrushSheet: View {
     let model: SketchModel
+    @State private var theme = ThemeStore.shared
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -42,7 +43,7 @@ struct BrushSheet: View {
                 Button("Done") { dismiss() }
             }
         }
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(theme.flavor.colorScheme)
         .tint(Theme.accent)
     }
 }
