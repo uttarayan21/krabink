@@ -390,6 +390,15 @@ private struct NoteDetail: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
+                    note.insertSketch()
+                } label: {
+                    Label("insert sketch", systemImage: "rectangle.and.pencil.and.ellipsis")
+                }
+                .accessibilityIdentifier("newSketch")
+                .disabled(preview)
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
                     note.ink.eraseLast()
                 } label: {
                     Label("erase last", systemImage: "arrow.uturn.backward")

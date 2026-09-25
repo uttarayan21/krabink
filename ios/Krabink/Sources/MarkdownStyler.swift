@@ -26,6 +26,8 @@ enum MarkdownStyler {
     static let listHang: CGFloat = 18
     static let quoteIndent: CGFloat = 18
     static let codeBlockIndent: CGFloat = 12
+    /// Font size of a hidden embed line: small enough never to wrap.
+    static let embedFontSize: CGFloat = 8
 
     static var bodyFont: UIFont { .systemFont(ofSize: bodySize) }
 
@@ -45,16 +47,30 @@ enum MarkdownStyler {
     }
 
     /// Reset `storage` to the base look and apply `runs` over it.
-    static func restyle(_ storage: NSTextStorage, runs: [StyleRun], index: ScalarIndex) {
+    /// `boxHeights` gives each inline sketch's box height (by sketch id);
+    /// an embed without one gets the minimum.
+    static func restyle(
+        _ storage: NSTextStorage, runs: [StyleRun], index: ScalarIndex,
+        boxHeights: [String: CGFloat] = [:]
+    ) {
         let whole = NSRange(location: 0, length: storage.length)
         storage.beginEditing()
         storage.setAttributes(baseAttributes, range: whole)
         for run in runs {
             let range = utf16Range(run, index: index, length: storage.length)
             guard range.length > 0 else { continue }
-            apply(run.kind, to: storage, range: range)
+            apply(run.kind, to: storage, range: range, boxHeights: boxHeights)
         }
         storage.endEditing()
+    }
+
+    /// The inline sketches among `runs`, in text order: sketch id and the
+    /// scalar the embed starts at (in the text the runs were made for).
+    static func embeds(in runs: [StyleRun]) -> [(sketch: String, scalar: Int)] {
+        runs.compactMap { run in
+            if case .sketchEmbed(let sketch) = run.kind { return (sketch, Int(run.start)) }
+            return nil
+        }
     }
 
     private static func utf16Range(_ run: StyleRun, index: ScalarIndex, length: Int) -> NSRange {
@@ -63,7 +79,9 @@ enum MarkdownStyler {
         return NSRange(location: start, length: max(0, end - start))
     }
 
-    private static func apply(_ kind: StyleKind, to storage: NSTextStorage, range: NSRange) {
+    private static func apply(
+        _ kind: StyleKind, to storage: NSTextStorage, range: NSRange, boxHeights: [String: CGFloat]
+    ) {
         switch kind {
         case .heading(let level):
             let size = headingSizes[max(0, min(Int(level) - 1, headingSizes.count - 1))]
@@ -101,14 +119,26 @@ enum MarkdownStyler {
                 $0.firstLineHeadIndent += quoteIndent
                 $0.headIndent += quoteIndent
             }
-        case .link, .sketchEmbed:
-            // Inline sketch boxes land in the inline-sketch step; until
-            // then the embed line reads as a link.
+        case .link:
             storage.addAttributes(
                 [
                     .foregroundColor: UIColor.themeAccent,
                     .underlineStyle: NSUnderlineStyle.single.rawValue,
                 ], range: range)
+        case .sketchEmbed(let sketch):
+            // Hidden: the row is the sketch's box, the glyphs invisible.
+            let height = boxHeights[sketch] ?? InlineGeometry.minHeight
+            storage.addAttributes(
+                [
+                    .font: UIFont.systemFont(ofSize: embedFontSize),
+                    .foregroundColor: UIColor.clear,
+                ], range: range)
+            storage.removeAttribute(.underlineStyle, range: range)
+            editParagraphs(storage, range: range) {
+                $0.minimumLineHeight = height
+                $0.maximumLineHeight = height
+                $0.lineBreakMode = .byClipping
+            }
         case .marker, .thematicBreak:
             storage.addAttribute(.foregroundColor, value: UIColor.themeMuted, range: range)
             storage.removeAttribute(.underlineStyle, range: range)

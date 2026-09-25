@@ -21,6 +21,13 @@
 // map, so ink stays on its line and the Pencil still draws (anchors are
 // taken in source scalars either way).
 //
+// Inline sketches: every `SketchEmbed` run is laid out as a hidden row as
+// tall as the sketch's box (`MarkdownStyler`); once the layout settles
+// the boxes are measured (`LineLayout.inlineBoxes`) and framed by
+// `InlineBoxOverlay`, a non-interactive subview of the text view drawn
+// above ink and text. Heights come from the core per sketch and are
+// cached until that sketch changes.
+//
 // CRDT binding, both ways, through one reconciliation (`reconcile`).
 // `shadow` is the text the view and the CRDT last agreed on. A local edit
 // (`textViewDidChange`) is the splice from `shadow` to the view; a remote
@@ -60,7 +67,14 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
     /// The lines moved (text or width changed); coalesced per run-loop pass.
     var onLayoutChanged: (() -> Void)?
     private let hoverRecognizer = UIHoverGestureRecognizer()
+    private let boxOverlay = InlineBoxOverlay()
     private var index = ScalarIndex("")
+    /// Inline sketch embeds of the displayed text (display scalars).
+    private var embeds: [(sketch: String, scalar: Int)] = []
+    /// Box height per sketch, dropped when the sketch changes.
+    private var boxHeights: [String: CGFloat] = [:]
+    /// The boxes as of the last completed layout.
+    private(set) var cachedBoxes: [InlineBox] = []
     /// The text the view and the CRDT last agreed on (the source text,
     /// also in the reading view).
     private var shadow = ""
@@ -132,6 +146,7 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
             textView.panGestureRecognizer.minimumNumberOfTouches = 2
         }
         textView.addInteraction(UIScribbleInteraction(delegate: self))
+        textView.addSubview(boxOverlay)
         addSubview(textView)
         applyTheme()
 
@@ -194,7 +209,32 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             layoutNotifyPending = false
+            refreshBoxes()
             onLayoutChanged?()
+        }
+    }
+
+    /// Measure the inline boxes against the settled layout and frame them.
+    private func refreshBoxes() {
+        let boxes = lineLayout.inlineBoxes(embeds: embeds, heights: boxHeights)
+        guard boxes != cachedBoxes else { return }
+        cachedBoxes = boxes
+        boxOverlay.set(boxes)
+    }
+
+    /// A sketch's elements changed: its box may need a new height.
+    func sketchChanged(_ sketch: String) {
+        guard boxHeights[sketch] != nil else { return }
+        boxHeights[sketch] = nil
+        restyle()
+    }
+
+    /// Note the embeds among `runs` and make sure each has a height.
+    private func collectEmbeds(_ runs: [StyleRun]) {
+        embeds = MarkdownStyler.embeds(in: runs)
+        for embed in embeds where boxHeights[embed.sketch] == nil {
+            let height = (try? model.session.sketchBoxHeight(sketch: embed.sketch)).map { CGFloat($0) }
+            boxHeights[embed.sketch] = height ?? InlineGeometry.minHeight
         }
     }
 
@@ -220,6 +260,7 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
         paperFlavor = flavor
         backgroundColor = .paper
         applyBackground()
+        boxOverlay.recolor()
         restyle()
     }
 
@@ -257,7 +298,9 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
         }
         let text = textView.text ?? ""
         if index.utf16Count != (text as NSString).length { index = ScalarIndex(text) }
-        MarkdownStyler.restyle(textView.textStorage, runs: styleRuns(text: text), index: index)
+        let runs = styleRuns(text: text)
+        collectEmbeds(runs)
+        MarkdownStyler.restyle(textView.textStorage, runs: runs, index: index, boxHeights: boxHeights)
         textView.typingAttributes = MarkdownStyler.baseAttributes
         scheduleLayoutNotify()
     }
@@ -272,7 +315,9 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
             index = ScalarIndex(rendered.text)
             sourceOf = rendered.sourceOf.map { Int($0) }
         }
-        MarkdownStyler.restyle(textView.textStorage, runs: rendered.runs, index: index)
+        collectEmbeds(rendered.runs)
+        MarkdownStyler.restyle(
+            textView.textStorage, runs: rendered.runs, index: index, boxHeights: boxHeights)
         scheduleLayoutNotify()
     }
 
@@ -357,6 +402,15 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
         }
     }
 
+    /// Where the caret is, in source scalars, for inserting a sketch at
+    /// the caret's line.
+    nonisolated func textViewDidChangeSelection(_ textView: UITextView) {
+        MainActor.assumeIsolated {
+            guard !preview else { return }
+            model.caret = index.scalar(ofUTF16: textView.selectedRange.location)
+        }
+    }
+
     /// The keyboard went away: keep the tool picker by taking the
     /// responder chain back.
     nonisolated func textViewDidEndEditing(_ textView: UITextView) {
@@ -410,6 +464,78 @@ final class CanvasLineLayout: LineLayoutProvider {
     func origin(forScalar scalar: Int) -> CGPoint {
         canvas?.lineLayout.origin(forScalar: scalar) ?? .zero
     }
+
+    func inlineBoxes() -> [InlineBox] {
+        canvas?.cachedBoxes ?? []
+    }
+}
+
+/// Frames the inline sketch boxes: a hairline rounded border and a
+/// "sketch" caption per box, in the text view's content space, above
+/// the ink and the text. Takes no touches.
+@MainActor
+final class InlineBoxOverlay: UIView {
+    private static let cornerRadius: CGFloat = 8
+    private static let captionSize: CGFloat = 10
+    private var frames: [CAShapeLayer] = []
+    private var captions: [CATextLayer] = []
+
+    init() {
+        super.init(frame: .zero)
+        isUserInteractionEnabled = false
+        isOpaque = false
+        backgroundColor = .clear
+        clipsToBounds = false
+        accessibilityIdentifier = "inlineBoxes"
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    func set(_ boxes: [InlineBox]) {
+        while frames.count > boxes.count {
+            frames.removeLast().removeFromSuperlayer()
+            captions.removeLast().removeFromSuperlayer()
+        }
+        while frames.count < boxes.count {
+            let frame = CAShapeLayer()
+            frame.fillColor = nil
+            frame.lineWidth = 1
+            layer.addSublayer(frame)
+            frames.append(frame)
+            let caption = CATextLayer()
+            caption.string = "sketch"
+            caption.font = UIFont.systemFont(ofSize: Self.captionSize)
+            caption.fontSize = Self.captionSize
+            caption.isWrapped = false
+            caption.truncationMode = .none
+            layer.addSublayer(caption)
+            captions.append(caption)
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (i, box) in boxes.enumerated() {
+            frames[i].path = UIBezierPath(
+                roundedRect: box.rect.insetBy(dx: 0.5, dy: 0.5), cornerRadius: Self.cornerRadius
+            ).cgPath
+            captions[i].frame = CGRect(
+                x: box.rect.minX + InlineGeometry.padding, y: box.rect.minY + 2,
+                width: 80, height: Self.captionSize + 4)
+        }
+        CATransaction.commit()
+        recolor()
+        var extent = CGRect.zero
+        for box in boxes { extent = extent.union(box.rect) }
+        frame = CGRect(origin: .zero, size: CGSize(width: extent.maxX, height: extent.maxY))
+    }
+
+    func recolor() {
+        let scale = traitCollection.displayScale
+        for frame in frames { frame.strokeColor = UIColor.themeBorder.cgColor }
+        for caption in captions {
+            caption.foregroundColor = UIColor.themeMuted.cgColor
+            caption.contentsScale = scale
+        }
+    }
 }
 
 struct NoteCanvas: UIViewRepresentable {
@@ -445,6 +571,7 @@ struct NoteCanvas: UIViewRepresentable {
         }
         canvas.onHover = { ink.hover($0) }
         canvas.onLayoutChanged = { ink.layoutChanged() }
+        ink.onSketchChanged = { [weak canvas] sketch in canvas?.sketchChanged(sketch) }
         ink.hapticView = canvas
 
         // PencilKit's picker works with any first responder; it hands us

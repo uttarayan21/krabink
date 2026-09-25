@@ -227,6 +227,10 @@ final class NoteModel: Identifiable {
     /// The page ink layer: one model per note, kept with the note so ink
     /// state (tool, counters) survives switching notes.
     let ink: PageInkModel
+    /// Where the editor's caret is, in unicode scalars of `text`.
+    var caret = 0
+    /// Mirrors the core's `SKETCH_URI_PREFIX` (the embed rule lives there).
+    static let sketchUriPrefix = "krabink://sketch/"
     var onTitleChanged: (() -> Void)?
     private var titleTask: Task<Void, Never>?
 
@@ -242,6 +246,26 @@ final class NoteModel: Identifiable {
     /// Forward one local edit (unicode-scalar offsets) to the CRDT.
     func localEdit(at: UInt64, del: UInt64, insert: String) {
         try? session.applyTextEdit(at: at, del: del, insert: insert)
+        scheduleTitleSync()
+    }
+
+    /// Insert a new inline sketch after the caret's line: the container
+    /// is created first (its own commit, so a peer never sees an embed
+    /// without one), then the embed line goes into the text and flows
+    /// into the editor like a remote edit.
+    func insertSketch() {
+        guard let sketch = try? session.createSketch() else { return }
+        let current = (try? session.text()) ?? text
+        let scalars = Array(current.unicodeScalars)
+        let at = max(0, min(caret, scalars.count))
+        var lineEnd = at
+        while lineEnd < scalars.count && scalars[lineEnd] != "\n" { lineEnd += 1 }
+        let lineEmpty = lineEnd == 0 || scalars[lineEnd - 1] == "\n"
+        var insert = lineEmpty ? "" : "\n"
+        insert += "![sketch](\(Self.sketchUriPrefix)\(sketch))"
+        if lineEnd == scalars.count { insert += "\n" }
+        try? session.applyTextEdit(at: UInt64(lineEnd), del: 0, insert: insert)
+        text = (try? session.text()) ?? current
         scheduleTitleSync()
     }
 
@@ -359,15 +383,17 @@ private final class NoteEvents: NoteListener {
     }
 
     func strokesChanged(sketch: String) {
-        // Inline sketches: wired to the ink model in the inline-sketch step.
-        _ = sketch
+        Task { @MainActor [weak model] in model?.ink.remoteSketchChanged(sketch: sketch) }
     }
 
     func wetBegin(
         sketch: String, stroke: String, tool: Tool, color: UInt32, baseWidth: Float, spec: Data?
     ) {
-        // Inline sketches: wired to the ink model in the inline-sketch step.
-        _ = (sketch, stroke, tool, color, baseWidth, spec)
+        Task { @MainActor [weak model] in
+            model?.ink.remoteWetBegin(
+                sketch: sketch, stroke: stroke, tool: tool, color: color, baseWidth: baseWidth,
+                spec: spec)
+        }
     }
 
     func wetBeginAnchored(

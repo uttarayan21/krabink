@@ -153,4 +153,11 @@ extension Element {
         if case .shape = self { return true }
         return false
     }
+
+    var createdMs: UInt64 {
+        switch self {
+        case .stroke(let s): s.createdMs
+        case .shape(let s): s.createdMs
+        }
+    }
 }

@@ -28,6 +28,16 @@
 // probe expressed in that element's own space.
 // Remote elements: wet batches render through `pointsMesh`; pageChanged
 // diffs the CRDT into meshes — deferred while a local pen is down.
+//
+// Two layers share the renderer. The overlay (the `page` list) is the
+// line-anchored ink above. An inline sketch is a legacy `sketches`
+// container shown as a box in the text flow: a pen-down inside a box
+// draws into that container in the box's own space (origin = the box
+// corner inset by the padding), commits with the sketch-keyed calls and
+// streams its wet ink under `WetInk::Begin`. Inline elements sit below
+// the overlay in z. A box appears and disappears with its embed line;
+// the layout reports the boxes and `syncInline` loads, moves or drops
+// the sketch's elements to match.
 
 import Observation
 import PencilKit
@@ -57,18 +67,28 @@ private let hoverAlpha: Float = 0.35
 private let pointerInterval: CFAbsoluteTime = 1.0 / 30
 private let pointerMinMove: CGFloat = 1.5
 
+/// Which layer an element lives in and what it is placed by.
+enum Placement: Equatable {
+    /// Overlay: anchored to a source line.
+    case line(anchor: Data)
+    /// Inline: inside the box of this sketch.
+    case sketch(String)
+}
+
 /// A local stroke: in progress, or past pen-up and settling. Its points
-/// are in anchor space (page point − `origin`).
+/// are in its layer's space (page point − `origin`).
 @MainActor
 private struct LiveStroke {
     let id: String
     let modeler: BrushModeler
     let selection: BrushSelection
-    /// The line the stroke belongs to.
+    let placement: Placement
+    /// The line under the pen at pen-down (the stroke's line for the
+    /// overlay; the embed line for an inline stroke, for the pointer).
     let anchor: Data
-    /// Scalar index of the anchored line's first char at pen-down.
+    /// Scalar index of that line's first char at pen-down.
     let lineStart: Int
-    /// Where the line is on the page right now.
+    /// Where the stroke's space is on the page right now.
     var origin: CGPoint
     var brush: BrushRef { selection.brush }
     var color: UInt32 { selection.color }
@@ -122,6 +142,13 @@ final class PageInkModel {
     /// Page y of the oldest element's line (status label: UI tests watch
     /// it move when text above the ink changes).
     var originY: CGFloat = 0
+    /// Inline elements on screen, over every box.
+    var inlineCount = 0
+    /// Page y of the first inline box (status label).
+    var boxY: CGFloat = 0
+    /// A sketch's elements changed here or remotely: its box height may
+    /// have moved. The canvas re-measures.
+    @ObservationIgnored var onSketchChanged: ((String) -> Void)?
     /// What the picker selected: ink, or the eraser.
     var picked: PickedTool
 
@@ -154,23 +181,33 @@ final class PageInkModel {
     /// The status line the UI tests read.
     var status: String {
         String(
-            format: "strokes=%d shapes=%d wetSent=%d wetRecv=%d est=%d custom=%d originY=%.0f",
-            strokeCount, shapeCount, wetSent, wetRecv, estUpdated, customCount, originY)
+            format: "strokes=%d shapes=%d wetSent=%d wetRecv=%d est=%d custom=%d originY=%.0f inline=%d boxY=%.0f",
+            strokeCount, shapeCount, wetSent, wetRecv, estUpdated, customCount, originY,
+            inlineCount, boxY)
     }
 
     private weak var renderer: InkRenderer?
     private weak var layout: (any LineLayoutProvider)?
-    /// Committed element ids on screen, in CRDT order.
+    /// Committed overlay element ids on screen, in CRDT order.
     private var ids: [String] = []
-    /// Each committed element's anchor and where its line is.
-    private var placed: [String: (anchor: Data, origin: CGPoint)] = [:]
+    /// Every committed element on screen (both layers): where it lives
+    /// and where that is on the page.
+    private var placed: [String: (placement: Placement, origin: CGPoint)] = [:]
+    /// Every committed element on screen, for re-showing and `createdMs`.
+    private var elements: [String: Element] = [:]
+    /// Inline element ids per loaded sketch, in CRDT order.
+    private var inlineIds: [String: [String]] = [:]
+    /// Loaded sketches in box (text) order.
+    private var inlineOrder: [String] = []
     /// The subset of `ids` that are shapes.
     private var shapeIds: Set<String> = []
     /// The subset of `ids` that are strokes with a custom brush.
     private var customIds: Set<String> = []
-    /// Remote wet strokes' anchors, for re-placing.
-    private var wetAnchors: [String: Data] = [:]
+    /// Remote wet strokes' placements, for re-placing.
+    private var wetPlacements: [String: Placement] = [:]
     private var penDown = false
+    /// Sketches that changed remotely while the pen was down.
+    private var pendingSketches: Set<String> = []
     /// The remote pointer as last sent: when, where (page space) and
     /// whether the pen was down; `pointerSentPos == nil` once withdrawn.
     private var pointerSentAt: CFAbsoluteTime = 0
@@ -201,9 +238,12 @@ final class PageInkModel {
         self.layout = layout
         ids = []
         placed = [:]
+        elements = [:]
+        inlineIds = [:]
+        inlineOrder = []
         shapeIds = []
         customIds = []
-        wetAnchors = [:]
+        wetPlacements = [:]
         renderer.removeAll()
         refreshFromCrdt()
         if UserDefaults.standard.bool(forKey: "figureEight"), !selfTestDone {
@@ -240,6 +280,29 @@ final class PageInkModel {
         strokeCount = ids.count - shapeCount
         customCount = customIds.count
         originY = ids.first.flatMap { placed[$0]?.origin.y } ?? 0
+        inlineCount = inlineIds.values.reduce(0) { $0 + $1.count }
+        boxY = layout?.inlineBoxes().first?.rect.minY ?? 0
+    }
+
+    /// Re-place every element in z: inline sketches (box order, then CRDT
+    /// order) below the overlay (CRDT order).
+    private func rezAll() {
+        guard let renderer else { return }
+        var z = 0
+        for sketch in inlineOrder {
+            for id in inlineIds[sketch] ?? [] {
+                if let element = elements[id], let origin = placed[id]?.origin {
+                    renderer.show(element, z: z, origin: origin)
+                }
+                z += 1
+            }
+        }
+        for id in ids {
+            if let element = elements[id], let origin = placed[id]?.origin {
+                renderer.show(element, z: z, origin: origin)
+            }
+            z += 1
+        }
     }
 
     // MARK: pen input (samples in page space)
@@ -268,19 +331,39 @@ final class PageInkModel {
         }
     }
 
+    /// A pen-down inside a sketch's box draws into that sketch; anywhere
+    /// else onto the line under the pen.
     private func beginStroke(_ selection: BrushSelection, at sample: RawSample) {
         guard let layout else { return }
-        let line = layout.line(at: CGPoint(x: CGFloat(sample.x), y: CGFloat(sample.y)))
-        guard
-            let anchor = try? session.anchorAt(charIndex: UInt64(line.scalar)),
-            let id = try? session.beginPageStroke(
-                anchor: anchor, tool: selection.brush.tool, color: selection.color,
-                baseWidth: selection.brush.baseWidth, spec: selection.brush.custom?.spec)
-        else { return }
+        let at = CGPoint(x: CGFloat(sample.x), y: CGFloat(sample.y))
+        let line = layout.line(at: at)
+        guard let anchor = try? session.anchorAt(charIndex: UInt64(line.scalar)) else { return }
+        let placement: Placement
+        let origin: CGPoint
+        let id: String
+        if let box = layout.inlineBox(at: at) {
+            guard
+                let began = try? session.beginStroke(
+                    sketch: box.sketch, tool: selection.brush.tool, color: selection.color,
+                    baseWidth: selection.brush.baseWidth, spec: selection.brush.custom?.spec)
+            else { return }
+            id = began
+            placement = .sketch(box.sketch)
+            origin = box.origin
+        } else {
+            guard
+                let began = try? session.beginPageStroke(
+                    anchor: anchor, tool: selection.brush.tool, color: selection.color,
+                    baseWidth: selection.brush.baseWidth, spec: selection.brush.custom?.spec)
+            else { return }
+            id = began
+            placement = .line(anchor: anchor)
+            origin = line.origin
+        }
         var stroke = LiveStroke(
             id: id, modeler: BrushModeler.forBrush(brush: selection.brush), selection: selection,
-            anchor: anchor, lineStart: line.scalar, origin: line.origin)
-        let local = sample.translated(by: line.origin)
+            placement: placement, anchor: anchor, lineStart: line.scalar, origin: origin)
+        let local = sample.translated(by: origin)
         stroke.wetBuffer = stroke.modeler.push(samples: [local])
         if sample.expectsUpdate { stroke.estPushed += 1 }
         if StrokeRecorder.enabled { stroke.recording = [local] }
@@ -495,9 +578,14 @@ final class PageInkModel {
             let shape = ShapeElement(
                 id: stroke.id, shape: snapped, tool: stroke.brush.tool, color: stroke.color,
                 width: stroke.brush.baseWidth, start: nil, end: nil, createdMs: createdMs)
-            try? session.finishPageShape(shape: shape, anchor: stroke.anchor)
+            switch stroke.placement {
+            case .line(let anchor):
+                try? session.finishPageShape(shape: shape, anchor: anchor)
+                shapeIds.insert(stroke.id)
+            case .sketch(let sketch):
+                try? session.finishShape(sketch: sketch, shape: shape)
+            }
             element = .shape(shape)
-            shapeIds.insert(stroke.id)
         } else {
             let points = stroke.modeler.finish()
             let tail = Array(points.dropFirst(min(stroke.sentPoints, points.count)))
@@ -505,7 +593,12 @@ final class PageInkModel {
                 id: stroke.id, tool: stroke.brush.tool, color: stroke.color,
                 baseWidth: stroke.brush.baseWidth, kind: .polylineSample, points: points,
                 createdMs: createdMs, brush: stroke.brush.custom)
-            try? session.finishPageStroke(stroke: committed, anchor: stroke.anchor, tail: tail)
+            switch stroke.placement {
+            case .line(let anchor):
+                try? session.finishPageStroke(stroke: committed, anchor: anchor, tail: tail)
+            case .sketch(let sketch):
+                try? session.finishStroke(sketch: sketch, stroke: committed, tail: tail)
+            }
             element = .stroke(committed)
         }
         estUpdated += stroke.estUpdated
@@ -516,12 +609,28 @@ final class PageInkModel {
                 stroke.estPushed, stroke.estUpdated, stroke.estLate, stroke.maxLateMs, waited,
                 stroke.modeler.pendingEstimates().count, stroke.redraws, stroke.maxRedrawMs)
         }
-        // `show` also drops the settling copy of the same id.
-        renderer?.show(element, z: ids.count, origin: stroke.origin)
-        ids.append(stroke.id)
-        placed[stroke.id] = (stroke.anchor, stroke.origin)
-        if stroke.brush.custom != nil, stroke.shape == nil { customIds.insert(stroke.id) }
-        updateCounts()
+        elements[stroke.id] = element
+        placed[stroke.id] = (stroke.placement, stroke.origin)
+        switch stroke.placement {
+        case .line:
+            // `show` also drops the settling copy of the same id.
+            let base = inlineIds.values.reduce(0) { $0 + $1.count }
+            renderer?.show(element, z: base + ids.count, origin: stroke.origin)
+            ids.append(stroke.id)
+            if stroke.brush.custom != nil, stroke.shape == nil { customIds.insert(stroke.id) }
+            updateCounts()
+        case .sketch(let sketch):
+            if inlineIds[sketch] == nil {
+                inlineIds[sketch] = []
+                inlineOrder.append(sketch)
+            }
+            inlineIds[sketch]!.append(stroke.id)
+            // Below every overlay element: re-place the lot (`show` also
+            // drops the settling copy of the same id).
+            rezAll()
+            updateCounts()
+            onSketchChanged?(sketch)
+        }
     }
 
     private func showLive(predicted: [RawSample]) {
@@ -594,12 +703,13 @@ final class PageInkModel {
             if hypot(at.x - last.x, at.y - last.y) < pointerMinMove / zoom { return }
         }
         guard let layout else { return }
-        // While drawing, the pointer rides the stroke's line.
+        // While drawing, the pointer rides the line under the stroke (the
+        // embed line for an inline stroke).
         let scalar: Int
         let origin: CGPoint
         if let live {
             scalar = live.lineStart
-            origin = live.origin
+            origin = layout.origin(forScalar: scalar)
         } else {
             (scalar, origin) = layout.line(at: at)
         }
@@ -651,14 +761,18 @@ final class PageInkModel {
             pendingRefresh = false
             refreshFromCrdt()
         }
+        let sketches = pendingSketches
+        pendingSketches = []
+        for sketch in sketches { reloadSketch(sketch) }
     }
 
     // MARK: eraser
 
     /// Hit-test every element whose ink could be under the pen, each in
-    /// its own space, and drop the ones the core says it touched.
+    /// its own space, and drop the ones the core says it touched: the
+    /// overlay by probes, then every box the pen reaches into.
     private func erase(at sample: RawSample, radius: Float) {
-        guard let renderer else { return }
+        guard let renderer, let layout else { return }
         let at = CGPoint(x: CGFloat(sample.x), y: CGFloat(sample.y))
         let reach = CGFloat(radius)
         let probes: [PageProbe] = ids.compactMap { id in
@@ -668,19 +782,33 @@ final class PageInkModel {
             let local = sample.translated(by: origin)
             return PageProbe(element: id, x: local.x, y: local.y)
         }
-        guard !probes.isEmpty,
-              let removed = try? session.erasePageAt(probes: probes, radius: radius),
-              !removed.isEmpty
-        else { return }
-        forget(Set(removed))
+        if !probes.isEmpty,
+           let removed = try? session.erasePageAt(probes: probes, radius: radius),
+           !removed.isEmpty
+        {
+            forget(Set(removed))
+        }
+        for box in layout.inlineBoxes()
+        where box.rect.insetBy(dx: -reach, dy: -reach).contains(at) && inlineIds[box.sketch] != nil {
+            let local = sample.translated(by: box.origin)
+            guard
+                let removed = try? session.eraseAt(
+                    sketch: box.sketch, x: local.x, y: local.y, radius: radius),
+                !removed.isEmpty
+            else { continue }
+            forget(Set(removed))
+            onSketchChanged?(box.sketch)
+        }
     }
 
     private func forget(_ gone: Set<String>) {
         for id in gone {
             renderer?.remove(id)
             placed[id] = nil
+            elements[id] = nil
         }
         ids.removeAll { gone.contains($0) }
+        for sketch in inlineOrder { inlineIds[sketch]?.removeAll { gone.contains($0) } }
         shapeIds.subtract(gone)
         customIds.subtract(gone)
         updateCounts()
@@ -698,12 +826,32 @@ final class PageInkModel {
     func remoteWetBegin(
         stroke: String, anchor: Data, tool: Tool, color: UInt32, baseWidth: Float, spec: Data?
     ) {
+        remoteWetBegin(
+            stroke: stroke, placement: .line(anchor: anchor), tool: tool, color: color,
+            baseWidth: baseWidth, spec: spec)
+    }
+
+    /// An inline wet stroke; dropped while its box is not on the page
+    /// (no embed line yet): the commit brings it back.
+    func remoteWetBegin(
+        sketch: String, stroke: String, tool: Tool, color: UInt32, baseWidth: Float, spec: Data?
+    ) {
+        remoteWetBegin(
+            stroke: stroke, placement: .sketch(sketch), tool: tool, color: color,
+            baseWidth: baseWidth, spec: spec)
+    }
+
+    private func remoteWetBegin(
+        stroke: String, placement: Placement, tool: Tool, color: UInt32, baseWidth: Float,
+        spec: Data?
+    ) {
+        guard let origin = origin(of: placement) else { return }
         // The id does not matter for meshing; the committed stroke brings its own.
         let custom = spec.map { CustomBrush(id: "wet", spec: $0) }
-        wetAnchors[stroke] = anchor
+        wetPlacements[stroke] = placement
         renderer?.wetBegin(
             stroke, brush: BrushRef(tool: tool, baseWidth: baseWidth, custom: custom), color: color,
-            origin: origin(of: anchor))
+            origin: origin)
     }
 
     func remoteWetPoints(stroke: String, points: [StrokePoint]) {
@@ -713,7 +861,7 @@ final class PageInkModel {
 
     /// Sender says no stroke is coming: drop the provisional ink right away.
     func remoteWetCancel(stroke: String) {
-        wetAnchors[stroke] = nil
+        wetPlacements[stroke] = nil
         renderer?.wetRemove(stroke)
     }
 
@@ -725,7 +873,7 @@ final class PageInkModel {
         renderer?.wetEnd(stroke, tail: [])
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: wetLinger)
-            self?.wetAnchors[stroke] = nil
+            self?.wetPlacements[stroke] = nil
             self?.renderer?.wetRemove(stroke)
         }
     }
@@ -740,13 +888,28 @@ final class PageInkModel {
         return layout.origin(forScalar: scalar)
     }
 
+    /// Where a placement is on the page now; `nil` for a sketch whose box
+    /// is not laid out.
+    private func origin(of placement: Placement) -> CGPoint? {
+        switch placement {
+        case .line(let anchor): return origin(of: anchor)
+        case .sketch(let sketch):
+            return layout?.inlineBoxes().first(where: { $0.sketch == sketch })?.origin
+        }
+    }
+
+    private func anchor(of placement: Placement) -> Data? {
+        if case .line(let anchor) = placement { return anchor }
+        return nil
+    }
+
     /// The text was laid out again: re-place every element, wet stroke
-    /// and the stroke in progress on its line.
+    /// and the stroke in progress on its line or in its box.
     func layoutChanged() {
         guard let renderer, let layout else { return }
         var moved: [String: CGPoint] = [:]
         if !ids.isEmpty {
-            let anchors = ids.map { placed[$0]?.anchor ?? Data() }
+            let anchors = ids.map { placed[$0].flatMap { anchor(of: $0.placement) } ?? Data() }
             let resolved = (try? session.resolveAnchors(anchors: anchors)) ?? []
             for (i, id) in ids.enumerated() {
                 let scalar = i < resolved.count ? resolved[i].map { Int($0) } ?? Int.max : Int.max
@@ -758,22 +921,104 @@ final class PageInkModel {
             }
             if !moved.isEmpty { renderer.setOrigins(moved) }
         }
-        for (id, anchor) in wetAnchors {
-            renderer.setWetOrigin(id, origin(of: anchor))
+        syncInline()
+        for (id, placement) in wetPlacements {
+            if let origin = origin(of: placement) { renderer.setWetOrigin(id, origin) }
         }
         for id in settling.keys {
-            let origin = origin(of: settling[id]!.anchor)
+            guard let origin = origin(of: settling[id]!.placement) else { continue }
             settling[id]!.origin = origin
             renderer.setSettlingOrigin(id, origin)
         }
-        if live != nil {
-            let origin = origin(of: live!.anchor)
-            if origin != live!.origin {
-                live!.origin = origin
-                renderer.setLocalOrigin(origin)
-            }
+        if live != nil, let origin = origin(of: live!.placement), origin != live!.origin {
+            live!.origin = origin
+            renderer.setLocalOrigin(origin)
         }
         updateCounts()
+    }
+
+    // MARK: inline sketches
+
+    /// Match the loaded sketches to the boxes on the page: load the
+    /// sketches whose box appeared, move the ones still there, drop the
+    /// ones whose box is gone (their data stays in the note).
+    private func syncInline() {
+        guard let renderer, let layout else { return }
+        let boxes = layout.inlineBoxes()
+        let present = boxes.map(\.sketch)
+        var changed = false
+        for sketch in inlineOrder where !present.contains(sketch) {
+            unloadSketch(sketch)
+            changed = true
+        }
+        var moved: [String: CGPoint] = [:]
+        for box in boxes {
+            if inlineIds[box.sketch] == nil {
+                loadSketch(box.sketch, origin: box.origin)
+                changed = true
+                continue
+            }
+            for id in inlineIds[box.sketch] ?? [] where placed[id]?.origin != box.origin {
+                placed[id]?.origin = box.origin
+                moved[id] = box.origin
+            }
+        }
+        if !moved.isEmpty { renderer.setOrigins(moved) }
+        if inlineOrder != present.filter({ inlineIds[$0] != nil }) {
+            inlineOrder = present.filter { inlineIds[$0] != nil }
+            changed = true
+        }
+        if changed { rezAll() }
+    }
+
+    /// Read a sketch's elements from the note and place them at `origin`
+    /// (z is assigned by `rezAll`). An unknown container loads empty.
+    private func loadSketch(_ sketch: String, origin: CGPoint) {
+        let found = (try? session.elements(sketch: sketch)) ?? []
+        inlineIds[sketch] = found.map(\.id)
+        if !inlineOrder.contains(sketch) { inlineOrder.append(sketch) }
+        for element in found {
+            elements[element.id] = element
+            placed[element.id] = (.sketch(sketch), origin)
+            // A committed element replaces its wet ink.
+            if renderer?.hasWet(element.id) == true {
+                wetPlacements[element.id] = nil
+                renderer?.wetRemove(element.id)
+            }
+        }
+    }
+
+    private func unloadSketch(_ sketch: String) {
+        for id in inlineIds[sketch] ?? [] {
+            renderer?.remove(id)
+            placed[id] = nil
+            elements[id] = nil
+        }
+        inlineIds[sketch] = nil
+        inlineOrder.removeAll { $0 == sketch }
+    }
+
+    /// A sketch changed in the CRDT (remote commit or erase): reload it
+    /// if its box is on the page. Deferred while a local pen is down,
+    /// like `remoteChanged`.
+    func remoteSketchChanged(sketch: String) {
+        if penDown {
+            pendingSketches.insert(sketch)
+            return
+        }
+        reloadSketch(sketch)
+    }
+
+    private func reloadSketch(_ sketch: String) {
+        guard let layout else { return }
+        if inlineIds[sketch] != nil { unloadSketch(sketch) }
+        if let box = layout.inlineBoxes().first(where: { $0.sketch == sketch }) {
+            loadSketch(sketch, origin: box.origin)
+        }
+        inlineOrder = layout.inlineBoxes().map(\.sketch).filter { inlineIds[$0] != nil }
+        rezAll()
+        updateCounts()
+        onSketchChanged?(sketch)
     }
 
     // MARK: CRDT → renderer
@@ -786,12 +1031,26 @@ final class PageInkModel {
         }
     }
 
-    /// Erase helper for the toolbar (and UI tests): drops the newest element
+    /// Erase helper for the toolbar (and UI tests): drops the newest
+    /// element of either layer (by creation time; the overlay wins a tie)
     /// through the same CRDT path the eraser uses.
     func eraseLast() {
-        guard let last = ids.last else { return }
-        try? session.removePageElement(element: last)
-        forget([last])
+        let overlay = ids.last
+        let inline = inlineOrder.flatMap { inlineIds[$0] ?? [] }
+            .max { (elements[$0]?.createdMs ?? 0) < (elements[$1]?.createdMs ?? 0) }
+        let overlayMs = overlay.flatMap { elements[$0]?.createdMs } ?? 0
+        let inlineMs = inline.flatMap { elements[$0]?.createdMs } ?? 0
+        if let inline, overlay == nil || inlineMs > overlayMs,
+           case .sketch(let sketch)? = placed[inline]?.placement
+        {
+            try? session.removeElement(sketch: sketch, element: inline)
+            forget([inline])
+            onSketchChanged?(sketch)
+            return
+        }
+        guard let overlay else { return }
+        try? session.removePageElement(element: overlay)
+        forget([overlay])
     }
 
     private func refreshFromCrdt() {
@@ -801,12 +1060,15 @@ final class PageInkModel {
         for id in ids where !keep.contains(id) {
             renderer.remove(id)
             placed[id] = nil
+            elements[id] = nil
         }
-        for (z, entry) in page.enumerated() {
+        let base = inlineIds.values.reduce(0) { $0 + $1.count }
+        for (i, entry) in page.enumerated() {
             let scalar = entry.charIndex.map { Int($0) } ?? Int.max
             let origin = layout.origin(forScalar: scalar)
-            placed[entry.element.id] = (entry.anchor, origin)
-            renderer.show(entry.element, z: z, origin: origin)
+            placed[entry.element.id] = (.line(anchor: entry.anchor), origin)
+            elements[entry.element.id] = entry.element
+            renderer.show(entry.element, z: base + i, origin: origin)
         }
         ids = newIds
         shapeIds = Set(page.map(\.element).filter(\.isShape).map(\.id))
@@ -817,7 +1079,7 @@ final class PageInkModel {
             })
         // A committed element replaces its wet ink.
         for id in newIds where renderer.hasWet(id) {
-            wetAnchors[id] = nil
+            wetPlacements[id] = nil
             renderer.wetRemove(id)
         }
         updateCounts()

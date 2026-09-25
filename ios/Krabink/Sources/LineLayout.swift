@@ -6,11 +6,16 @@
 // of its source line's first line fragment (forward, for placing ink) and
 // a point on the page back to the line under it (inverse, for pen-down).
 //
+// An inline sketch's box is the row of its hidden embed line: `InlineBox`
+// is that rect in content space, the sketch's origin inset by the core's
+// padding. Pen-down tests boxes before lines.
+//
 // TextKit 1 on purpose (`UITextView(usingTextLayoutManager: false)`):
 // its layout is eager and deterministic, so `lineFragmentRect` is exact.
 // TextKit 2 estimates off-screen heights and would make ink jump as the
 // estimates settle.
 
+import KrabinkCore
 import UIKit
 
 /// Unicode-scalar index ↔ UTF-16 offset for one text.
@@ -106,6 +111,24 @@ struct TextSplice: Equatable {
     }
 }
 
+/// The box geometry every platform agrees on (core contract).
+enum InlineGeometry {
+    /// Inset of a sketch's origin inside its box.
+    static let padding: CGFloat = CGFloat(inlinePadding())
+    /// Box height of an empty or unknown sketch.
+    static let minHeight: CGFloat = CGFloat(inlineMinHeight())
+}
+
+/// Where an inline sketch's box is on the page (content space).
+struct InlineBox: Equatable {
+    let sketch: String
+    let rect: CGRect
+    /// The sketch's (0, 0): the box corner inset by the padding.
+    var origin: CGPoint {
+        CGPoint(x: rect.minX + InlineGeometry.padding, y: rect.minY + InlineGeometry.padding)
+    }
+}
+
 /// What the ink model needs from the editor's layout.
 @MainActor
 protocol LineLayoutProvider: AnyObject {
@@ -115,6 +138,15 @@ protocol LineLayoutProvider: AnyObject {
     /// Ink origin of the line containing scalar `scalar` (past the end:
     /// the last line). Content space.
     func origin(forScalar scalar: Int) -> CGPoint
+    /// The inline sketch boxes as last laid out, in text order.
+    func inlineBoxes() -> [InlineBox]
+}
+
+extension LineLayoutProvider {
+    /// The box under `point`, if any.
+    func inlineBox(at point: CGPoint) -> InlineBox? {
+        inlineBoxes().first { $0.rect.contains(point) }
+    }
 }
 
 /// Line geometry of a TextKit 1 text view. In the reading view the text
@@ -187,6 +219,23 @@ struct LineLayout {
 
     func origin(forScalar scalar: Int) -> CGPoint {
         origin(lineStart: lineStart(utf16: index.utf16(ofScalar: display(ofSource: scalar))))
+    }
+
+    /// The boxes of `embeds` (sketch id, display scalar of the embed's
+    /// first char): each spans the text's width at the top of its line,
+    /// `heights[sketch]` tall (the minimum when unknown).
+    func inlineBoxes(embeds: [(sketch: String, scalar: Int)], heights: [String: CGFloat]) -> [InlineBox] {
+        guard !embeds.isEmpty else { return [] }
+        let inset = textView.textContainerInset
+        let width = max(0, container.size.width - 2 * container.lineFragmentPadding)
+        return embeds.map { embed in
+            let start = lineStart(utf16: index.utf16(ofScalar: embed.scalar))
+            let top = inset.top + fragmentTop(lineStart: start)
+            let height = heights[embed.sketch] ?? InlineGeometry.minHeight
+            return InlineBox(
+                sketch: embed.sketch,
+                rect: CGRect(x: anchorLeft, y: top, width: width, height: height))
+        }
     }
 
     func line(at point: CGPoint) -> (scalar: Int, origin: CGPoint) {
