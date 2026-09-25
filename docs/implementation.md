@@ -259,10 +259,15 @@ connections and the app's in-process `LocalLink` are served by the same
 loop each (`outbound.rs`: backoff, `ClientSession`, route reporting).
 Wire: ALPN `krabink/sync/1`, two lanes per connection (`framing.rs`).
 `Node` API: `start`, `local_link`, `set_peers`, `set_relay`,
-`add_addr_hint`, `add_token`, `peers` / `watch_peers`, `relay_health`,
-`suspend` / `resume` / `network_changed`, `shutdown`. `mdns.rs` (feature
-`mdns`, desktop only) advertises `_krabink._udp` and turns hits into
-address hints. `tests/mesh.rs` runs three nodes with the relay disabled.
+`add_addr_hint` (a new hint sends `OutCmd::Hint`, which cuts the dial
+loop's backoff short), `add_token`, `peers` / `watch_peers`,
+`relay_health`, `suspend` / `resume` / `network_changed`, `shutdown`.
+`start` binds the endpoint before opening the store, so a taken
+`bind_port` fails with nothing else held and the caller can retry.
+`mdns.rs` (feature `mdns`, desktop only) advertises `_krabink._udp` with
+TXT `id`, `port` and `addrs` (every candidate interface) and turns hits
+into address hints. `tests/mesh.rs` runs three nodes with the relay
+disabled.
 
 `krabink-server` is one binary: `relay.rs` spawns an `iroh_relay` server
 whose `TokenAccess` admits only workspace tokens; `replica.rs` starts a
@@ -277,8 +282,10 @@ tokens, replica bridging offline edits.
 
 Bevy app with egui UI. Modules:
 
-- `config.rs`: data dir (store, `node.redb`, `node_key`, device id,
-  per-install `workspace_token`) and `~/.config/krabink/config.toml`
+- `config.rs`: data dir (store, `node.redb`, `node_key`, `node_port`
+  (last bound UDP port, rebound on start so pairings and hints survive a
+  restart), device id, per-install `workspace_token`) and
+  `~/.config/krabink/config.toml`
   (`relay`, `token`, `replica`, `[[peers]]`), overridable by `cli.rs` flags
   (`--data-dir`, `--relay`, `--token`, `--follow-latest`). Subcommands:
   `completions`, `pair <uri>` (writes the pairing to config.toml),
@@ -467,8 +474,9 @@ Bonjour usage strings, file sharing for recordings).
   source scalar is reported to the model on every selection change.
 - `SettingsScreen.swift`, `PairScreen.swift`, `ScanScreen.swift`,
   `PeerDiscovery.swift`: peers and routes, device registry, pairing QR out
-  and in (VisionKit), Bonjour lookup (`_krabink._udp`, UDP resolve) of the
-  paired desktop for the relay-less LAN.
+  and in (VisionKit), Bonjour lookup (`_krabink._udp`) of the paired
+  desktop for the relay-less LAN: every `ip:port` from the TXT record
+  (`addrs` + `port`) plus the UDP-resolved one become address hints.
 - `PenInput.swift`: `PenGestureRecognizer` on the text view captures
   Pencil touches (coalesced and predicted) and
   `touchesEstimatedPropertiesUpdated`; every other recogniser on the text

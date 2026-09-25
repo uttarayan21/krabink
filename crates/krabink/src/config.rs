@@ -45,6 +45,9 @@ pub struct RuntimeConfig {
     /// Separate redb for the node's mirror of every doc.
     pub node_store_path: PathBuf,
     pub node_key_path: PathBuf,
+    /// Last UDP port the node was bound to; rebound on the next start so
+    /// pairings and mDNS hints survive a restart.
+    pub node_port_path: PathBuf,
     pub device: DeviceId,
     /// Per-install token this node always accepts; what our QR carries
     /// until we adopt a workspace.
@@ -114,6 +117,7 @@ impl RuntimeConfig {
             store_path: data_dir.join("krabink.redb"),
             node_store_path: data_dir.join("node.redb"),
             node_key_path: data_dir.join("node_key"),
+            node_port_path: data_dir.join("node_port"),
             device: load_device_id(&data_dir.join("device_id"))?,
             workspace_token: load_workspace_token(&data_dir)?,
             relay,
@@ -262,6 +266,24 @@ fn read_config(config_dir: &Path) -> Result<FileConfig> {
 /// Stable per-install random secret, created on first run (migrating the
 /// pre-P2P `relay_token` file). A ULID carries 80 random bits, plenty for
 /// a bearer token.
+/// The port saved by [`save_node_port`], if any and well-formed.
+pub fn load_node_port(path: &Path) -> Option<u16> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|p| *p != 0)
+}
+
+/// Remember the bound port for the next start. Best effort: a failure
+/// only costs a fresh port next time.
+pub fn save_node_port(path: &Path, port: u16) {
+    if let Err(err) = std::fs::write(path, format!("{port}\n")) {
+        tracing::warn!(%err, path = %path.display(), "saving node port failed");
+    }
+}
+
 fn load_workspace_token(data_dir: &Path) -> Result<String> {
     let path = data_dir.join("workspace_token");
     let legacy = data_dir.join("relay_token");
@@ -295,4 +317,22 @@ fn load_device_id(path: &Path) -> Result<DeviceId> {
         .change_context(Error)
         .attach_with(|| format!("writing {}", path.display()))?;
     Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_port_roundtrips_and_rejects_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node_port");
+        assert_eq!(load_node_port(&path), None);
+        save_node_port(&path, 38651);
+        assert_eq!(load_node_port(&path), Some(38651));
+        std::fs::write(&path, "nope\n").unwrap();
+        assert_eq!(load_node_port(&path), None);
+        std::fs::write(&path, "0\n").unwrap();
+        assert_eq!(load_node_port(&path), None);
+    }
 }

@@ -88,11 +88,16 @@ Rules the diagram encodes:
   too (`RuntimeConfig::pair_token` decides which one its QR carries).
 - **Relay-less LAN still works.** Without a reachable relay iroh cannot
   learn a peer's addresses, so both platforms fall back to mDNS
-  (`_krabink._udp`, TXT `id=<EndpointId>`): the desktop advertises and
-  browses with `mdns-sd` (`krabink_local::mdns`), the iPad browses with
-  `NWBrowser` and resolves with a UDP `NWConnection` (`PeerDiscovery.swift`).
-  A hit becomes `Node::add_addr_hint`, used on the next dial. With a relay
-  up, iroh finds the LAN path by itself and mDNS is redundant.
+  (`_krabink._udp`, TXT `id=<EndpointId>`, `port=<udp>`, `addrs=<ip,…>`
+  for every advertised interface, Tailscale included): the desktop
+  advertises and browses with `mdns-sd` (`krabink_local::mdns`), the iPad
+  browses with `NWBrowser`, hints every TXT address and also the one a
+  UDP `NWConnection` resolves (`PeerDiscovery.swift`). A hit becomes
+  `Node::add_addr_hint`; a new hint wakes the peer's dial loop out of its
+  backoff. The desktop rebinds the UDP port of its previous run
+  (`node_port` in the data dir, ephemeral fallback when taken) so QR
+  hints and stored pairings survive a restart. With a relay up, iroh
+  finds the LAN path by itself and mDNS is redundant.
 
 ## 2. Wire
 
@@ -332,7 +337,8 @@ behind different NATs stay on the relay path; fine on one LAN.
 | Relay unreachable, same LAN | Existing direct connections keep running. New dials need an address: the QR's `addr=` hints or an mDNS hit. Off-LAN with no relay: nothing connects. |
 | Relay unreachable, different LANs | Islands until the relay is back; each island still syncs internally. |
 | Replica down | Devices that are online at the same time still converge directly. Offline edits wait for the replica to return. |
-| Desktop restarted (new UDP port) | Stored `addr=` hints are stale; through the relay the new address is learned automatically, on a relay-less LAN mDNS re-announces it. Its key and `EndpointId` are unchanged. |
+| Desktop restarted | Same key, `EndpointId` and (unless taken) UDP port, so stored `addr=` hints stay valid. If the port did change: through the relay the new address is learned automatically, on a relay-less LAN mDNS re-announces it with every address and the iPad redials at once. |
+| Desktop firewall admits only an overlay (e.g. Mullvad lockdown + Tailscale) | The QR's and mDNS's LAN addresses are dead; the overlay address (also in both) is the only path. Off-LAN, only the pinned port keeps the pairing alive across desktop restarts. |
 | Wrong token | The relay refuses the client (`RelayHealth.error`) and any node rejects the `Hello`; the peer goes `Fatal` and stays there until `set_peers` / `resume`. Shown as "error: …" in Settings. |
 | Local Network permission denied on iOS | No mDNS; the relay route is the only way to find the desktop. |
 | Duplicate connection (both sides dialled) | Node skips the dial while an inbound connection from that peer is up; if both raced, the extra copy of each update is a no-op import. |

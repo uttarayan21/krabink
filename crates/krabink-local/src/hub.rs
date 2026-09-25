@@ -26,6 +26,9 @@ pub(crate) enum OutCmd {
     Subscribe(DocKey),
     /// Tell the peer we are unpairing, then end the dial loop for good.
     Unpair,
+    /// A new direct address for this peer arrived: dial now, not after
+    /// the backoff.
+    Hint,
     Close,
 }
 
@@ -351,6 +354,18 @@ impl Hub {
             .entry(id)
             .or_default()
             .insert(addr)
+    }
+
+    /// Wake every dial loop targeting `remote` (see [`OutCmd::Hint`]).
+    pub fn wake_dial(&self, remote: EndpointId) {
+        let peers = self.peers.lock().expect("peer registry poisoned");
+        for peer in peers.peers.values() {
+            if peer.status.id == Some(remote)
+                && let PeerSink::Outbound { cmd } = &peer.sink
+            {
+                let _ = cmd.send(OutCmd::Hint);
+            }
+        }
     }
 
     pub fn hints_for(&self, id: EndpointId) -> Vec<SocketAddr> {

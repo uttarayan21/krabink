@@ -100,10 +100,13 @@ struct Inner {
 pub struct Node(Arc<Inner>);
 
 impl Node {
-    /// Open the store, load the key, bind the endpoint. Must run on the
-    /// tokio runtime that will drive the node.
+    /// Load the key, bind the endpoint, then open the store. Must run on
+    /// the tokio runtime that will drive the node. Binding first means a
+    /// taken port fails before anything else is held open, so the caller
+    /// can retry with another port.
     pub async fn start(cfg: NodeConfig) -> Result<Self> {
         let secret = crate::identity::load_or_create_secret_key(&cfg.key_path)?;
+        let endpoint = bind_endpoint(&secret, cfg.relay.clone(), cfg.bind_port).await?;
         let store = Store::open(&cfg.store_path)?;
         let hub = Hub::new(cfg.device, ServerDocs::new(store), cfg.tokens);
         let maintenance = tokio::spawn(maintenance(hub.clone()));
@@ -122,7 +125,7 @@ impl Node {
             relay_health,
             maintenance,
         }));
-        node.resume().await?;
+        node.attach(endpoint).await;
         Ok(node)
     }
 
@@ -174,11 +177,13 @@ impl Node {
         self.0.hub.remove_token(token);
     }
 
-    /// A direct address for `peer` learned out of band (mDNS); used on the
-    /// next dial attempt.
+    /// A direct address for `peer` learned out of band (mDNS). A new hint
+    /// wakes that peer's dial loop out of its backoff, so a desktop that
+    /// came back on a fresh port is reached at once, not after the wait.
     pub fn add_addr_hint(&self, peer: EndpointId, addr: SocketAddr) {
         if self.0.hub.add_hint(peer, addr) {
             tracing::info!(peer = %peer.fmt_short(), %addr, "direct address hint");
+            self.0.hub.wake_dial(peer);
         }
     }
 
@@ -302,11 +307,20 @@ impl Node {
 
     /// Bind a fresh endpoint with the same key and redial every peer.
     pub async fn resume(&self) -> Result<()> {
-        let mut net = self.0.net.lock().await;
-        if net.is_some() {
+        if self.0.net.lock().await.is_some() {
             return Ok(());
         }
-        let endpoint = self.bind().await?;
+        let endpoint = bind_endpoint(&self.0.secret, self.relay(), self.0.bind_port).await?;
+        self.attach(endpoint).await;
+        Ok(())
+    }
+
+    /// Put a bound endpoint to work: accept, watch the relay, dial peers.
+    async fn attach(&self, endpoint: Endpoint) {
+        let mut net = self.0.net.lock().await;
+        if net.is_some() {
+            return;
+        }
         tracing::info!(id = %endpoint.id(), "node endpoint bound");
         let accept = tokio::spawn(accept_loop(endpoint.clone(), self.0.hub.clone()));
         let relay_watch = tokio::spawn(watch_relay(endpoint.clone(), self.0.relay_health.clone()));
@@ -319,7 +333,6 @@ impl Node {
         let targets = self.0.targets.lock().expect("targets poisoned").clone();
         self.reconcile_dials(&mut fresh, &targets);
         *net = Some(fresh);
-        Ok(())
     }
 
     /// Tell the endpoint the network changed (interface up/down, Wi-Fi
@@ -355,29 +368,6 @@ impl Node {
         .await
         .map_err(|err| Error::Bind(format!("checkpoint task: {err}")))??;
         Ok(())
-    }
-
-    async fn bind(&self) -> Result<Endpoint> {
-        let mut builder = Endpoint::builder(presets::Minimal)
-            .secret_key(self.0.secret.clone())
-            .alpns(vec![ALPN.to_vec()]);
-        builder = match self.relay() {
-            Some(relay) => builder.relay_mode(RelayMode::Custom(
-                RelayConfig::new(relay.url, None)
-                    .with_auth_token(relay.token)
-                    .into(),
-            )),
-            None => builder.relay_mode(RelayMode::Disabled),
-        };
-        if let Some(port) = self.0.bind_port {
-            builder = builder
-                .bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
-                .map_err(|err| Error::Bind(err.to_string()))?;
-        }
-        builder
-            .bind()
-            .await
-            .map_err(|err| Error::Bind(err.to_string()))
     }
 
     fn reconcile_dials(&self, net: &mut Net, targets: &[PeerTarget]) {
@@ -423,6 +413,34 @@ impl Node {
             net.dials.insert(target.id, Dial { cmd: tx, task });
         }
     }
+}
+
+/// Bind an endpoint for `secret` on `bind_port` (or an ephemeral one).
+async fn bind_endpoint(
+    secret: &SecretKey,
+    relay: Option<RelayTarget>,
+    bind_port: Option<u16>,
+) -> Result<Endpoint> {
+    let mut builder = Endpoint::builder(presets::Minimal)
+        .secret_key(secret.clone())
+        .alpns(vec![ALPN.to_vec()]);
+    builder = match relay {
+        Some(relay) => builder.relay_mode(RelayMode::Custom(
+            RelayConfig::new(relay.url, None)
+                .with_auth_token(relay.token)
+                .into(),
+        )),
+        None => builder.relay_mode(RelayMode::Disabled),
+    };
+    if let Some(port) = bind_port {
+        builder = builder
+            .bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+            .map_err(|err| Error::Bind(err.to_string()))?;
+    }
+    builder
+        .bind()
+        .await
+        .map_err(|err| Error::Bind(err.to_string()))
 }
 
 /// Periodic checkpoint + idle unload; runs until aborted. The checkpoint

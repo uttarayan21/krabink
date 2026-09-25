@@ -88,22 +88,38 @@ fn run_app(args: cli::Cli) -> Result<()> {
         .attach("tokio runtime")?;
 
     // The node accepts our own token plus the adopted workspace's, so one
-    // QR opens every path.
-    let node = runtime
-        .block_on(Node::start(NodeConfig {
-            key_path: config.node_key_path.clone(),
-            store_path: config.node_store_path.clone(),
-            device: config.device,
-            tokens: [config.workspace_token.clone(), config.token.clone()]
-                .into_iter()
-                .filter(|t| !t.is_empty())
-                .collect(),
-            relay: config.relay_target(),
-            bind_port: None,
-            role: Role::Device,
-        }))
-        .change_context(Error)
-        .attach("starting sync node")?;
+    // QR opens every path. The UDP port is the one from the last run when
+    // it is still free: peers keep dialling `ip:port` hints from the QR
+    // and mDNS, and a restart must not invalidate them.
+    let node_config = |bind_port| NodeConfig {
+        key_path: config.node_key_path.clone(),
+        store_path: config.node_store_path.clone(),
+        device: config.device,
+        tokens: [config.workspace_token.clone(), config.token.clone()]
+            .into_iter()
+            .filter(|t| !t.is_empty())
+            .collect(),
+        relay: config.relay_target(),
+        bind_port,
+        role: Role::Device,
+    };
+    let saved_port = config::load_node_port(&config.node_port_path);
+    let node = match runtime.block_on(Node::start(node_config(saved_port))) {
+        Ok(node) => node,
+        Err(err) if saved_port.is_some() => {
+            tracing::warn!(%err, port = saved_port, "saved port unavailable; binding a fresh one");
+            runtime
+                .block_on(Node::start(node_config(None)))
+                .change_context(Error)
+                .attach("starting sync node")?
+        }
+        Err(err) => {
+            return Err(err).change_context(Error).attach("starting sync node");
+        }
+    };
+    if let Some(port) = runtime.block_on(node.bound_port()) {
+        config::save_node_port(&config.node_port_path, port);
+    }
     let peers = config.peer_targets();
     if peers.is_empty() {
         tracing::info!("no peers configured; waiting to be paired");

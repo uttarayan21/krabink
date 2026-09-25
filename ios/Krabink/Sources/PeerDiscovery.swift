@@ -2,21 +2,27 @@ import Foundation
 import Network
 
 /// Finds the paired desktop's node on the local network via Bonjour
-/// (`_krabink._udp`, matched on the `id` TXT record) and resolves it to an
-/// `ip:port` the core can hand its node as a direct address hint. Only
-/// matters when the relay is unreachable: with the relay up, the nodes
-/// exchange addresses through it and punch the LAN path themselves.
-/// Multicast does not cross VPN/overlay networks like Tailscale; there the
-/// QR's addresses and the relay do the job.
+/// (`_krabink._udp`, matched on the `id` TXT record) and hands the core
+/// every `ip:port` it can dial: the TXT record's `addrs` + `port` (every
+/// interface the desktop advertises, overlays like Tailscale included,
+/// which matters when a firewall on the desktop admits only the overlay)
+/// plus the address Bonjour itself resolves. Only matters when the relay
+/// is unreachable: with the relay up, the nodes exchange addresses through
+/// it and punch the LAN path themselves. Multicast does not cross
+/// VPN/overlay networks; there the QR's addresses and the relay do the job.
 @MainActor
 final class PeerDiscovery {
     static let serviceType = "_krabink._udp"
 
     let nodeId: String
-    /// `ip:port` of the matched desktop; nil while not found.
+    /// `ip:port` Bonjour resolved for the matched desktop; nil while not
+    /// found. Shown in Settings.
     private(set) var addr: String? {
-        didSet { if addr != oldValue, let addr { onFound?(addr) } }
+        didSet { if addr != oldValue, let addr { hint(addr) } }
     }
+    /// Every address handed to `onFound` so far; reset on `stop()`.
+    private var hinted: Set<String> = []
+    /// Called once per new `ip:port`.
     var onFound: ((String) -> Void)?
 
     private var browser: NWBrowser?
@@ -53,6 +59,22 @@ final class PeerDiscovery {
         resolver?.cancel()
         resolver = nil
         addr = nil
+        hinted = []
+    }
+
+    private func hint(_ addr: String) {
+        guard hinted.insert(addr).inserted else { return }
+        onFound?(addr)
+    }
+
+    /// `ip:port` pairs from the TXT record (`addrs=ip,ip…`, `port=n`).
+    static func txtAddrs(_ txt: [String: String]) -> [String] {
+        guard let port = txt["port"], UInt16(port) != nil else { return [] }
+        return (txt["addrs"] ?? "")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .map { "\($0):\(port)" }
     }
 
     private func handle(_ results: Set<NWBrowser.Result>) {
@@ -65,6 +87,9 @@ final class PeerDiscovery {
             resolver = nil
             addr = nil
             return
+        }
+        if case .bonjour(let txt) = match.metadata {
+            for addr in Self.txtAddrs(txt.dictionary) { hint(addr) }
         }
         resolve(match.endpoint)
     }

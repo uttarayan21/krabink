@@ -123,7 +123,8 @@ async fn dial_until_closed(
     }
 }
 
-/// Sleep unless told to close first. Returns true when closing.
+/// Sleep unless told to close first. Returns true when closing. A new
+/// address hint cuts the wait short: the next dial sees it.
 async fn pause(cmd: &mut mpsc::UnboundedReceiver<OutCmd>, wait: Duration) -> bool {
     let deadline = tokio::time::sleep(wait);
     tokio::pin!(deadline);
@@ -132,6 +133,7 @@ async fn pause(cmd: &mut mpsc::UnboundedReceiver<OutCmd>, wait: Duration) -> boo
             _ = &mut deadline => return false,
             next = cmd.recv() => match next {
                 None | Some(OutCmd::Close) => return true,
+                Some(OutCmd::Hint) => return false,
                 Some(_) => {} // not connected; drop
             },
         }
@@ -268,6 +270,8 @@ async fn session_loop(
                             Vec::new()
                         }
                     }
+                    // Already connected; iroh probes new paths itself.
+                    Some(OutCmd::Hint) => Vec::new(),
                 };
                 if let Err(end) = apply(&mut session, hub, peer_id, conn, lanes, effects) {
                     return end;
@@ -352,5 +356,28 @@ impl ClientDocs for HubDocs<'_> {
     fn updates_since(&mut self, doc: DocKey, have: &[u8]) -> krabink_core::Result<Vec<u8>> {
         let mut docs = self.hub.docs.lock().expect("doc registry poisoned");
         Ok(docs.catch_up(doc, have)?.payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn hint_cuts_the_backoff_short() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(OutCmd::Hint).unwrap();
+        let started = tokio::time::Instant::now();
+        assert!(!pause(&mut rx, Duration::from_secs(30)).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn close_ends_the_pause_and_updates_do_not() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(OutCmd::Subscribe(krabink_core::DocKey::WORKSPACE))
+            .unwrap();
+        tx.send(OutCmd::Close).unwrap();
+        assert!(pause(&mut rx, Duration::from_secs(30)).await);
     }
 }

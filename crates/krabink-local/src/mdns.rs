@@ -1,6 +1,10 @@
 //! LAN discovery for the relay-less case (desktop only): advertise this
-//! node as `_krabink._udp` with TXT `id=<EndpointId>`, browse for other
-//! nodes and hand their addresses to the node as dial hints. Only matters
+//! node as `_krabink._udp` with TXT `id=<EndpointId>`, `port=<udp port>`
+//! and `addrs=<ip,ip,…>` (every candidate interface, overlays like
+//! Tailscale included), browse for other nodes and hand their addresses
+//! to the node as dial hints. The TXT copy of the addresses lets a
+//! browser that never resolves the SRV/A records (the iPad's
+//! `NWBrowser`) hint every address at once. Only matters
 //! where multicast reaches and the relay does not; with a relay up, iroh
 //! finds the LAN path by itself.
 
@@ -26,8 +30,9 @@ impl Mdns {
     /// browsing for other nodes.
     pub fn start(node: EndpointId, port: u16, host: &str) -> Result<Self, mdns_sd::Error> {
         let instance = format!("krabink-{host}");
-        let props = HashMap::from([("id".to_string(), node.to_string())]);
-        let addrs: Vec<IpAddr> = candidate_ips().into_iter().map(IpAddr::V4).collect();
+        let ips = candidate_ips();
+        let props = txt_props(node, port, &ips);
+        let addrs: Vec<IpAddr> = ips.into_iter().map(IpAddr::V4).collect();
         let info = ServiceInfo::new(
             SERVICE_TYPE,
             &instance,
@@ -91,6 +96,16 @@ impl Drop for Mdns {
     }
 }
 
+/// TXT record: `id`, `port` and the comma-joined `addrs`, best first.
+pub fn txt_props(node: EndpointId, port: u16, ips: &[Ipv4Addr]) -> HashMap<String, String> {
+    let addrs: Vec<String> = ips.iter().map(ToString::to_string).collect();
+    HashMap::from([
+        ("id".to_string(), node.to_string()),
+        ("port".to_string(), port.to_string()),
+        ("addrs".to_string(), addrs.join(",")),
+    ])
+}
+
 /// Every IPv4 address peers could reach us at, best first.
 pub fn candidate_ips() -> Vec<Ipv4Addr> {
     let mut ips: Vec<Ipv4Addr> = if_addrs::get_if_addrs()
@@ -113,4 +128,25 @@ fn is_virtual(name: &str) -> bool {
     ["docker", "virbr", "br-", "veth", "lxc", "vmnet", "bridge"]
         .iter()
         .any(|prefix| name.starts_with(prefix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn txt_lists_port_and_every_address() {
+        let node = iroh::SecretKey::generate().public();
+        let props = txt_props(
+            node,
+            38651,
+            &[
+                Ipv4Addr::new(192, 168, 0, 188),
+                Ipv4Addr::new(100, 78, 171, 80),
+            ],
+        );
+        assert_eq!(props["id"], node.to_string());
+        assert_eq!(props["port"], "38651");
+        assert_eq!(props["addrs"], "192.168.0.188,100.78.171.80");
+    }
 }
