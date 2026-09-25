@@ -92,6 +92,23 @@ impl Docs {
         Ok((id, note_payload, ws_payload))
     }
 
+    /// Remove notes from the synced registry and close them here. Note
+    /// history stays in the store (GC is backlog, same as the iPad).
+    /// Returns the workspace payload for the wire; empty for no ids.
+    pub fn delete_notes(&mut self, ids: &[NoteId]) -> krabink_core::Result<Vec<u8>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let before = self.workspace.version();
+        for id in ids {
+            self.open.remove(id);
+            self.workspace.remove(*id)?;
+        }
+        let payload = self.workspace.export_updates_since(&before)?;
+        self.persist(DocKey::WORKSPACE, &payload)?;
+        Ok(payload)
+    }
+
     /// Splice an edit into an open note; returns the sync payload.
     pub fn splice(
         &mut self,
@@ -232,5 +249,51 @@ impl ClientDocs for Docs {
                 .map(|(_, note)| note.export_updates_since(have))
                 .unwrap_or_else(|| Ok(Vec::new()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_notes_drops_registry_rows_and_open_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        let mut docs = Docs::load(Store::open(&path).unwrap()).unwrap();
+        // A peer that followed every workspace payload converges.
+        let peer = WorkspaceDoc::new();
+        let (a, _, ws) = docs.create_note().unwrap();
+        peer.import_update(&ws).unwrap();
+        let (b, _, ws) = docs.create_note().unwrap();
+        peer.import_update(&ws).unwrap();
+        let (c, _, ws) = docs.create_note().unwrap();
+        peer.import_update(&ws).unwrap();
+
+        let payload = docs.delete_notes(&[a, c]).unwrap();
+        assert!(!payload.is_empty());
+        let left: Vec<NoteId> = docs.workspace.notes().into_iter().map(|n| n.id).collect();
+        assert_eq!(left, vec![b]);
+        assert!(docs.note(a).is_none());
+        assert!(docs.note(c).is_none());
+        assert!(docs.note(b).is_some());
+
+        peer.import_update(&payload).unwrap();
+        let (_, _, ws) = docs.create_note().unwrap();
+        peer.import_update(&ws).unwrap();
+        let mut theirs: Vec<NoteId> = peer.notes().into_iter().map(|n| n.id).collect();
+        let mut ours: Vec<NoteId> = docs.workspace.notes().into_iter().map(|n| n.id).collect();
+        theirs.sort();
+        ours.sort();
+        assert_eq!(theirs, ours);
+        assert_eq!(ours.len(), 2);
+
+        // Persisted: a reload has the same registry.
+        drop(docs);
+        let mut docs = Docs::load(Store::open(&path).unwrap()).unwrap();
+        let mut reloaded: Vec<NoteId> = docs.workspace.notes().into_iter().map(|n| n.id).collect();
+        reloaded.sort();
+        assert_eq!(reloaded, ours);
+        assert!(docs.delete_notes(&[]).unwrap().is_empty());
     }
 }

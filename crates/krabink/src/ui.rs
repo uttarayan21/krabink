@@ -18,7 +18,7 @@
 //! the embed line is link-styled source text, editable and selectable
 //! like any other line. The desktop shows sketches read-only.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bevy::prelude::*;
@@ -74,6 +74,21 @@ pub struct EditorState {
     previewed: PreviewCache,
     /// Inline box heights of the open note's sketches.
     boxes: BoxHeights,
+    /// Library select mode: rows toggle membership in `selected` instead
+    /// of opening, and the delete strip shows (the iPad's edit mode).
+    pub select_mode: bool,
+    pub selected: HashSet<NoteId>,
+    /// Where the two-step bulk delete confirmation stands.
+    confirm_delete: DeleteConfirm,
+}
+
+/// The two confirmations before a bulk delete, as on the iPad.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum DeleteConfirm {
+    #[default]
+    None,
+    First,
+    Final,
 }
 
 /// `sketch_box_height` of every sketch container, refreshed when the doc
@@ -563,9 +578,20 @@ fn editor_ui(
             ui.add_space(18.0);
 
             let notes = docs.workspace.notes();
+            if notes.is_empty() {
+                editor.select_mode = false;
+            }
             ui.horizontal(|ui| {
                 palette.caption(ui, "Notes");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !notes.is_empty() {
+                        let label = if editor.select_mode { "Done" } else { "Select" };
+                        if ui.small_button(label).clicked() {
+                            editor.select_mode = !editor.select_mode;
+                            editor.selected.clear();
+                            editor.confirm_delete = DeleteConfirm::None;
+                        }
+                    }
                     ui.label(
                         egui::RichText::new(notes.len().to_string())
                             .small()
@@ -574,6 +600,10 @@ fn editor_ui(
                 });
             });
             ui.add_space(4.0);
+            if editor.select_mode {
+                delete_strip(ui, &palette, &mut docs, &mut editor, &mut commits);
+                ui.add_space(6.0);
+            }
 
             // Leave room for the footer so the list scrolls above it.
             let footer_height = 44.0;
@@ -591,8 +621,23 @@ fn editor_ui(
                         );
                     }
                     for meta in notes {
+                        if editor.select_mode {
+                            let checked = editor.selected.contains(&meta.id);
+                            if note_row(ui, &palette, &meta.title, checked, Some(checked)).clicked()
+                            {
+                                if checked {
+                                    editor.selected.remove(&meta.id);
+                                } else {
+                                    editor.selected.insert(meta.id);
+                                }
+                                editor.confirm_delete = DeleteConfirm::None;
+                            }
+                            continue;
+                        }
                         let selected = editor.open == Some(meta.id);
-                        if note_row(ui, &palette, &meta.title, selected).clicked() && !selected {
+                        if note_row(ui, &palette, &meta.title, selected, None).clicked()
+                            && !selected
+                        {
                             match docs.open_note(meta.id) {
                                 Ok(_) => {
                                     subscribes.write(SubscribeNeeded(DocKey::from(meta.id)));
@@ -838,7 +883,15 @@ fn logo(ui: &mut egui::Ui, palette: &Palette, size: f32, bg: egui::Color32) {
 
 /// One entry in the library list: rounded hover/selection background with
 /// an accent bar on the selected row, title truncated to one line.
-fn note_row(ui: &mut egui::Ui, palette: &Palette, title: &str, selected: bool) -> egui::Response {
+/// One library row. `check` draws a checkbox (select mode) and moves the
+/// title right of it.
+fn note_row(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    title: &str,
+    selected: bool,
+    check: Option<bool>,
+) -> egui::Response {
     let height = 34.0;
     let (rect, response) = ui.allocate_exact_size(
         egui::Vec2::new(ui.available_width(), height),
@@ -874,16 +927,121 @@ fn note_row(ui: &mut egui::Ui, palette: &Palette, title: &str, selected: bool) -
     } else {
         palette.muted
     };
-    let text_width = rect.width() - 24.0;
+    let mut text_left = rect.left() + 12.0;
+    if let Some(checked) = check {
+        let size = 14.0;
+        let center = egui::pos2(rect.left() + 12.0 + size / 2.0, rect.center().y);
+        let square = egui::Rect::from_center_size(center, egui::Vec2::splat(size));
+        let (fill, stroke) = if checked {
+            (palette.accent, palette.accent)
+        } else {
+            (egui::Color32::TRANSPARENT, palette.muted)
+        };
+        painter.rect(
+            square,
+            egui::CornerRadius::same(3),
+            fill,
+            egui::Stroke::new(1.0, stroke),
+            egui::StrokeKind::Inside,
+        );
+        if checked {
+            let tick = egui::Stroke::new(2.0, palette.on_accent);
+            let knee = center + egui::vec2(-1.0, 3.0);
+            painter.line_segment([center + egui::vec2(-4.5, -0.5), knee], tick);
+            painter.line_segment([knee, center + egui::vec2(4.5, -3.5)], tick);
+        }
+        text_left += size + 10.0;
+    }
+    let text_width = rect.right() - 12.0 - text_left;
     let galley = egui::WidgetText::from(egui::RichText::new(shown).color(color)).into_galley(
         ui,
         Some(egui::TextWrapMode::Truncate),
         text_width,
         egui::TextStyle::Body,
     );
-    let pos = egui::pos2(rect.left() + 12.0, rect.center().y - galley.size().y / 2.0);
+    let pos = egui::pos2(text_left, rect.center().y - galley.size().y / 2.0);
     painter.galley(pos, galley, color);
     response
+}
+
+/// Select mode's action row: the delete button and its two confirmations,
+/// the desktop twin of the iPad's `bulkDelete` alerts.
+fn delete_strip(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    docs: &mut Docs,
+    editor: &mut EditorState,
+    commits: &mut MessageWriter<LocalCommit>,
+) {
+    let count = editor.selected.len();
+    let plural = if count == 1 { "" } else { "s" };
+    match editor.confirm_delete {
+        DeleteConfirm::None => {
+            let button = palette.danger_button(&format!("Delete ({count})"));
+            if ui.add_enabled(count > 0, button).clicked() {
+                editor.confirm_delete = DeleteConfirm::First;
+            }
+        }
+        DeleteConfirm::First => {
+            ui.label(
+                egui::RichText::new(format!("Delete {count} note{plural}?")).color(palette.text),
+            );
+            ui.weak("You will be asked to confirm once more.");
+            ui.horizontal(|ui| {
+                if ui.add(palette.danger_button("Delete")).clicked() {
+                    editor.confirm_delete = DeleteConfirm::Final;
+                }
+                if ui.small_button("Cancel").clicked() {
+                    editor.confirm_delete = DeleteConfirm::None;
+                }
+            });
+        }
+        DeleteConfirm::Final => {
+            ui.label(
+                egui::RichText::new(format!("Really delete {count} note{plural}?"))
+                    .color(palette.text),
+            );
+            ui.weak("This cannot be undone.");
+            ui.horizontal(|ui| {
+                if ui.add(palette.danger_button("Delete forever")).clicked() {
+                    delete_selected(docs, editor, commits);
+                }
+                if ui.small_button("Cancel").clicked() {
+                    editor.confirm_delete = DeleteConfirm::None;
+                }
+            });
+        }
+    }
+}
+
+/// Drop every selected note from the synced registry (history stays in
+/// the store, as on the iPad), close it if it was open, leave select mode.
+fn delete_selected(
+    docs: &mut Docs,
+    editor: &mut EditorState,
+    commits: &mut MessageWriter<LocalCommit>,
+) {
+    let ids: Vec<NoteId> = editor.selected.iter().copied().collect();
+    match docs.delete_notes(&ids) {
+        Ok(payload) => {
+            if !payload.is_empty() {
+                commits.write(LocalCommit {
+                    doc: DocKey::WORKSPACE,
+                    payload,
+                });
+            }
+            if editor.open.is_some_and(|open| ids.contains(&open)) {
+                editor.open = None;
+                editor.buffer.clear();
+                editor.last.clear();
+                editor.boxes.reset();
+            }
+        }
+        Err(err) => tracing::error!(%err, "delete notes failed"),
+    }
+    editor.selected.clear();
+    editor.select_mode = false;
+    editor.confirm_delete = DeleteConfirm::None;
 }
 
 /// Paper card filling `height`: the editor's frame.

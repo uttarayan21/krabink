@@ -298,7 +298,10 @@ Bevy app with egui UI. Modules:
 - `sync.rs`: one `ClientSession` over the node's `LocalLink`, driven once
   per frame; the node does peers, relay and fan-out. See
   `docs/architecture.md`.
-- `ui.rs`: library sidebar and one styled editor per note: an egui
+- `ui.rs`: library sidebar (a Select mode with checkbox rows and a
+  two-step bulk delete, the iPad's edit mode; `Docs::delete_notes` drops
+  the registry rows, note history stays in the store) and one styled
+  editor per note: an egui
   `TextEdit` with a custom layouter that turns the core's style runs into
   a `LayoutJob` (16 pt body, heading sizes 16×{1.6, 1.4, 1.25, 1.1},
   markers muted, code monospace on the raised surface, list indents;
