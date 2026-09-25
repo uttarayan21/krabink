@@ -248,6 +248,13 @@ impl NoteDoc {
             .collect()
     }
 
+    /// Number of elements in a sketch (0 for an unknown one): elements are
+    /// only ever added or removed whole, so a length diff catches every
+    /// change without decoding a point.
+    pub fn sketch_len(&self, sketch: SketchId) -> usize {
+        self.elements_list(sketch).map_or(0, |list| list.len())
+    }
+
     /// Append a stroke on top of the sketch's z-order.
     pub fn add_stroke(&self, sketch: SketchId, stroke: &Stroke) -> Result<()> {
         let map = self.elements_list(sketch)?.push_container(LoroMap::new())?;

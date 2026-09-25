@@ -21,6 +21,7 @@ mod element;
 mod export;
 mod geom;
 mod ids;
+mod inline;
 mod markdown;
 mod note;
 mod pair;
@@ -47,6 +48,9 @@ pub use geom::{
     DEFAULT_TOLERANCE, GrainStyle, Ink, InkMesh, InkStyle, InkVertex, MAX_DABS, MaskStyle,
 };
 pub use ids::{DeviceId, ElementId, NoteId, SketchId, StrokeId};
+pub use inline::{
+    INLINE_MIN_HEIGHT, INLINE_PADDING, outline_bounds, points_bounds, sketch_box_height,
+};
 pub use markdown::{PreviewText, StyleKind, StyleRun, preview_text, style_runs};
 pub use note::NoteDoc;
 pub use pair::PairInfo;

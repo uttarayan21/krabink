@@ -9,9 +9,13 @@
 //! Offsets are unicode scalars, `[start, end)`, matching
 //! [`crate::NoteDoc::splice_text`].
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+
+use crate::SketchId;
+use crate::export::SKETCH_URI_PREFIX;
 
 /// What a run of source text is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -35,6 +39,13 @@ pub enum StyleKind {
     BlockQuote,
     /// A link or image, brackets and destination included.
     Link,
+    /// An inline sketch's embed line, `![…](krabink://sketch/<id>)`: the
+    /// image alone on its line, first occurrence of that id. The run
+    /// covers the whole image syntax and never hosts markers; the editors
+    /// hide the text and lay the line out as the sketch's box.
+    SketchEmbed {
+        sketch: SketchId,
+    },
     /// Syntax that is not content: `#`, `*`, `-`, `1.`, `>`, backticks,
     /// fences, `[`, `](url)`, `[ ]`. Always inside some other run.
     Marker,
@@ -59,11 +70,21 @@ pub fn style_runs(text: &str) -> Vec<StyleRun> {
     // between them are syntax.
     let mut covered: Vec<Range<usize>> = Vec::new();
     let mut lists: Vec<bool> = Vec::new();
+    let mut embedded: HashSet<SketchId> = HashSet::new();
 
     for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
         match event {
             Event::Start(tag) => {
+                let embed = match &tag {
+                    Tag::Image { dest_url, .. } => embed_id(dest_url, text, &range, &mut embedded),
+                    _ => None,
+                };
                 let kind = match tag {
+                    Tag::Image { .. } if embed.is_some() => {
+                        // The whole syntax is the box: no markers inside.
+                        covered.push(range.clone());
+                        embed.map(|sketch| StyleKind::SketchEmbed { sketch })
+                    }
                     Tag::Heading { level, .. } => Some(StyleKind::Heading {
                         level: heading_level(level),
                     }),
@@ -150,6 +171,25 @@ pub fn style_runs(text: &str) -> Vec<StyleRun> {
     });
     runs.dedup();
     runs
+}
+
+/// The sketch an image at byte `range` embeds: its destination is a
+/// `krabink://sketch/` URI with a ULID, the image is the only non-blank
+/// content of its source line, and the id was not embedded before.
+fn embed_id(
+    dest: &str,
+    text: &str,
+    range: &Range<usize>,
+    embedded: &mut HashSet<SketchId>,
+) -> Option<SketchId> {
+    let id: SketchId = dest.strip_prefix(SKETCH_URI_PREFIX)?.parse().ok()?;
+    let line_start = text[..range.start].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = text[range.end..]
+        .find('\n')
+        .map_or(text.len(), |i| range.end + i);
+    let alone = text[line_start..range.start].trim().is_empty()
+        && text[range.end..line_end].trim().is_empty();
+    (alone && embedded.insert(id)).then_some(id)
 }
 
 /// Non-whitespace stretches of `range` become `Marker` runs.
@@ -587,6 +627,7 @@ mod tests {
         let corpus = [
             "# H *e* **s** `c`\n\n> q **b**\n\n- [ ] a `b`\n  - [x] [l](u)\n\n```\nx\n```\n\n---\n",
             "1. one\n2. two **b** *i*\n\n***\n\n![i](x) ~~s~~",
+            "a\n\n![sketch](krabink://sketch/01ARZ3NDEKTSV4RRFFQ69G5FAV)\n\n- b",
         ];
         for text in corpus {
             let runs = style_runs(text);
@@ -619,6 +660,84 @@ mod tests {
 
     fn preview(text: &str) -> PreviewText {
         preview_text(text)
+    }
+
+    const EMBED: &str = "![sketch](krabink://sketch/01ARZ3NDEKTSV4RRFFQ69G5FAV)";
+
+    fn embed_kind() -> StyleKind {
+        StyleKind::SketchEmbed {
+            sketch: "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn sketch_embed_is_one_run_without_markers() {
+        let text = format!("a\n\n{EMBED}\n\nb");
+        let embed = (3, 3 + EMBED.chars().count(), embed_kind());
+        assert_eq!(runs(&text), vec![embed]);
+        assert!(markers(&text).is_empty());
+        // Indented or trailing blanks still count as alone on the line.
+        let text = format!("  {EMBED}  \n");
+        assert!(
+            runs(&text).iter().any(|r| r.2 == embed_kind()),
+            "{:?}",
+            runs(&text)
+        );
+    }
+
+    #[test]
+    fn sketch_embed_needs_own_line_and_first_occurrence() {
+        let text = format!("see {EMBED}");
+        assert!(runs(&text).iter().all(|r| r.2 != embed_kind()));
+        assert_eq!(
+            markers(&text),
+            vec!["![", "](krabink://sketch/01ARZ3NDEKTSV4RRFFQ69G5FAV)"]
+        );
+        let text = format!("{EMBED}\n\n{EMBED}\n");
+        let embeds: Vec<_> = runs(&text)
+            .into_iter()
+            .filter(|r| r.2 == embed_kind())
+            .collect();
+        assert_eq!(embeds.len(), 1);
+        assert_eq!(embeds[0].0, 0);
+        let links: Vec<_> = runs(&text)
+            .into_iter()
+            .filter(|r| r.2 == StyleKind::Link)
+            .collect();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].0, EMBED.chars().count() + 2);
+    }
+
+    #[test]
+    fn bad_sketch_uri_is_a_link() {
+        for text in [
+            "![s](krabink://sketch/short)",
+            "![s](krabink://sketch/01ARZ3NDEKTSV4RRFFQ69G5FAVx)",
+            "![s](krabink://note/01ARZ3NDEKTSV4RRFFQ69G5FAV)",
+            "[s](krabink://sketch/01ARZ3NDEKTSV4RRFFQ69G5FAV)",
+        ] {
+            let kinds: Vec<_> = runs(text).into_iter().map(|r| r.2).collect();
+            assert!(kinds.contains(&StyleKind::Link), "{text}: {kinds:?}");
+            assert!(
+                !kinds
+                    .iter()
+                    .any(|k| matches!(k, StyleKind::SketchEmbed { .. })),
+                "{text}: {kinds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_keeps_embed_line_and_run() {
+        let text = format!("# T\n{EMBED}\nafter\n");
+        let p = preview(&text);
+        assert_eq!(p.text, format!("T\n{EMBED}\nafter\n"));
+        let embed = p.runs.iter().find(|r| r.kind == embed_kind()).unwrap();
+        assert_eq!(embed.start, 2);
+        assert_eq!(embed.end, 2 + EMBED.chars().count());
+        // The line start maps back to the source `!`.
+        assert_eq!(p.source_of[embed.start], 4);
+        assert_eq!(p.display_of(4), 2);
     }
 
     #[test]

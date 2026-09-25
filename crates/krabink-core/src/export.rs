@@ -15,6 +15,7 @@ use std::fmt::Write as _;
 use crate::brush::{Blend, StrokeEnd, TipEvaluator};
 use crate::element::Element;
 use crate::geom::Ink;
+use crate::inline::points_bounds;
 use crate::note::NoteDoc;
 use crate::stroke::StrokePoint;
 use crate::{Result, SketchId};
@@ -99,28 +100,16 @@ pub fn elements_to_svg(elements: &[Element]) -> String {
         })
         .filter(|(_, pts, _)| !pts.is_empty())
         .collect();
-    let points = outlines.iter().flat_map(|(_, pts, _)| pts);
-    let (min_x, min_y, max_x, max_y) = points.fold(
-        (f32::MAX, f32::MAX, f32::MIN, f32::MIN),
-        |(min_x, min_y, max_x, max_y), p| {
-            (
-                min_x.min(p[0]),
-                min_y.min(p[1]),
-                max_x.max(p[0]),
-                max_y.max(p[1]),
-            )
-        },
-    );
-    let (min_x, min_y, max_x, max_y) = if outlines.is_empty() {
-        (0.0, 0.0, 1.0, 1.0)
-    } else {
-        (
-            min_x - SVG_PAD,
-            min_y - SVG_PAD,
-            max_x + SVG_PAD,
-            max_y + SVG_PAD,
-        )
-    };
+    let (min_x, min_y, max_x, max_y) =
+        match points_bounds(outlines.iter().flat_map(|(_, pts, _)| pts)) {
+            Some((min, max)) => (
+                min[0] - SVG_PAD,
+                min[1] - SVG_PAD,
+                max[0] + SVG_PAD,
+                max[1] + SVG_PAD,
+            ),
+            None => (0.0, 0.0, 1.0, 1.0),
+        };
 
     let mut svg = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{min_x} {min_y} {w} {h}">"#,
