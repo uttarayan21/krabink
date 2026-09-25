@@ -9,6 +9,12 @@
 //! off-screen page texture the sketch module renders from it. In the
 //! reading view anchors resolve through the display's source map, so ink
 //! stays on its line.
+//!
+//! Inline sketches (`![…](krabink://sketch/<id>)` alone on a line) show as
+//! a box in the text flow: the embed's chars are laid out invisible at
+//! the box's height (`krabink_core::sketch_box_height`), the sketch's ink
+//! renders inside it from the same texture, and a hairline frame with a
+//! caption is painted over the text. The desktop shows them read-only.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,7 +23,8 @@ use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, egui};
 use egui::text::{ByteIndex, CCursor, LayoutJob, LayoutSection, TextFormat};
 use krabink_core::{
-    Anchor, DocKey, ElementId, NoteDoc, NoteId, StyleKind, StyleRun, preview_text, style_runs,
+    Anchor, DocKey, ElementId, INLINE_MIN_HEIGHT, INLINE_PADDING, NoteDoc, NoteId, SketchId,
+    StyleKind, StyleRun, preview_text, sketch_box_height, style_runs,
 };
 
 use crate::docs::Docs;
@@ -37,6 +44,11 @@ const LIST_INDENT: f32 = 18.0;
 /// Scroll room below the last line, as a fraction of the viewport, so ink
 /// drawn under it stays reachable (the iPad insets its text view alike).
 const TAIL_FRACTION: f32 = 0.6;
+/// Font size of a hidden inline-sketch embed line: small enough never to
+/// wrap at a sane width, so the line stays one row of the box's height.
+const EMBED_FONT_SIZE: f32 = 8.0;
+/// Inline box caption size.
+const CAPTION_SIZE: f32 = 10.0;
 
 /// When set, the newest note auto-opens as the library changes (replay rig).
 #[derive(Resource, Default)]
@@ -58,6 +70,46 @@ pub struct EditorState {
     styled: StyledCache,
     /// The reading view of the buffer, rebuilt only when the text changes.
     previewed: PreviewCache,
+    /// Inline box heights of the open note's sketches.
+    boxes: BoxHeights,
+}
+
+/// `sketch_box_height` of every sketch container, refreshed when the doc
+/// changes. Keyed on the doc version (not the text): a peer's stroke
+/// changes the height without touching the text. Only sketches whose
+/// element count moved are re-measured, so a keystroke costs a few list
+/// lengths.
+#[derive(Default)]
+struct BoxHeights {
+    for_version: Vec<u8>,
+    /// Sketch → (element count measured, box height).
+    measured: HashMap<SketchId, (usize, f32)>,
+    heights: HashMap<SketchId, f32>,
+}
+
+impl BoxHeights {
+    fn refresh(&mut self, note: &NoteDoc) {
+        let version = note.version();
+        if self.for_version == version {
+            return;
+        }
+        self.for_version = version;
+        let mut measured = HashMap::new();
+        for sketch in note.sketch_ids() {
+            let len = note.sketch_len(sketch);
+            let height = match self.measured.get(&sketch) {
+                Some((n, h)) if *n == len => *h,
+                _ => sketch_box_height(&note.elements(sketch).unwrap_or_default()),
+            };
+            measured.insert(sketch, (len, height));
+        }
+        self.heights = measured.iter().map(|(s, (_, h))| (*s, *h)).collect();
+        self.measured = measured;
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 #[derive(Default)]
@@ -98,6 +150,20 @@ impl StyledCache {
     }
 }
 
+/// An inline sketch's box in galley space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InlineBox {
+    pub sketch: SketchId,
+    pub rect: egui::Rect,
+}
+
+impl InlineBox {
+    /// The sketch's local origin: the box's top-left inset by the padding.
+    pub fn origin(&self) -> egui::Vec2 {
+        self.rect.min.to_vec2() + egui::Vec2::splat(INLINE_PADDING)
+    }
+}
+
 /// Where the open note's text sits this frame, for the page ink scene.
 /// Points are in galley space: the galley's top-left is the origin, y grows
 /// down, one unit is one logical point.
@@ -112,6 +178,8 @@ pub struct PageLayout {
     pub galley: Option<Arc<egui::Galley>>,
     /// Anchor-space origin of every committed page element.
     pub origins: HashMap<ElementId, egui::Vec2>,
+    /// Every inline sketch box, in text order (first embed of an id only).
+    pub boxes: Vec<InlineBox>,
     /// The part of the galley that is on screen.
     pub window: egui::Rect,
     /// Pixels per point of the egui context.
@@ -131,6 +199,7 @@ impl Default for PageLayout {
             galley_size: egui::Vec2::ZERO,
             galley: None,
             origins: HashMap::new(),
+            boxes: Vec::new(),
             window: egui::Rect::ZERO,
             scale: 1.0,
             generation: 0,
@@ -142,6 +211,10 @@ impl Default for PageLayout {
 impl PageLayout {
     /// Publish this frame's galley; re-resolve the anchors when the doc or
     /// the text geometry changed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call site; every argument is a distinct frame fact"
+    )]
     fn update(
         &mut self,
         id: NoteId,
@@ -150,6 +223,7 @@ impl PageLayout {
         window: egui::Rect,
         scale: f32,
         source_of: Option<Arc<Vec<usize>>>,
+        boxes: Vec<InlineBox>,
     ) {
         let version = note.version();
         let size = galley.size();
@@ -162,11 +236,13 @@ impl PageLayout {
             || self.doc_version != version
             || self.galley_size != size
             || !same_map
+            || self.boxes != boxes
         {
             self.note = Some(id);
             self.doc_version = version;
             self.galley_size = size;
             self.source_of = source_of;
+            self.boxes = boxes;
             let map = self.source_of.as_deref().map(Vec::as_slice);
             self.origins = note
                 .page_elements()
@@ -188,6 +264,71 @@ impl PageLayout {
     /// The galley's source map, for resolving anchors not in `origins`.
     pub fn source_map(&self) -> Option<&[usize]> {
         self.source_of.as_deref().map(Vec::as_slice)
+    }
+
+    /// Local origin of `sketch`'s inline box, if its embed line is laid out.
+    pub fn box_origin(&self, sketch: SketchId) -> Option<egui::Vec2> {
+        self.boxes
+            .iter()
+            .find(|b| b.sketch == sketch)
+            .map(InlineBox::origin)
+    }
+}
+
+/// `(sketch, start)` of every inline embed run, in text order.
+fn embeds_of(runs: &[StyleRun]) -> Vec<(SketchId, usize)> {
+    runs.iter()
+        .filter_map(|r| match r.kind {
+            StyleKind::SketchEmbed { sketch } => Some((sketch, r.start)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The inline boxes of `galley`: each embed's row top, the full `width`,
+/// and the sketch's height (`heights`; the minimum for an unknown
+/// container).
+fn inline_boxes(
+    galley: &egui::Galley,
+    embeds: &[(SketchId, usize)],
+    heights: &HashMap<SketchId, f32>,
+    width: f32,
+) -> Vec<InlineBox> {
+    embeds
+        .iter()
+        .map(|&(sketch, start)| {
+            let top = galley.pos_from_cursor(CCursor::new(start)).min.y;
+            let height = heights.get(&sketch).copied().unwrap_or(INLINE_MIN_HEIGHT);
+            InlineBox {
+                sketch,
+                rect: egui::Rect::from_min_size(egui::pos2(0.0, top), egui::vec2(width, height)),
+            }
+        })
+        .collect()
+}
+
+/// The hairline frame and caption of every inline box, over text and ink.
+fn paint_inline_frames(
+    painter: &egui::Painter,
+    palette: &Palette,
+    boxes: &[InlineBox],
+    at: egui::Pos2,
+) {
+    for b in boxes {
+        let rect = b.rect.translate(at.to_vec2());
+        painter.rect_stroke(
+            rect,
+            egui::CornerRadius::same(theme::RADIUS),
+            egui::Stroke::new(1.0, palette.border),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            rect.min + egui::vec2(INLINE_PADDING, 2.0),
+            egui::Align2::LEFT_TOP,
+            "sketch",
+            egui::FontId::proportional(CAPTION_SIZE),
+            palette.muted,
+        );
     }
 }
 
@@ -527,7 +668,10 @@ fn editor_ui(
 
             let editor_height = ui.available_height();
             let preview = editor.preview;
-            let (output, inner_rect) = pane(ui, &palette, editor_height, |ui| {
+            if let Some(note) = docs.note(id) {
+                editor.boxes.refresh(note);
+            }
+            let (output, boxes, inner_rect) = pane(ui, &palette, editor_height, |ui| {
                 let scroll = egui::ScrollArea::vertical()
                     .id_salt("editor")
                     .auto_shrink([false, false])
@@ -541,8 +685,10 @@ fn editor_ui(
                             buffer,
                             styled,
                             previewed,
+                            boxes,
                             ..
                         } = &mut *editor;
+                        let heights = &boxes.heights;
                         // The reading view shows the display text (read-only)
                         // with the runs remapped onto it; the editor the
                         // source with its own runs.
@@ -553,9 +699,11 @@ fn editor_ui(
                             let runs = styled.runs_for(buffer);
                             (buffer, runs)
                         };
+                        let embeds = embeds_of(runs);
                         let mut layouter =
                             |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-                                let job = layout_job(text.as_str(), runs, &palette, wrap_width);
+                                let job =
+                                    layout_job(text.as_str(), runs, heights, &palette, wrap_width);
                                 ui.painter().layout_job(job)
                             };
                         let output = egui::TextEdit::multiline(text)
@@ -566,6 +714,8 @@ fn editor_ui(
                             .min_size(available)
                             .hint_text("Start writing…")
                             .show(ui);
+                        let boxes = inline_boxes(&output.galley, &embeds, heights, available.x);
+                        paint_inline_frames(ui.painter(), &palette, &boxes, output.galley_pos);
                         ui.add_space(available.y * TAIL_FRACTION);
                         if let Some(target) = &page_texture.0 {
                             // Painted in galley space, so a one-frame-old
@@ -604,9 +754,10 @@ fn editor_ui(
                                 );
                             }
                         }
-                        output
+                        (output, boxes)
                     });
-                (scroll.inner, scroll.inner_rect)
+                let (output, boxes) = scroll.inner;
+                (output, boxes, scroll.inner_rect)
             });
 
             if !preview && output.response.response.changed() {
@@ -645,7 +796,7 @@ fn editor_ui(
             if let Some(note) = docs.note(id) {
                 let window = inner_rect.translate(-output.galley_pos.to_vec2());
                 let map = preview.then(|| editor.previewed.source_of.clone());
-                layout.update(id, note, output.galley, window, scale, map);
+                layout.update(id, note, output.galley, window, scale, map, boxes);
             }
         });
 
@@ -814,6 +965,7 @@ fn open_note(docs: &mut Docs, editor: &mut EditorState, id: NoteId) {
     editor.open = Some(id);
     editor.buffer = text.clone();
     editor.last = text;
+    editor.boxes.reset();
 }
 
 // ---- styled source ----
@@ -831,6 +983,8 @@ struct CharStyle {
     background: bool,
     /// Left indent of the line this char starts, if it starts one.
     indent: f32,
+    /// Row height override: an inline box's height for its hidden embed.
+    line_height: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -839,6 +993,8 @@ enum Role {
     Strong,
     Muted,
     Accent,
+    /// Laid out but not drawn (inline sketch embeds).
+    Hidden,
 }
 
 impl CharStyle {
@@ -851,9 +1007,12 @@ impl CharStyle {
         color: Role::Body,
         background: false,
         indent: 0.0,
+        line_height: None,
     };
 
-    fn apply(&mut self, kind: StyleKind) {
+    /// Paint `kind` over this style. `heights` gives inline boxes their
+    /// row height; an unknown sketch gets the minimum.
+    fn apply(&mut self, kind: StyleKind, heights: &HashMap<SketchId, f32>) {
         match kind {
             StyleKind::Heading { level } => {
                 let scale = HEADING_SCALE[usize::from(level.clamp(1, 6)) - 1];
@@ -872,11 +1031,17 @@ impl CharStyle {
                 self.italics = true;
                 self.indent += LIST_INDENT;
             }
-            // Inline sketch boxes land in the next step; until then the
-            // embed line reads as a link.
-            StyleKind::Link | StyleKind::SketchEmbed { .. } => {
+            StyleKind::Link => {
                 self.color = Role::Accent;
                 self.underline = true;
+            }
+            // The embed is laid out invisible, tiny (never wraps) and as
+            // tall as its box; the sketch renders in the row it holds open.
+            StyleKind::SketchEmbed { sketch } => {
+                self.size = EMBED_FONT_SIZE;
+                self.color = Role::Hidden;
+                self.underline = false;
+                self.line_height = Some(heights.get(&sketch).copied().unwrap_or(INLINE_MIN_HEIGHT));
             }
             StyleKind::Marker | StyleKind::ThematicBreak => {
                 self.color = Role::Muted;
@@ -898,6 +1063,7 @@ impl CharStyle {
             Role::Strong => palette.text,
             Role::Muted => palette.muted,
             Role::Accent => palette.accent,
+            Role::Hidden => egui::Color32::TRANSPARENT,
         };
         let line = |on: bool| {
             if on {
@@ -917,18 +1083,26 @@ impl CharStyle {
             italics: self.italics,
             underline: line(self.underline),
             strikethrough: line(self.strikethrough),
+            line_height: self.line_height,
+            // Glyphs sit at the top of a tall row, so the caret and the
+            // box share a top edge.
+            valign: if self.line_height.is_some() {
+                egui::Align::TOP
+            } else {
+                egui::Align::Center
+            },
             ..TextFormat::default()
         }
     }
 }
 
 /// Per-char styles of `text` under `runs` (scalar offsets, clamped).
-fn char_styles(text: &str, runs: &[StyleRun]) -> Vec<CharStyle> {
+fn char_styles(text: &str, runs: &[StyleRun], heights: &HashMap<SketchId, f32>) -> Vec<CharStyle> {
     let mut styles = vec![CharStyle::BODY; text.chars().count()];
     for run in runs {
         let end = run.end.min(styles.len());
         for style in &mut styles[run.start.min(end)..end] {
-            style.apply(run.kind);
+            style.apply(run.kind, heights);
         }
     }
     styles
@@ -936,8 +1110,14 @@ fn char_styles(text: &str, runs: &[StyleRun]) -> Vec<CharStyle> {
 
 /// The styled galley job: one section per maximal run of equally styled
 /// chars, split at newlines so every line of an indented block indents.
-fn layout_job(text: &str, runs: &[StyleRun], palette: &Palette, wrap_width: f32) -> LayoutJob {
-    let styles = char_styles(text, runs);
+fn layout_job(
+    text: &str,
+    runs: &[StyleRun],
+    heights: &HashMap<SketchId, f32>,
+    palette: &Palette,
+    wrap_width: f32,
+) -> LayoutJob {
+    let styles = char_styles(text, runs, heights);
     let mut job = LayoutJob {
         text: text.to_owned(),
         ..LayoutJob::default()
@@ -991,8 +1171,12 @@ mod tests {
         *Theme::new(theme::Flavor::Latte).palette()
     }
 
+    fn job(text: &str) -> LayoutJob {
+        layout_job(text, &style_runs(text), &HashMap::new(), &palette(), 400.0)
+    }
+
     fn sections(text: &str) -> Vec<(std::ops::Range<usize>, f32, f32)> {
-        let job = layout_job(text, &style_runs(text), &palette(), 400.0);
+        let job = job(text);
         job.sections
             .iter()
             .map(|s| {
@@ -1014,7 +1198,7 @@ mod tests {
     #[test]
     fn heading_scales_and_marker_dims() {
         let text = "# Hi\nbody";
-        let job = layout_job(text, &style_runs(text), &palette(), 400.0);
+        let job = job(text);
         let marker = &job.sections[0];
         assert_eq!(marker.byte_range, ByteIndex(0)..ByteIndex(1));
         assert_eq!(marker.format.color, palette().muted);
@@ -1041,7 +1225,7 @@ mod tests {
     #[test]
     fn sections_cover_text_in_order_with_multibyte() {
         let text = "héllo **wörld** `c`\n> q\n";
-        let job = layout_job(text, &style_runs(text), &palette(), 400.0);
+        let job = job(text);
         let mut at = 0;
         for s in &job.sections {
             assert_eq!(s.byte_range.start.0, at);
@@ -1071,8 +1255,70 @@ mod tests {
             end: 99,
             kind: StyleKind::Strong,
         }];
-        let styles = char_styles("abc", &runs);
+        let styles = char_styles("abc", &runs, &HashMap::new());
         assert_eq!(styles.len(), 3);
         assert_eq!(styles[2].color, Role::Strong);
+    }
+
+    const SKETCH: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+    fn embed_text() -> String {
+        format!("a\n![sketch](krabink://sketch/{SKETCH})\nb\n")
+    }
+
+    #[test]
+    fn embed_section_is_hidden_small_and_tall() {
+        let text = embed_text();
+        let sketch: SketchId = SKETCH.parse().unwrap();
+        let heights = HashMap::from([(sketch, 240.0)]);
+        let job = layout_job(&text, &style_runs(&text), &heights, &palette(), 400.0);
+        let embed = job
+            .sections
+            .iter()
+            .find(|s| s.byte_range.start.0 == 2)
+            .unwrap();
+        assert_eq!(embed.byte_range.end.0, 2 + 10 + 17 + 26 + 1);
+        assert_eq!(embed.format.color, egui::Color32::TRANSPARENT);
+        assert_eq!(embed.format.font_id.size, EMBED_FONT_SIZE);
+        assert_eq!(embed.format.line_height, Some(240.0));
+        assert_eq!(embed.format.valign, egui::Align::TOP);
+        assert_eq!(embed.format.underline, egui::Stroke::NONE);
+        // Unknown container: the minimum height.
+        let job = layout_job(
+            &text,
+            &style_runs(&text),
+            &HashMap::new(),
+            &palette(),
+            400.0,
+        );
+        let embed = job
+            .sections
+            .iter()
+            .find(|s| s.byte_range.start.0 == 2)
+            .unwrap();
+        assert_eq!(embed.format.line_height, Some(INLINE_MIN_HEIGHT));
+        // Body rows keep the font's height.
+        assert_eq!(job.sections[0].format.line_height, None);
+        assert_eq!(job.sections[0].format.valign, egui::Align::Center);
+    }
+
+    #[test]
+    fn embeds_are_listed_in_text_order() {
+        let text = format!("{}![again](krabink://sketch/{SKETCH})\n", embed_text());
+        let embeds = embeds_of(&style_runs(&text));
+        assert_eq!(embeds, vec![(SKETCH.parse().unwrap(), 2)]);
+        assert!(embeds_of(&style_runs("plain\n")).is_empty());
+    }
+
+    #[test]
+    fn inline_box_origin_is_inset_by_the_padding() {
+        let b = InlineBox {
+            sketch: SKETCH.parse().unwrap(),
+            rect: egui::Rect::from_min_size(egui::pos2(0.0, 30.0), egui::vec2(500.0, 160.0)),
+        };
+        assert_eq!(
+            b.origin(),
+            egui::vec2(INLINE_PADDING, 30.0 + INLINE_PADDING)
+        );
     }
 }

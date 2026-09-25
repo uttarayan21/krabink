@@ -5,10 +5,16 @@
 //! the camera follows the scroll; every element sits at its line's origin
 //! from the editor's [`PageLayout`], so ink moves with the text.
 //!
+//! Two committed layers share the scene. Inline sketches (the note's
+//! sketch containers, one box each in the text flow) sit at their box's
+//! origin from the same [`PageLayout`]; the page (overlay) layer sits at
+//! its lines' origins above them.
+//!
 //! Committed CRDT strokes become ink meshes drawn with [`InkMaterial`];
 //! wet ink from the ephemeral channel renders as provisional meshes on top
 //! and is dropped once the authoritative stroke lands (or after a timeout).
-//! Draw order is z order: committed element `k` sits at `k / 100`, remote
+//! Draw order is z order: inline element `k` sits at `k / 100` (capped at
+//! 400), overlay element `k` at `500 + k / 100` (capped at 980), remote
 //! wet stroke `j` at `990 + j / 100`, and the ink pipeline writes depth.
 //!
 //! Peers' pens show as pointers above everything: the tip's footprint at
@@ -33,7 +39,7 @@ use bevy::render::storage::ShaderBuffer;
 use bevy_egui::{EguiTextureHandle, EguiUserTextures, egui};
 use krabink_core::{
     Anchor, BrushSpec, DEFAULT_TOLERANCE, DeviceId, DocKey, ElementId, Ink, InkMesh, InkStyle,
-    NoteDoc, NoteId, Rgba, StrokeEnd, StrokeId, StrokePoint, Tool, WetInk,
+    NoteDoc, NoteId, Rgba, SketchId, StrokeEnd, StrokeId, StrokePoint, Tool, WetInk,
 };
 
 use crate::docs::{Docs, now_ms};
@@ -58,6 +64,12 @@ const OVERSCAN: f32 = 256.0;
 const LAYER: usize = 1;
 /// z spacing between consecutive strokes.
 const Z_STEP: f32 = 0.01;
+/// Inline elements never reach this z.
+const INLINE_Z_MAX: f32 = 400.0;
+/// Overlay elements start here, above every inline one.
+const OVERLAY_Z_BASE: f32 = 500.0;
+/// Overlay elements never reach this z (below the wet band).
+const OVERLAY_Z_MAX: f32 = 980.0;
 /// Remote wet strokes sit above every committed element.
 const WET_Z_BASE: f32 = 990.0;
 /// Wet z slots wrap here so they stay under the pointers and the camera's
@@ -108,9 +120,16 @@ struct InkEntity {
     z: f32,
 }
 
+/// Where a wet stroke lands: a line of the page layer or an inline box.
+enum WetPlacement {
+    Line(Anchor),
+    Sketch(SketchId),
+}
+
 struct WetStroke {
-    anchor: Anchor,
+    placement: WetPlacement,
     /// Resolved when the entity spawns; refreshed on every layout change.
+    /// `None` until the placement is laid out (an inline box may not be).
     origin: Option<Vec2>,
     /// Spawned on the first batch with drawable geometry.
     drawn: Option<InkEntity>,
@@ -273,10 +292,16 @@ struct PageScene {
     assets_generation: u32,
     /// The `PageLayout` generation the elements were placed against.
     layout_generation: Option<u64>,
-    /// Committed element id → ink entity (`None` for elements with no ink).
+    /// Committed page (overlay) element id → ink entity (`None` for
+    /// elements with no ink).
     strokes: HashMap<ElementId, Option<InkEntity>>,
-    /// Committed elements spawned so far; the next one's z slot.
+    /// Committed inline element → ink entity, keyed by its sketch too so
+    /// a box vanishing drops its elements in one sweep.
+    inline: HashMap<(SketchId, ElementId), Option<InkEntity>>,
+    /// Committed overlay elements spawned so far; the next one's z slot.
     committed: u16,
+    /// Committed inline elements spawned so far; the next one's z slot.
+    inline_serial: u16,
     /// Next remote wet stroke's z slot.
     wet_serial: u16,
 }
@@ -290,6 +315,51 @@ struct PageScenes {
 }
 
 impl PageScenes {
+    /// A peer's pen went down: start collecting a wet stroke at
+    /// `placement`; its entity spawns with the first drawable batch.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the wet-ink begin frame's fields, threaded from one system"
+    )]
+    fn begin_wet(
+        &mut self,
+        commands: &mut Commands,
+        stroke: StrokeId,
+        placement: WetPlacement,
+        tool: Tool,
+        color: Rgba,
+        base_width: f32,
+        spec: Option<Vec<u8>>,
+    ) {
+        let spec = spec.and_then(|bytes| match BrushSpec::decode(&bytes) {
+            Ok(spec) => Some(spec),
+            Err(err) => {
+                tracing::warn!(%err, "unreadable wet-ink brush spec; using the preset");
+                None
+            }
+        });
+        if self.scene.is_none() {
+            return; // page not on screen yet; CRDT commit will cover it
+        }
+        self.despawn_wet(commands, stroke);
+        self.wet.insert(
+            stroke,
+            WetStroke {
+                placement,
+                origin: None,
+                drawn: None,
+                mesh: None,
+                tool,
+                color,
+                base_width,
+                spec,
+                points: Vec::new(),
+                last_seq: 0,
+                expires_ms: None,
+            },
+        );
+    }
+
     /// Drop a wet stroke's entity and free its style slot.
     fn despawn_wet(&mut self, commands: &mut Commands, id: StrokeId) {
         let Some(wet) = self.wet.remove(&id) else {
@@ -363,7 +433,12 @@ impl PageScenes {
             pointer.ring.clear(commands, None);
         }
         if let Some(scene) = self.scene.take() {
-            for drawn in scene.strokes.into_values().flatten() {
+            for drawn in scene
+                .strokes
+                .into_values()
+                .chain(scene.inline.into_values())
+                .flatten()
+            {
                 commands.entity(drawn.entity).despawn();
             }
             commands.entity(scene.target.camera).despawn();
@@ -431,6 +506,20 @@ fn to_egui(v: Vec2) -> egui::Vec2 {
 /// view's source map when that is what the galley shows).
 fn origin_of(layout: &PageLayout, galley: &egui::Galley, note: &NoteDoc, anchor: &Anchor) -> Vec2 {
     to_bevy(resolve_origin(galley, note, anchor, layout.source_map()))
+}
+
+/// Where a wet stroke's placement sits; `None` for an inline sketch whose
+/// box is not laid out (no embed line, or a later duplicate).
+fn wet_origin(
+    layout: &PageLayout,
+    galley: &egui::Galley,
+    note: &NoteDoc,
+    placement: &WetPlacement,
+) -> Option<Vec2> {
+    match placement {
+        WetPlacement::Line(anchor) => Some(origin_of(layout, galley, note, anchor)),
+        WetPlacement::Sketch(sketch) => layout.box_origin(*sketch).map(to_bevy),
+    }
 }
 
 /// The render target region for a visible galley `window`: the window
@@ -540,7 +629,9 @@ fn sync_page_scene(
             assets_generation: ink_assets.generation,
             layout_generation: None,
             strokes: HashMap::new(),
+            inline: HashMap::new(),
             committed: 0,
+            inline_serial: 0,
             wet_serial: 0,
         }
     });
@@ -575,7 +666,13 @@ fn sync_page_scene(
     if scene.assets_generation != ink_assets.generation {
         scene.assets_generation = ink_assets.generation;
         scene.palette.set_assets(&mut materials, &ink_assets);
-        for drawn in scene.strokes.drain().filter_map(|(_, d)| d) {
+        for drawn in scene
+            .strokes
+            .drain()
+            .map(|(_, d)| d)
+            .chain(scene.inline.drain().map(|(_, d)| d))
+            .flatten()
+        {
             commands.entity(drawn.entity).despawn();
             scene.palette.remove(drawn.slot);
         }
@@ -588,7 +685,47 @@ fn sync_page_scene(
     scene.layout_generation = Some(layout.generation);
     let tolerance = DEFAULT_TOLERANCE / layout.scale;
 
-    // Diff committed elements; re-place the ones that stay.
+    // Diff inline elements first (they sit under the overlay): every
+    // sketch with a box on screen, at the box's origin.
+    let mut stale: HashMap<_, _> = scene.inline.clone();
+    for b in &layout.boxes {
+        let Ok(elements) = note.elements(b.sketch) else {
+            continue; // embed line without a container: an empty box
+        };
+        let origin = to_bevy(b.origin());
+        for el in elements {
+            let key = (b.sketch, el.id());
+            if let Some(drawn) = stale.remove(&key) {
+                if let Some(drawn) = drawn {
+                    commands.entity(drawn.entity).insert(place(origin, drawn.z));
+                }
+                continue;
+            }
+            let z = inline_z(scene.inline_serial);
+            scene.inline_serial = scene.inline_serial.saturating_add(1);
+            let drawn = spawn_committed(
+                &mut commands,
+                &mut meshes,
+                scene,
+                &ink_assets,
+                &el,
+                origin,
+                z,
+                tolerance,
+            );
+            scene.inline.insert(key, drawn);
+            drop_wet_preview(&mut commands, scene, wet, el.id());
+        }
+    }
+    for (key, drawn) in stale {
+        if let Some(drawn) = drawn {
+            commands.entity(drawn.entity).despawn();
+            scene.palette.remove(drawn.slot);
+        }
+        scene.inline.remove(&key);
+    }
+
+    // Then the overlay: re-place the elements that stay.
     let mut stale: HashMap<_, _> = scene.strokes.clone();
     for el in note.page_elements() {
         let id = el.element.id();
@@ -603,34 +740,20 @@ fn sync_page_scene(
             }
             continue;
         }
-        let outline = el.element.outline();
-        let drawn = ink_mesh(&el.element.ink(), &outline, StrokeEnd::Complete, tolerance).map(
-            |(mesh, style)| {
-                let slot = scene.palette.insert(&style, &ink_assets);
-                let z = committed_z(scene.committed);
-                scene.committed = scene.committed.saturating_add(1);
-                let (tag, material) = scene.palette.components(slot);
-                let entity = commands
-                    .spawn((
-                        Mesh2d(meshes.add(mesh)),
-                        material,
-                        tag,
-                        place(origin, z),
-                        RenderLayers::layer(LAYER),
-                    ))
-                    .id();
-                InkEntity { entity, slot, z }
-            },
+        let z = committed_z(scene.committed);
+        scene.committed = scene.committed.saturating_add(1);
+        let drawn = spawn_committed(
+            &mut commands,
+            &mut meshes,
+            scene,
+            &ink_assets,
+            &el.element,
+            origin,
+            z,
+            tolerance,
         );
         scene.strokes.insert(id, drawn);
-        // A committed element (stroke or snapped shape) replaces its
-        // wet-ink preview.
-        if let Some(wet) = wet.remove(&id)
-            && let Some(drawn) = wet.drawn
-        {
-            commands.entity(drawn.entity).despawn();
-            scene.palette.remove(drawn.slot);
-        }
+        drop_wet_preview(&mut commands, scene, wet, id);
     }
     for (id, drawn) in stale {
         if let Some(drawn) = drawn {
@@ -640,9 +763,11 @@ fn sync_page_scene(
         scene.strokes.remove(&id);
     }
 
-    // Wet strokes and pointers follow their lines too.
+    // Wet strokes and pointers follow their lines and boxes too.
     for wet in wet.values_mut() {
-        let origin = origin_of(&layout, galley, note, &wet.anchor);
+        let Some(origin) = wet_origin(&layout, galley, note, &wet.placement) else {
+            continue; // box not laid out: keep the last origin, if any
+        };
         wet.origin = Some(origin);
         if let Some(drawn) = wet.drawn {
             commands.entity(drawn.entity).insert(place(origin, drawn.z));
@@ -652,6 +777,54 @@ fn sync_page_scene(
         let origin = origin_of(&layout, galley, note, &pointer.anchor);
         pointer.dab.replace(&mut commands, origin);
         pointer.ring.replace(&mut commands, origin);
+    }
+}
+
+/// Spawn a committed element's ink at `origin` and `z`; `None` when it
+/// has no drawable geometry.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every ECS handle a spawn needs, threaded from one system"
+)]
+fn spawn_committed(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    scene: &mut PageScene,
+    ink_assets: &InkAssets,
+    element: &krabink_core::Element,
+    origin: Vec2,
+    z: f32,
+    tolerance: f32,
+) -> Option<InkEntity> {
+    let outline = element.outline();
+    let (mesh, style) = ink_mesh(&element.ink(), &outline, StrokeEnd::Complete, tolerance)?;
+    let slot = scene.palette.insert(&style, ink_assets);
+    let (tag, material) = scene.palette.components(slot);
+    let entity = commands
+        .spawn((
+            Mesh2d(meshes.add(mesh)),
+            material,
+            tag,
+            place(origin, z),
+            RenderLayers::layer(LAYER),
+        ))
+        .id();
+    Some(InkEntity { entity, slot, z })
+}
+
+/// A committed element (stroke or snapped shape) replaces its wet-ink
+/// preview, which shares its id.
+fn drop_wet_preview(
+    commands: &mut Commands,
+    scene: &mut PageScene,
+    wet: &mut HashMap<StrokeId, WetStroke>,
+    id: ElementId,
+) {
+    if let Some(wet) = wet.remove(&id)
+        && let Some(drawn) = wet.drawn
+    {
+        commands.entity(drawn.entity).despawn();
+        scene.palette.remove(drawn.slot);
     }
 }
 
@@ -666,9 +839,14 @@ fn flush_palettes(
     }
 }
 
-/// z of the `k`th committed element; saturates far below the wet band.
+/// z of the `k`th committed overlay element; capped below the wet band.
 fn committed_z(k: u16) -> f32 {
-    f32::from(k) * Z_STEP
+    (OVERLAY_Z_BASE + f32::from(k) * Z_STEP).min(OVERLAY_Z_MAX)
+}
+
+/// z of the `k`th committed inline element; capped below the overlay.
+fn inline_z(k: u16) -> f32 {
+    (f32::from(k) * Z_STEP).min(INLINE_Z_MAX)
 }
 
 /// z of the `j`th remote wet stroke, above every committed element.
@@ -894,35 +1072,31 @@ fn apply_wet_ink(
                 color,
                 base_width,
                 spec,
-            } => {
-                let spec = spec.and_then(|bytes| match BrushSpec::decode(&bytes) {
-                    Ok(spec) => Some(spec),
-                    Err(err) => {
-                        tracing::warn!(%err, "unreadable wet-ink brush spec; using the preset");
-                        None
-                    }
-                });
-                if scenes.scene.is_none() {
-                    continue; // page not on screen yet; CRDT commit will cover it
-                }
-                scenes.despawn_wet(&mut commands, stroke);
-                scenes.wet.insert(
-                    stroke,
-                    WetStroke {
-                        anchor: Anchor(anchor),
-                        origin: None,
-                        drawn: None,
-                        mesh: None,
-                        tool,
-                        color,
-                        base_width,
-                        spec,
-                        points: Vec::new(),
-                        last_seq: 0,
-                        expires_ms: None,
-                    },
-                );
-            }
+            } => scenes.begin_wet(
+                &mut commands,
+                stroke,
+                WetPlacement::Line(Anchor(anchor)),
+                tool,
+                color,
+                base_width,
+                spec,
+            ),
+            WetInk::Begin {
+                sketch,
+                stroke,
+                tool,
+                color,
+                base_width,
+                spec,
+            } => scenes.begin_wet(
+                &mut commands,
+                stroke,
+                WetPlacement::Sketch(sketch),
+                tool,
+                color,
+                base_width,
+                spec,
+            ),
             WetInk::Points {
                 stroke,
                 seq,
@@ -961,9 +1135,12 @@ fn apply_wet_ink(
                         else {
                             continue; // page went away; the commit will cover it
                         };
-                        let origin = *wet
-                            .origin
-                            .get_or_insert_with(|| origin_of(&layout, galley, note, &wet.anchor));
+                        if wet.origin.is_none() {
+                            wet.origin = wet_origin(&layout, galley, note, &wet.placement);
+                        }
+                        let Some(origin) = wet.origin else {
+                            continue; // inline box not laid out; the commit will cover it
+                        };
                         let slot = scene.palette.insert(&style, &ink_assets);
                         let z = wet_z(scene.wet_serial);
                         scene.wet_serial = (scene.wet_serial + 1) % WET_Z_SLOTS;
@@ -1042,11 +1219,9 @@ fn apply_wet_ink(
                 );
             }
             WetInk::PointerAnchoredGone => scenes.despawn_pointer(&mut commands, frame.from),
-            // Embedded sketches are no longer shown on the desktop.
-            WetInk::Begin { sketch, .. } | WetInk::Pointer { sketch, .. } => {
-                tracing::debug!(%sketch, "sketch-keyed wet ink ignored");
-            }
-            WetInk::PointerGone { .. } => {}
+            // Pens inside inline boxes report `PointerAnchored` with the
+            // embed line's anchor; sketch-keyed pointers are legacy.
+            WetInk::Pointer { .. } | WetInk::PointerGone { .. } => {}
         }
     }
 
@@ -1125,5 +1300,14 @@ mod tests {
     fn placement_negates_y_only() {
         let t = place(Vec2::new(3.0, 7.0), 0.5);
         assert_eq!(t.translation, Vec3::new(3.0, -7.0, 0.5));
+    }
+
+    #[test]
+    fn z_bands_never_overlap() {
+        assert!(inline_z(u16::MAX) < committed_z(0));
+        assert!(committed_z(u16::MAX) < WET_Z_BASE);
+        assert!(wet_z(WET_Z_SLOTS - 1) < POINTER_DAB_Z);
+        assert!(inline_z(1) > inline_z(0));
+        assert!(committed_z(1) > committed_z(0));
     }
 }
