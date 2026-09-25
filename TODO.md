@@ -16,7 +16,8 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
 - [ ] Publish `{endpoint_id, relay}` in `DeviceMeta` so nodes dial every
       workspace device without pairwise QRs (today: scanner dials QR owner,
       everyone dials the replica).
-- [ ] Desktop-side drawing (page ink is view-only on desktop).
+- [ ] Desktop-side drawing (both ink layers are view-only on desktop; no
+      insert-sketch there either).
 - [ ] Page ink export: group `page_elements()` by resolved line and emit
       an SVG after each paragraph (`export.rs` skips page ink today).
 - [ ] Transparent ink overlay above the text (premultiplied output; the
@@ -54,8 +55,13 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
 - [ ] Ink anchors are per source line, first fragment: ink on a wrapped
       continuation drifts when the width changes (iPad and desktop widths
       differ).
-- [ ] Old `krabink://sketch/` embeds stay as plain styled text; the sketch
-      data is never shown.
+- [ ] Inline sketch ink is not clipped to its box: an old full-screen
+      sketch gives a tall box with ink wider than the text. Also: an embed
+      must be alone on its line, a repeated id shows one box, the box
+      height depends on decodable brush specs (a build without the spec
+      lays the text below out differently), and on the desktop a
+      container narrower than ~200 pt wraps the hidden embed line and
+      doubles the box.
 - [ ] Reading view renders no images or tables (source shows through).
 - [ ] Wet ink carries no per-point size yet; receivers (desktop and iPad, same
       ribbon code) fall back to `base_width * force` until the commit lands.

@@ -64,11 +64,18 @@ sits above it.
   with `add_page_stroke` / `add_page_shape` / `remove_page_element` /
   `page_len` beside it. Element points are stored relative to `(text
   container left edge, top of the line's first fragment)` at a 16 pt body
-  font on every platform. The legacy `sketches` container (per-sketch
-  element lists under `strokes`, `create_sketch`, `elements(sketch)`)
-  stays readable for old notes and the exporter but nothing writes it.
-  Text splice, title and the CRDT triad `version`,
-  `export_updates_since`, `import_update`, `export_snapshot` as before.
+  font on every platform. The `sketches` container (per-sketch element
+  lists under `strokes`: `create_sketch`, `sketch_ids`, `elements(sketch)`,
+  `sketch_len`, `add_stroke` / `add_shape` / `remove_element`) is the
+  **inline** layer: a sketch shown as a box in the text flow at its
+  `![…](krabink://sketch/<id>)` line, drawn in place, points relative to
+  the box's padded corner. `inline.rs` fixes the box contract:
+  `INLINE_PADDING` (8), `INLINE_MIN_HEIGHT` (160) and
+  `sketch_box_height(elements) = max(min, ceil(max_y of the outlines +
+  2·padding))`, so every platform lays the same box out for the same
+  elements (`outline_bounds` is shared with the exporter). Text splice,
+  title and the CRDT triad `version`, `export_updates_since`,
+  `import_update`, `export_snapshot` as before.
 - `WorkspaceDoc` (`workspace.rs`): registry of notes (`NoteMeta`) and paired
   devices (`DeviceMeta`) so the library UI never opens every note.
 - `SyncDoc` (`sync_doc.rs`): semantics-free import/export/version; what the
@@ -229,6 +236,17 @@ map (one sentinel past the end) and the runs remapped onto the display
 text. Both platforms translate ink anchors through `source_of` so the
 same ink sits on the same line in either view.
 
+`SketchEmbed { sketch }` marks an inline sketch: an image whose URL is
+`krabink://sketch/` plus a 26-char ULID, alone on its source line (only
+whitespace around it), for the first occurrence of that id. It is one
+run over the whole `![…](…)` span and never hosts `Marker` or `Link`
+runs, so both editors hide the line as a unit. Anything else (a bare
+URI, an embed sharing its line, a repeat of an id, a malformed id) stays
+a `Link` with markers. The rule lives in the core so the two apps show
+a box for exactly the same lines. `preview_text` needs nothing extra:
+no char of an embed is dropped, the line survives and the run is
+remapped 1:1, so the box exists in the reading view too.
+
 ## 4. Sync node (`krabink-local`) and cloud (`krabink-server`)
 
 Every device runs one `krabink_local::Node`: an iroh `Endpoint` with a
@@ -280,10 +298,18 @@ Bevy app with egui UI. Modules:
   prefix/suffix diffing on `changed()`. A "Preview" slide switch swaps the
   buffer for `preview_text` in the same read-only `TextEdit`
   (`PreviewCache`). Each frame the open note writes a `PageLayout`
-  resource: the galley, the visible window, and every page element's
+  resource: the galley, the visible window, every page element's
   origin (`resolve_anchor` → `pos_from_cursor`, translated through the
   preview's source map when it is showing; unresolvable anchors go to the
-  end of the text). The page texture is painted under the text at the
+  end of the text) and the inline boxes. An embed run is laid out as
+  transparent 8 pt text on a row `line_height` = box height (glyphs
+  top-aligned), so the box takes its place in the flow; `BoxHeights`
+  caches `sketch_box_height` per sketch on the doc version, re-measuring
+  only sketches whose element count moved. Right after the `TextEdit`
+  lays out, `inline_boxes` reads each embed's row top and the frame
+  (hairline border, "sketch" caption) is painted with the egui painter
+  above the text; `PageLayout.boxes` / `box_origin` hand the padded
+  corner to the scene. The page texture is painted under the text at the
   scrolled rect. `settings.rs`: sync state, devices, pairing QR,
   paste-to-join.
 - `sketch.rs`: the page ink is one off-screen Bevy scene (own render layer
@@ -292,12 +318,17 @@ Bevy app with egui UI. Modules:
   paper colour as its opaque clear colour, so the marker's multiply blend
   has paper to multiply against. Element meshes are built once in anchor
   space and only their `Transform` moves when `PageLayout` changes.
-  Committed elements sit at z `k/100`; remote wet strokes at `990 + j/100`
-  (900 slots) are dropped when the commit lands or on timeout. Peers' pens
+  Two committed layers: inline elements (one per box the layout reports,
+  placed at the box origin, despawned when the embed line goes) at z
+  `k/100` capped at 400, overlay elements at `500 + k/100` capped at
+  980; remote wet strokes at `990 + j/100` (900 slots) are dropped when
+  the commit lands or on timeout. A wet stroke carries a `WetPlacement`
+  (`Line(anchor)` from `BeginAnchored`, `Sketch(id)` from `Begin`) and is
+  skipped while its line or box is not laid out. Peers' pens
   draw above that at 999.2 (the tool's hover dab, faint hovering /
   stronger drawing) and 999.4 (a monoline ring in a per-device hue); a
   pointer dies on `PointerAnchoredGone` or after 1.5 s of silence. The
-  desktop shows page ink; it does not draw.
+  desktop shows both layers; it does not draw and cannot insert a sketch.
 - `lab.rs`: `krabink brush-lab --corpus <file|dir> --presets … --models
   ema,ism --out dir --svg --metrics`, the tuning bench: SVG grids per
   recording through `elements_to_svg` and `metrics.json` from
@@ -333,13 +364,21 @@ UniFFI proc macros (`uniffi::setup_scaffolding!("krabink")`), no UDL.
   `append_points` / `finish_page_stroke` / `cancel_stroke`,
   `finish_page_shape`, `erase_page_at` (one probe per element, in that
   element's anchor space, hit-tested in the core), `remove_page_element`,
-  `send_page_pointer` / `send_page_pointer_gone`). Events come back
-  through the foreign traits `CoreListener` (`notes_changed`,
-  `brushes_changed`, `assets_changed`, `devices_changed`, `sync_state`)
-  and `NoteListener` (`synced`, `text_changed`, `page_changed`,
-  `wet_begin_anchored` / `wet_points` / `wet_end` / `wet_cancel`).
-  `page_changed` fires when an import changes the page list's length
-  (elements are only ever added or removed whole). `Core` also owns the shared
+  `send_page_pointer` / `send_page_pointer_gone`; inline sketches:
+  `sketch_ids`, `create_sketch`, `elements(sketch)`,
+  `sketch_box_height(sketch)` (the minimum for an unknown container),
+  `begin_stroke(sketch, …)` (streams `WetInk::Begin`), `finish_stroke` /
+  `finish_shape`, `erase_at(sketch, x, y, radius)`, `remove_element`).
+  Events come back through the foreign traits `CoreListener`
+  (`notes_changed`, `brushes_changed`, `assets_changed`,
+  `devices_changed`, `sync_state`) and `NoteListener` (`synced`,
+  `text_changed`, `page_changed`, `strokes_changed(sketch)`, `wet_begin`
+  (inline) / `wet_begin_anchored` (overlay) / `wet_points` / `wet_end` /
+  `wet_cancel`). `page_changed` fires when an import changes the page
+  list's length, `strokes_changed` when a sketch's element-list length
+  moves (`sketch_len` diffed per sketch around the import; a container
+  arriving fires once at length 0, before its first stroke lands).
+  Elements are only ever added or removed whole. `Core` also owns the shared
   brush library (`list_brushes` / `upsert_brush` / `remove_brush`) and
   asset library (`list_assets` / `put_asset` / `remove_asset`) next to
   `builtin_brushes()`, `builtin_assets()` and the `brush_knobs` /
@@ -357,14 +396,18 @@ UniFFI proc macros (`uniffi::setup_scaffolding!("krabink")`), no UDL.
   (`INK_VERTEX_FLOATS` floats per vertex) rather than element-wise lifts,
   which is what made 1000-point live strokes redraw in under 2 ms.
 - `markdown.rs`: `style_runs` and `preview_text` as free functions with
-  `StyleRun` / `StyleKind` / `PreviewText` records.
+  `StyleRun` / `StyleKind` (`SketchEmbed { sketch: String }`) /
+  `PreviewText` records, plus `inline_padding()` / `inline_min_height()`
+  (UniFFI cannot export constants).
 - `types.rs`: Swift-facing records and enums mirroring the core
   (`PageElement`, `PageProbe` among them).
 - `tests/engine.rs`: local persistence, two-client round trips (direct and
   through the real relay router) including page ink and anchored wet ink,
-  eraser probes, style runs. `examples/probe.rs` is the UI-test harness's
-  remote peer: `--expect`, `--append`, `--add-page-stroke LINE`,
-  `--expect-page-elements N`, `--wet-watch`, `--devices`.
+  inline sketches (wet begin, `strokes_changed`, equal box heights,
+  erase), eraser probes, style runs. `examples/probe.rs` is the UI-test
+  harness's remote peer: `--expect`, `--append`, `--add-page-stroke LINE`,
+  `--expect-page-elements N`, `--add-sketch-stroke EMBED` (nth embed in
+  text order), `--expect-sketch-elements N`, `--wet-watch`, `--devices`.
 
 Build: `scripts/build-ios-core.sh` builds `staticlib` for
 `aarch64-apple-ios` and `aarch64-apple-ios-sim`, runs library-mode bindgen
@@ -382,8 +425,11 @@ Bonjour usage strings, file sharing for recordings).
   list and one `NoteModel` per open note (each with its `PageInkModel`,
   cached with the note). Listener callbacks arrive on the Rust network
   thread and hop to the main actor. `NoteDetail` is the note page on a
-  card with an Edit / Preview toggle, erase-last, and on iOS 17 a brush
-  sheet. `-spike 1` and `-brushLab 1` replace the main UI.
+  card with an Edit / Preview toggle, insert-sketch (`newSketch`:
+  `createSketch` first, its own commit, then the embed line spliced
+  after the caret's line through `applyTextEdit`, flowing into the view
+  like a remote edit; disabled in preview), erase-last, and on iOS 17 a
+  brush sheet. `-spike 1` and `-brushLab 1` replace the main UI.
 - `NoteCanvasView.swift`: the one surface per note. A TextKit 1
   `UITextView` (`usingTextLayoutManager: false`: eager, deterministic line
   fragments) over an opaque Metal view cleared to the paper colour, so
@@ -401,7 +447,17 @@ Bonjour usage strings, file sharing for recordings).
   `sourceOf` map so the ink model only ever sees source scalars.
   `MarkdownStyler.swift`: applies the core's style runs as TextKit
   attributes over the whole text after every edit (attribute-only edits
-  do not fire `textViewDidChange` or move the selection).
+  do not fire `textViewDidChange` or move the selection). A `SketchEmbed`
+  run becomes a hidden row: 8 pt clear glyphs, paragraph line height
+  pinned to the sketch's box height, `.byClipping`. The canvas caches
+  `sketchBoxHeight` per sketch (dropped when that sketch changes), and
+  once each layout settles measures the boxes (`LineLayout.inlineBoxes`:
+  x = the ink origin's left edge, top = the embed row's first fragment,
+  width = the container's, height from the cache) and frames them with
+  `InlineBoxOverlay`, a non-interactive subview of the text view (one
+  `CAShapeLayer` border and `CATextLayer` "sketch" caption per box)
+  drawn above ink and text. The caret's source scalar is reported to the
+  model on every selection change.
 - `SettingsScreen.swift`, `PairScreen.swift`, `ScanScreen.swift`,
   `PeerDiscovery.swift`: peers and routes, device registry, pairing QR out
   and in (VisionKit), Bonjour lookup (`_krabink._udp`, UDP resolve) of the
@@ -414,20 +470,35 @@ Bonjour usage strings, file sharing for recordings).
   (a short, still touch is a tap for the caret; two fingers scroll).
   `StrokeRecorder` writes recorder v2 files under Documents when launched
   with `-recordStrokes 1`.
-- `PageInkModel.swift`: pen-down asks the layout for the line under the
-  pen, takes an anchor for it and translates every sample into that
-  line's space; it feeds the core `BrushModeler`, streams wet batches
+- `PageInkModel.swift`: pen-down tests the inline boxes first
+  (`inlineBox(at:)`, a rect test, since the paragraph spacing under the
+  embed row still maps to that line) and otherwise asks the layout for
+  the line under the pen; the stroke's `Placement` (`.sketch(id)` with
+  the box's padded corner as origin, or `.line(anchor)`) picks the
+  sketch-keyed or the page calls for begin, commit and wet streaming.
+  Every sample is translated into that space; it feeds the core
+  `BrushModeler`, streams wet batches
   every 60 ms, draws the live mesh from `liveMesh`, coalesces estimate
   redraws to one per run-loop pass, waits up to a settle timeout for
   pending estimates before commit, arms draw-and-hold for shape snapping
   with a haptic, resizes a snapped shape on drag, erases by hit-testing
-  elements in the core (one probe per element in reach), and shows the
-  hover dab from a `UIHoverGestureRecognizer`. `layoutChanged()` (coalesced
+  elements in the core (one probe per overlay element in reach, plus
+  `eraseAt` for every box the eraser reaches into), and shows the hover
+  dab from a `UIHoverGestureRecognizer`. `layoutChanged()` (coalesced
   from `NSLayoutManagerDelegate`) re-resolves every anchor and moves the
   placed, wet, settling and live ink to its line's new origin, so ink
-  follows its line while typing above it. Remote wet ink and `pageChanged`
-  diffs are deferred while a local pen is down. The status line the UI
-  tests read: `strokes= shapes= wetSent= wetRecv= est= custom= originY=`.
+  follows its line while typing above it, then `syncInline()` loads the
+  sketches whose box appeared, moves the ones still there and drops the
+  ones whose box went (their data stays in the note). Inline elements are
+  shown below the overlay (z re-assigned inline-first after any change).
+  Erase-last takes the newest element of either layer by `createdMs`.
+  An inline wet stroke whose box is not on the page is dropped until its
+  commit lands; while drawing inline, the pointer still rides the embed
+  line's anchor. Remote wet ink, `pageChanged` diffs and
+  `strokesChanged` reloads are deferred while a local pen is down. The
+  status line the UI tests read: `strokes= shapes= wetSent= wetRecv=
+  est= custom= originY= inline= boxY=` (`strokes=` counts the overlay
+  only; `inline=` every box's elements; `boxY=` the first box's page y).
 - `StrokeCodec.swift`: the PencilKit tool picker maps onto core presets
   (pen, pencil, marker, monoline, fountain; crayon → the bundled
   `builtin:crayon` at 1.5× width; watercolour → marker at 0.6 opacity) or,
@@ -472,7 +543,10 @@ hold-to-shape, custom brush round trip, reopen keeps strokes, sidebar
 title, delete, bulk delete), `StyledEditorUITests` (source text preserved,
 ink follows its line when a heading above it changes),
 `PreviewUITests` (reading view hides markers and keeps the source),
-`SyncUITests`, `PairUITests`, `SpikeUITests`, `DeviceSpikeUITests`.
+`InlineSketchUITests` (insert a sketch, draw inside it and below it,
+erase-last across layers, the box follows text typed above it, inline
+ink survives reopening, the reading view keeps the box), `SyncUITests`,
+`PairUITests`, `SpikeUITests`, `DeviceSpikeUITests`.
 
 ## 8. The shared rendering contract
 
@@ -485,6 +559,14 @@ linear-light premultiplied blending. Write-once ink is the depth trick: a
 stroke's own later fragments at a sample fail the depth test, later strokes
 sit strictly nearer and blend over. Any change to one shader is made to the
 other in the same commit.
+
+Inline sketch boxes share one geometry contract too: the box's top is the
+top of the embed line's first fragment (the same rule as an overlay
+anchor), its left edge is the ink origin's x, the sketch's (0, 0) is that
+corner inset by `INLINE_PADDING` on both axes, and the height is the
+core's `sketch_box_height` of the committed elements (recomputed on
+commit or remote change, never mid-stroke; grows downward only). Width,
+caption and paragraph spacing are cosmetic and may differ per platform.
 
 ## 9. Building and verifying
 
@@ -555,10 +637,19 @@ draws and types, the desktop shows page ink read-only. Known limits:
   differ.
 - Inserting a newline exactly at a line start moves that line's ink down;
   typing elsewhere on the line does not.
-- Old `krabink://sketch/` notes: the embed line stays as styled text and
-  the sketch data stays in the doc, unread by either app.
-- Page ink is not exported; the desktop does not draw; the iPad does not
-  show peers' pointers.
+- Inline sketches (`![…](krabink://sketch/<id>)`, the legacy `sketches`
+  container) are boxes in the text flow, drawn in place on the iPad,
+  view-only on the desktop; they export to SVG as before. Ink is not
+  clipped to its box, so an old full-screen sketch gives a tall box with
+  ink wider than the text. An embed must be alone on its line; a repeat
+  of an id is plain link text; deleting the line hides the box (data
+  kept). The box height depends on decodable brush specs: a build that
+  cannot decode a custom spec lays the text below out differently
+  (stored coordinates are unaffected). On the desktop a container
+  narrower than about 200 pt wraps the hidden embed line and doubles the
+  box.
+- Page ink (the overlay) is not exported; the desktop does not draw or
+  insert sketches; the iPad does not show peers' pointers.
 - The reading view is the source with markers hidden: tables and raw
   HTML show as source, images are not rendered.
 - The ink layer is opaque paper under the text (a transparent overlay
