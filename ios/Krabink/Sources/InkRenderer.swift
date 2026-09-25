@@ -538,7 +538,8 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     }
 
     /// The clear colour for a UIKit background: the framebuffer is sRGB,
-    /// Metal takes clear values in linear light.
+    /// Metal takes clear values in linear light, premultiplied, so
+    /// `.clear` clears to transparent (tool icons) rather than black.
     ///
     /// Pass [`UIColor.paper`] for the page so both devices draw on the
     /// same colour.
@@ -548,11 +549,12 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         var b: CGFloat = 0
         var a: CGFloat = 0
         color.resolvedColor(with: trait).getRed(&r, green: &g, blue: &b, alpha: &a)
+        let alpha = Double(a)
         func linear(_ c: CGFloat) -> Double {
             let c = Double(c)
-            return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+            return (c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)) * alpha
         }
-        return MTLClearColor(red: linear(r), green: linear(g), blue: linear(b), alpha: 1)
+        return MTLClearColor(red: linear(r), green: linear(g), blue: linear(b), alpha: alpha)
     }
 
     /// Is this paper dark enough that a highlighter should screen rather

@@ -524,7 +524,8 @@ Bonjour usage strings, file sharing for recordings).
   autosaves under `sketch`.
 - `BrushLibrary.swift` + `BrushAttributesView.swift`: bundled brushes plus
   the workspace's (`brushesChanged`), one custom picker item each with the
-  brush drawn as its icon and width swatches, and a popover of `BrushKnobs`
+  brush drawn as its icon and width swatches (not added to the picker for
+  now: `makePicker` lists PencilKit's tools only), and a popover of `BrushKnobs`
   sliders, tip-mask and paper menus and picture import, persisted per
   brush in `UserDefaults` (`brush.<id>.knobs|mask|grain`).
 - `InkAssets.swift`: the mask and grain `r8` texture arrays (mipmapped)
@@ -543,7 +544,8 @@ Bonjour usage strings, file sharing for recordings).
   Three pipelines: normal, multiply, screen. `darkPaper` (from the clear
   colour's linear luminance) swaps multiply for screen so a highlighter
   tints a black canvas instead of vanishing. Thumbnails render offscreen
-  through the same pipeline at 2× with MSAA 4.
+  through the same pipeline at 2× with MSAA 4; the clear colour keeps the
+  background's alpha (premultiplied), so tool icons clear to transparent.
 - `BrushLabScreen.swift`: preset grid (five tools × three widths from one
   canned stroke, EMA/ISM toggle), a PencilKit calibration page for the
   `widthScale` / `opacityScale` ratios (currently 1.0) and a corpus page

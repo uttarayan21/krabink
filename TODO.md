@@ -24,6 +24,9 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
       marker's multiply blend needs a different formulation) so ink can
       sit over text instead of under it.
 - [ ] Peers' pointers on the iPad (`PointerAnchored` is desktop-only).
+- [ ] Custom brush picker items (chalk, grainy pencil, workspace brushes)
+      are off: `makePicker` skips `BrushLibrary.pickerItems()` until the
+      icons read as tools and the colour follows dark mode like PencilKit's.
 
 ## Known debt
 

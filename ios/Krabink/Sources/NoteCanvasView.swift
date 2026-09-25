@@ -620,9 +620,10 @@ struct NoteCanvas: UIViewRepresentable {
                 PKToolPickerInkingItem(type: .monoline),
                 PKToolPickerInkingItem(type: .fountainPen),
                 PKToolPickerInkingItem(type: .crayon),
-            ] + BrushLibrary.shared.pickerItems() + [
                 PKToolPickerEraserItem(type: .vector),
             ])
+            // The library's custom items (`BrushLibrary.pickerItems()`)
+            // are off until their icons read as tools.
         } else {
             picker = PKToolPicker()
         }
