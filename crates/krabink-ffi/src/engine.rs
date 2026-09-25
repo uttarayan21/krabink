@@ -14,15 +14,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use krabink_core as pcore;
-use krabink_core::{DeviceId, DocKey, Flush, NoteId, NoteMeta, Store, WorkspaceDoc};
+use krabink_core::{DeviceId, DocKey, Flush, NoteId, NoteMeta, SketchId, Store, WorkspaceDoc};
 use krabink_local::{Node, NodeConfig, PeerKind, PeerTarget, RelayTarget, Role, direct_addrs};
 use tokio::sync::mpsc;
 
 use crate::brush::{AssetInfo, AssetKind};
 use crate::net::{self, Cmd};
 use crate::types::{
-    BrushInfo, DeviceInfo, NoteInfo, PageElement, PageProbe, PairInfo, PeerInfo, ShapeElement,
-    Stroke, StrokePoint, SyncState, Tilt, Tool, rgba_from_u32,
+    BrushInfo, DeviceInfo, Element, NoteInfo, PageElement, PageProbe, PairInfo, PeerInfo,
+    ShapeElement, Stroke, StrokePoint, SyncState, Tilt, Tool, rgba_from_u32,
 };
 
 /// Errors crossing the FFI boundary. Flattened to message-carrying variants;
@@ -66,20 +66,38 @@ pub trait CoreListener: Send + Sync {
     fn sync_state(&self, state: SyncState);
 }
 
-/// Per-note events. Text and page changes are coarse: re-read via
-/// [`NoteSession::text`] / [`NoteSession::page_elements`]. Wet-ink events
-/// mirror the ephemeral stream and never touch the CRDT; render them
-/// provisionally and drop the overlay when `page_changed` delivers the
-/// committed element (a stroke or a snapped shape) under the same id.
+/// Per-note events. Text, page and sketch changes are coarse: re-read via
+/// [`NoteSession::text`] / [`NoteSession::page_elements`] /
+/// [`NoteSession::elements`]. Wet-ink events mirror the ephemeral stream
+/// and never touch the CRDT; render them provisionally and drop the
+/// overlay when `page_changed` / `strokes_changed` delivers the committed
+/// element (a stroke or a snapped shape) under the same id.
 #[uniffi::export(foreign)]
 pub trait NoteListener: Send + Sync {
     /// Catch-up with the server finished; local edits now propagate live.
     /// Fires once per (re)connection.
     fn synced(&self);
     fn text_changed(&self, text: String);
-    /// The page ink layer changed (an element was added or removed by a
-    /// peer): re-read [`NoteSession::page_elements`].
+    /// The page (overlay) ink layer changed (an element was added or
+    /// removed by a peer): re-read [`NoteSession::page_elements`].
     fn page_changed(&self);
+    /// An inline sketch's elements changed (added or removed by a peer):
+    /// re-read [`NoteSession::elements`] and
+    /// [`NoteSession::sketch_box_height`] for that sketch.
+    fn strokes_changed(&self, sketch: String);
+    /// A peer's pen went down inside an inline sketch: the points that
+    /// follow are in that sketch's local space (its box origin). `spec` as
+    /// in [`Self::wet_begin_anchored`]. Drop the stroke when the sketch has
+    /// no box laid out yet; the commit arrives via `strokes_changed`.
+    fn wet_begin(
+        &self,
+        sketch: String,
+        stroke: String,
+        tool: Tool,
+        color: u32,
+        base_width: f32,
+        spec: Option<Vec<u8>>,
+    );
     /// A peer's pen went down on the page: `anchor` is the line the wet
     /// stroke belongs to (resolve it with [`NoteSession::resolve_anchor`]),
     /// and the points that follow are in that anchor's space. `spec` is a
@@ -832,6 +850,12 @@ impl NoteSession {
             id: element.to_string(),
         })
     }
+
+    fn parse_sketch(&self, sketch: &str) -> Result<SketchId> {
+        sketch.parse().map_err(|_| KrabinkError::MalformedId {
+            id: sketch.to_string(),
+        })
+    }
 }
 
 #[uniffi::export]
@@ -1075,5 +1099,122 @@ impl NoteSession {
             .parse()
             .map_err(|_| KrabinkError::MalformedId { id: stroke })?;
         self.send_wet(pcore::WetInk::Cancel { stroke: stroke_id })
+    }
+
+    // ---- inline sketches ----
+    //
+    // A sketch is its own element container, shown as a box in the text
+    // flow at its `![sketch](krabink://sketch/<id>)` line (see
+    // `style_runs` → `StyleKind::SketchEmbed`). Coordinates are local to
+    // the box: origin at the box's top-left inset by `inline_padding()`.
+
+    /// Every sketch container in this note, whether or not the text still
+    /// embeds it.
+    pub fn sketch_ids(&self) -> Result<Vec<String>> {
+        self.read(|doc| Ok(doc.sketch_ids().iter().map(SketchId::to_string).collect()))
+    }
+
+    /// Create an empty sketch container and return its id. Commit this
+    /// first, then splice the embed line into the text; never create a
+    /// container on pen-down (two devices would race and orphan one).
+    pub fn create_sketch(&self) -> Result<String> {
+        self.commit(Flush::Immediate, |doc| doc.create_sketch(now_ms()))
+            .map(|id| id.to_string())
+    }
+
+    /// Every element of a sketch (strokes and shapes) in z-order.
+    pub fn elements(&self, sketch: String) -> Result<Vec<Element>> {
+        let sketch = self.parse_sketch(&sketch)?;
+        self.read(|doc| Ok(doc.elements(sketch)?.into_iter().map(Into::into).collect()))
+    }
+
+    /// Height of the sketch's inline box for its current content: at
+    /// least `inline_min_height()`, else the lowest ink plus padding,
+    /// rounded up to whole points. Recompute on commit and on
+    /// `strokes_changed`, never mid-stroke. An unknown sketch (embed line
+    /// without a container) gets the minimum.
+    pub fn sketch_box_height(&self, sketch: String) -> Result<f32> {
+        let sketch = self.parse_sketch(&sketch)?;
+        self.read(|doc| {
+            let elements = doc.elements(sketch).unwrap_or_default();
+            Ok(pcore::sketch_box_height(&elements))
+        })
+    }
+
+    /// Pen-down inside an inline sketch: announce a wet stroke on the
+    /// ephemeral channel. Returns the stroke id to use for `append_points`
+    /// and the committed stroke; points are in the sketch's local space.
+    pub fn begin_stroke(
+        &self,
+        sketch: String,
+        tool: Tool,
+        color: u32,
+        base_width: f32,
+        spec: Option<Vec<u8>>,
+    ) -> Result<String> {
+        let sketch = self.parse_sketch(&sketch)?;
+        let stroke = pcore::StrokeId::new();
+        self.send_wet(pcore::WetInk::Begin {
+            sketch,
+            stroke,
+            tool: tool.into(),
+            color: rgba_from_u32(color),
+            base_width,
+            spec,
+        })?;
+        Ok(stroke.to_string())
+    }
+
+    /// Pen-up inside an inline sketch: commit the stroke and end the wet
+    /// stream. Same contract as [`Self::finish_page_stroke`].
+    pub fn finish_stroke(
+        &self,
+        sketch: String,
+        stroke: Stroke,
+        tail: Vec<StrokePoint>,
+    ) -> Result<()> {
+        let sketch = self.parse_sketch(&sketch)?;
+        let stroke_id = self.parse_element(&stroke.id)?;
+        let committed = pcore::Stroke::from(stroke);
+        self.commit(Flush::Immediate, |doc| doc.add_stroke(sketch, &committed))?;
+        let tail: Vec<pcore::StrokePoint> = tail.into_iter().map(Into::into).collect();
+        self.send_wet(pcore::WetInk::end(stroke_id, now_ms(), &tail)?)
+    }
+
+    /// Pen-up inside an inline sketch for a stroke that snapped to a
+    /// shape: commit the shape under the wet stroke's id and end the wet
+    /// stream.
+    pub fn finish_shape(&self, sketch: String, shape: ShapeElement) -> Result<()> {
+        let sketch = self.parse_sketch(&sketch)?;
+        let id = self.parse_element(&shape.id)?;
+        let committed = pcore::ShapeElement::from(shape);
+        self.commit(Flush::Immediate, |doc| doc.add_shape(sketch, &committed))?;
+        self.send_wet(pcore::WetInk::end(id, now_ms(), &[])?)
+    }
+
+    /// Eraser sample inside an inline sketch, (`x`, `y`) in the sketch's
+    /// local space: remove every element whose ink a circle of `radius`
+    /// touches; returns their ids so the view can drop them.
+    pub fn erase_at(&self, sketch: String, x: f32, y: f32, radius: f32) -> Result<Vec<String>> {
+        let sketch_id = self.parse_sketch(&sketch)?;
+        let hit: Vec<pcore::ElementId> = self.read(|doc| {
+            Ok(doc
+                .elements(sketch_id)?
+                .iter()
+                .filter(|el| el.ink().hits(&el.outline(), x, y, radius))
+                .map(pcore::Element::id)
+                .collect())
+        })?;
+        for id in &hit {
+            self.commit(Flush::Immediate, |doc| doc.remove_element(sketch_id, *id))?;
+        }
+        Ok(hit.iter().map(ToString::to_string).collect())
+    }
+
+    /// Remove one inline-sketch element (stroke or shape) by id.
+    pub fn remove_element(&self, sketch: String, element: String) -> Result<()> {
+        let sketch = self.parse_sketch(&sketch)?;
+        let id = self.parse_element(&element)?;
+        self.commit(Flush::Immediate, |doc| doc.remove_element(sketch, id))
     }
 }

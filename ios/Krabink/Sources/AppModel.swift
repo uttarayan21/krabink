@@ -358,6 +358,18 @@ private final class NoteEvents: NoteListener {
         Task { @MainActor [weak model] in model?.ink.remoteChanged() }
     }
 
+    func strokesChanged(sketch: String) {
+        // Inline sketches: wired to the ink model in the inline-sketch step.
+        _ = sketch
+    }
+
+    func wetBegin(
+        sketch: String, stroke: String, tool: Tool, color: UInt32, baseWidth: Float, spec: Data?
+    ) {
+        // Inline sketches: wired to the ink model in the inline-sketch step.
+        _ = (sketch, stroke, tool, color, baseWidth, spec)
+    }
+
     func wetBeginAnchored(
         stroke: String, anchor: Data, tool: Tool, color: UInt32, baseWidth: Float, spec: Data?
     ) {

@@ -20,7 +20,9 @@ pub use brush::{
     parse_recording,
 };
 pub use engine::{Core, CoreListener, KrabinkError, NoteListener, NoteSession};
-pub use markdown::{PreviewText, StyleKind, StyleRun, preview_text, style_runs};
+pub use markdown::{
+    PreviewText, StyleKind, StyleRun, inline_min_height, inline_padding, preview_text, style_runs,
+};
 pub use types::{
     Binding, BrushInfo, DeviceInfo, Element, NoteInfo, PageElement, PageProbe, PairInfo, PeerInfo,
     PeerKind, Point2, PointKind, Recognition, Route, Shape, ShapeElement, Stroke, StrokePoint,

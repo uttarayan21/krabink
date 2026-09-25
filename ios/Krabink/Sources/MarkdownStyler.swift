@@ -101,7 +101,9 @@ enum MarkdownStyler {
                 $0.firstLineHeadIndent += quoteIndent
                 $0.headIndent += quoteIndent
             }
-        case .link:
+        case .link, .sketchEmbed:
+            // Inline sketch boxes land in the inline-sketch step; until
+            // then the embed line reads as a link.
             storage.addAttributes(
                 [
                     .foregroundColor: UIColor.themeAccent,

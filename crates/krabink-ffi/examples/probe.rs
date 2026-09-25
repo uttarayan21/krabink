@@ -1,17 +1,26 @@
 //! Desktop-class Rust peer for cross-device sync checks (used by the iOS UI
 //! test harness). Joins a workspace from a pairing URI with a fresh store,
 //! waits for the newest note, optionally asserts its text contains a
-//! substring and/or appends text, and can draw or count page ink.
+//! substring and/or appends text, and can draw or count page (overlay)
+//! ink and inline-sketch ink.
 //!
 //! cargo run -p krabink-ffi --example probe -- \
 //!     --pair 'krabink://pair?node=…&token=…&relay=…' \
 //!     [--expect SUBSTRING] [--append TEXT] [--timeout-secs 15] \
-//!     [--add-page-stroke LINE] [--expect-page-elements N]
+//!     [--add-page-stroke LINE] [--expect-page-elements N] \
+//!     [--add-sketch-stroke EMBED] [--expect-sketch-elements N]
+//!
+//! `EMBED` is the 0-based index of the `![…](krabink://sketch/…)` embed
+//! line in text order; `--expect-sketch-elements` waits for the first
+//! embed's sketch to hold `N` elements.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use krabink_ffi::{Core, NoteListener, PointKind, Stroke, StrokePoint, Tool, parse_pair_uri};
+use krabink_ffi::{
+    Core, NoteListener, NoteSession, PointKind, Stroke, StrokePoint, StyleKind, Tool,
+    parse_pair_uri, style_runs,
+};
 
 #[derive(Default)]
 struct Recorder {
@@ -41,6 +50,19 @@ impl NoteListener for Recorder {
     }
     fn text_changed(&self, _text: String) {}
     fn page_changed(&self) {}
+    fn strokes_changed(&self, _sketch: String) {}
+    fn wet_begin(
+        &self,
+        _sketch: String,
+        _st: String,
+        _t: Tool,
+        _c: u32,
+        _w: f32,
+        _spec: Option<Vec<u8>>,
+    ) {
+        self.wet.lock().unwrap().begins += 1;
+        eprintln!("wet begin (inline)");
+    }
     fn wet_begin_anchored(
         &self,
         _st: String,
@@ -73,6 +95,10 @@ struct Args {
     /// Draw a page stroke anchored to this 0-based source line.
     add_page_stroke: Option<usize>,
     expect_page_elements: Option<usize>,
+    /// Draw a stroke inside the nth inline sketch embed (text order).
+    add_sketch_stroke: Option<usize>,
+    /// Wait until the first embed's sketch holds this many elements.
+    expect_sketch_elements: Option<usize>,
     wet_watch: Option<Duration>,
     timeout: Duration,
     /// Print the device registry as it changes, then exit; no note needed.
@@ -87,6 +113,8 @@ fn parse_args() -> Args {
         append: None,
         add_page_stroke: None,
         expect_page_elements: None,
+        add_sketch_stroke: None,
+        expect_sketch_elements: None,
         wet_watch: None,
         timeout: Duration::from_secs(15),
         devices: false,
@@ -101,6 +129,10 @@ fn parse_args() -> Args {
             "--append" => args.append = Some(value()),
             "--add-page-stroke" => args.add_page_stroke = Some(value().parse().unwrap()),
             "--expect-page-elements" => args.expect_page_elements = Some(value().parse().unwrap()),
+            "--add-sketch-stroke" => args.add_sketch_stroke = Some(value().parse().unwrap()),
+            "--expect-sketch-elements" => {
+                args.expect_sketch_elements = Some(value().parse().unwrap());
+            }
             "--wet-watch" => args.wet_watch = Some(Duration::from_secs(value().parse().unwrap())),
             "--timeout-secs" => args.timeout = Duration::from_secs(value().parse().unwrap()),
             "--devices" => args.devices = true,
@@ -122,6 +154,18 @@ fn wait_for<T>(what: &str, timeout: Duration, mut poll: impl FnMut() -> Option<T
     }
     eprintln!("probe: timed out waiting for {what}");
     std::process::exit(1);
+}
+
+/// Sketch ids of the note's inline embeds, in text order.
+fn embeds(session: &NoteSession) -> Vec<String> {
+    let text = session.text().unwrap_or_default();
+    style_runs(text)
+        .into_iter()
+        .filter_map(|r| match r.kind {
+            StyleKind::SketchEmbed { sketch } => Some(sketch),
+            _ => None,
+        })
+        .collect()
 }
 
 fn main() {
@@ -179,6 +223,55 @@ fn main() {
             let n = session.page_elements().ok()?.len();
             (n == want).then_some(())
         });
+    }
+
+    if let Some(want) = args.expect_sketch_elements {
+        wait_for(
+            &format!("{want} inline sketch elements"),
+            args.timeout,
+            || {
+                let sketch = embeds(&session).into_iter().next()?;
+                let n = session.elements(sketch).ok()?.len();
+                (n == want).then_some(())
+            },
+        );
+    }
+
+    if let Some(index) = args.add_sketch_stroke {
+        let sketch = wait_for(&format!("embed #{index}"), args.timeout, || {
+            embeds(&session).into_iter().nth(index)
+        });
+        let id = session
+            .begin_stroke(sketch.clone(), Tool::Pen, 0xc81e_3cff, 6.0, None)
+            .expect("begin sketch stroke");
+        let points = (0..6u32)
+            .map(|i| StrokePoint {
+                x: 20.0 + 30.0 * i as f32,
+                y: 20.0 + 6.0 * i as f32,
+                force: 1.0,
+                t_ms: i * 16,
+                tilt: None,
+                size: None,
+            })
+            .collect();
+        session
+            .finish_stroke(
+                sketch,
+                Stroke {
+                    id,
+                    tool: Tool::Pen,
+                    color: 0xc81e_3cff,
+                    base_width: 6.0,
+                    kind: PointKind::BsplineControl,
+                    points,
+                    created_ms: now_unix_ms(),
+                    brush: None,
+                },
+                Vec::new(),
+            )
+            .expect("finish sketch stroke");
+        // Give the network task a moment to flush the update.
+        std::thread::sleep(Duration::from_millis(750));
     }
 
     if let Some(line) = args.add_page_stroke {
@@ -260,11 +353,22 @@ fn main() {
         std::thread::sleep(Duration::from_millis(750));
     }
 
+    let inline: Vec<String> = embeds(&session)
+        .into_iter()
+        .map(|sketch| {
+            let n = session
+                .elements(sketch.clone())
+                .map(|e| e.len())
+                .unwrap_or(0);
+            format!("{sketch}={n}")
+        })
+        .collect();
     println!(
-        "probe OK — note {} title {:?}\npage elements {}\n{}",
+        "probe OK — note {} title {:?}\npage elements {}\ninline sketches [{}]\n{}",
         newest.id,
         newest.title,
         session.page_elements().map(|p| p.len()).unwrap_or(0),
+        inline.join(" "),
         session.text().expect("text")
     );
 }

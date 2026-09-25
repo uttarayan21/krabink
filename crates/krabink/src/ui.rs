@@ -872,7 +872,9 @@ impl CharStyle {
                 self.italics = true;
                 self.indent += LIST_INDENT;
             }
-            StyleKind::Link => {
+            // Inline sketch boxes land in the next step; until then the
+            // embed line reads as a link.
+            StyleKind::Link | StyleKind::SketchEmbed { .. } => {
                 self.color = Role::Accent;
                 self.underline = true;
             }

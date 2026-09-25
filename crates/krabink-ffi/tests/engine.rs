@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use krabink_ffi::{
     AssetInfo, AssetKind, BrushInfo, Core, CoreListener, DeviceInfo, Element, NoteInfo,
     NoteListener, PageProbe, PairInfo, Point2, PointKind, Route, Shape, ShapeElement, Stroke,
-    StrokePoint, StyleKind, SyncState, Tool, style_runs,
+    StrokePoint, StyleKind, SyncState, Tool, inline_min_height, inline_padding, style_runs,
 };
 
 fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
@@ -132,6 +132,10 @@ struct RecNote {
     wet: Mutex<Vec<String>>,
     /// (stroke id, anchor) of every `wet_begin_anchored`.
     wet_anchored: Mutex<Vec<(String, Vec<u8>)>>,
+    /// (sketch id, stroke id) of every `wet_begin`.
+    wet_sketch: Mutex<Vec<(String, String)>>,
+    /// Sketch ids of every `strokes_changed`.
+    sketch_events: Mutex<Vec<String>>,
 }
 
 impl NoteListener for RecNote {
@@ -145,6 +149,27 @@ impl NoteListener for RecNote {
 
     fn page_changed(&self) {
         *self.page_events.lock().unwrap() += 1;
+    }
+
+    fn strokes_changed(&self, sketch: String) {
+        self.sketch_events.lock().unwrap().push(sketch);
+    }
+
+    fn wet_begin(
+        &self,
+        sketch: String,
+        stroke: String,
+        _tool: Tool,
+        color: u32,
+        width: f32,
+        spec: Option<Vec<u8>>,
+    ) {
+        let custom = if spec.is_some() { ":custom" } else { "" };
+        self.wet
+            .lock()
+            .unwrap()
+            .push(format!("begin:{stroke}:{color:08x}:{width}{custom}"));
+        self.wet_sketch.lock().unwrap().push((sketch, stroke));
     }
 
     fn wet_begin_anchored(
@@ -876,6 +901,144 @@ fn erase_page_hits_only_touched_elements() {
     assert_eq!(left[0].char_index, Some(2));
 }
 
+/// An inline sketch drawn on A reaches B as sketch-keyed wet ink, then as
+/// a committed element under `strokes_changed`; both sides agree on the
+/// box height; erasing removes it; the embed line styles as one run.
+#[test]
+fn inline_sketch_converges_direct() {
+    let dir = tempfile::tempdir().unwrap();
+    let core_a = Core::new(dir.path().join("a").to_str().unwrap().into()).unwrap();
+    let core_b = Core::new(dir.path().join("b").to_str().unwrap().into()).unwrap();
+    let mut pair = core_a.pair_info();
+    pair.addrs = vec![format!("127.0.0.1:{}", core_a.bound_port().unwrap())];
+    core_b.set_pairing(pair).unwrap();
+    wait_for("B connects to A", || connected(&core_b.sync_state()));
+
+    let note_a = core_a.clone().create_note("inline".into()).unwrap();
+    let sketch = note_a.create_sketch().unwrap();
+    assert_eq!(note_a.sketch_ids().unwrap(), vec![sketch.clone()]);
+    assert_eq!(
+        note_a.sketch_box_height(sketch.clone()).unwrap(),
+        inline_min_height(),
+        "empty sketch gets the minimum box"
+    );
+    let text = format!("intro\n![sketch](krabink://sketch/{sketch})\nafter\n");
+    note_a.apply_text_edit(0, 0, text.clone()).unwrap();
+    wait_for("note reaches B", || {
+        core_b.list_notes().iter().any(|n| n.title == "inline")
+    });
+    let note_b = core_b.clone().open_note(note_a.id()).unwrap();
+    let rec_b = Arc::new(RecNote::default());
+    note_b.set_listener(rec_b.clone());
+    wait_for("text reaches B", || note_b.text().unwrap() == text);
+    assert_eq!(note_b.sketch_ids().unwrap(), vec![sketch.clone()]);
+
+    // A draws a tall stroke inside the box.
+    let id = note_a
+        .begin_stroke(sketch.clone(), Tool::Pen, 0x1122_33ff, 4.0, None)
+        .unwrap();
+    note_a.append_points(id.clone(), 1, polyline(3)).unwrap();
+    let mut stroke = page_stroke(id.clone(), 5, 0.0, 300.0);
+    stroke.points.push(StrokePoint {
+        x: 12.0,
+        y: 300.0 + 4.0,
+        force: 0.5,
+        t_ms: 40,
+        tilt: None,
+        size: None,
+    });
+    note_a
+        .finish_stroke(sketch.clone(), stroke, Vec::new())
+        .unwrap();
+
+    wait_for("B hears the sketch wet begin", || {
+        !rec_b.wet_sketch.lock().unwrap().is_empty()
+    });
+    assert_eq!(
+        rec_b.wet_sketch.lock().unwrap()[0],
+        (sketch.clone(), id.clone())
+    );
+    // The container's arrival may already have fired one strokes_changed
+    // (its length went from "absent" to 0); wait for the commit itself.
+    wait_for("B hears strokes_changed for the stroke", || {
+        !rec_b.sketch_events.lock().unwrap().is_empty()
+            && note_b.elements(sketch.clone()).unwrap().len() == 1
+    });
+    assert!(
+        rec_b
+            .sketch_events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|s| s == &sketch)
+    );
+    let elements_b = note_b.elements(sketch.clone()).unwrap();
+    assert_eq!(elements_b[0].id(), id);
+    let height_a = note_a.sketch_box_height(sketch.clone()).unwrap();
+    let height_b = note_b.sketch_box_height(sketch.clone()).unwrap();
+    assert_eq!(height_a, height_b, "box height agrees on both replicas");
+    assert!(
+        height_a >= 304.0 + 2.0 * inline_padding(),
+        "ink at y=304 grows the box: {height_a}"
+    );
+    assert_eq!(height_a, height_a.ceil(), "whole points");
+    assert!(
+        rec_b
+            .wet
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e == &format!("end:{id}")),
+        "wet stream ended: {:?}",
+        rec_b.wet.lock().unwrap()
+    );
+
+    // The embed line is one run on B, without markers inside it.
+    let runs = style_runs(note_b.text().unwrap());
+    let embed = runs
+        .iter()
+        .find(|r| {
+            r.kind
+                == StyleKind::SketchEmbed {
+                    sketch: sketch.clone(),
+                }
+        })
+        .unwrap_or_else(|| panic!("no embed run in {runs:?}"));
+    assert_eq!(embed.start, 6);
+    assert_eq!(
+        embed.end,
+        6 + 10 + 17 + 26 + 1,
+        "![sketch]( + prefix + ulid + )"
+    );
+    assert!(
+        !runs
+            .iter()
+            .any(|r| r.kind == StyleKind::Marker && r.start >= embed.start && r.end <= embed.end),
+        "{runs:?}"
+    );
+
+    // Erasing at the stroke's start removes it on both sides.
+    let events_before = rec_b.sketch_events.lock().unwrap().len();
+    let hit = note_a.erase_at(sketch.clone(), 0.0, 300.0, 6.0).unwrap();
+    assert_eq!(hit, vec![id]);
+    wait_for("removal reaches B", || {
+        note_b.elements(sketch.clone()).unwrap().is_empty()
+    });
+    assert!(rec_b.sketch_events.lock().unwrap().len() > events_before);
+    assert_eq!(
+        note_b.sketch_box_height(sketch.clone()).unwrap(),
+        inline_min_height()
+    );
+    // A missing container is not an error for the height query.
+    assert_eq!(
+        note_b
+            .sketch_box_height("01ARZ3NDEKTSV4RRFFQ69G5FAV".into())
+            .unwrap(),
+        inline_min_height()
+    );
+    assert!(note_b.elements("nope".into()).is_err());
+}
+
 #[test]
 fn style_runs_crosses_ffi() {
     let runs = style_runs("# Hi **there**\n".into());
@@ -895,4 +1058,15 @@ fn style_runs_crosses_ffi() {
         "{runs:?}"
     );
     assert!(style_runs(String::new()).is_empty());
+
+    let embed = "![s](krabink://sketch/01ARZ3NDEKTSV4RRFFQ69G5FAV)\n";
+    let runs = style_runs(embed.into());
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(
+        runs[0].kind,
+        StyleKind::SketchEmbed {
+            sketch: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into()
+        }
+    );
+    assert_eq!((runs[0].start, runs[0].end), (0, 49));
 }

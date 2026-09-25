@@ -5,7 +5,7 @@
 use krabink_core as pcore;
 
 /// What a run of the source means. See `krabink_core::StyleKind`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum StyleKind {
     /// `level` 1..=6; the run covers the whole heading line(s).
     Heading {
@@ -30,6 +30,13 @@ pub enum StyleKind {
     /// fences, `[`, `](url)`, `[ ]`. Always inside some other run.
     Marker,
     ThematicBreak,
+    /// An inline sketch embed: the whole `![…](krabink://sketch/<id>)`
+    /// span, alone on its line, first occurrence of `sketch`. Never hosts
+    /// `Marker` runs; hide the text and lay out a box of
+    /// `NoteSession::sketch_box_height` in its place.
+    SketchEmbed {
+        sketch: String,
+    },
 }
 
 impl From<pcore::StyleKind> for StyleKind {
@@ -46,13 +53,16 @@ impl From<pcore::StyleKind> for StyleKind {
             pcore::StyleKind::Link => Self::Link,
             pcore::StyleKind::Marker => Self::Marker,
             pcore::StyleKind::ThematicBreak => Self::ThematicBreak,
+            pcore::StyleKind::SketchEmbed { sketch } => Self::SketchEmbed {
+                sketch: sketch.to_string(),
+            },
         }
     }
 }
 
 /// A styled span `[start, end)` of the source, in unicode scalars (the
 /// unit `NoteSession::apply_text_edit` and anchors use).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct StyleRun {
     pub start: u64,
     pub end: u64,
@@ -103,4 +113,17 @@ pub fn preview_text(text: String) -> PreviewText {
         source_of: p.source_of.into_iter().map(|s| s as u64).collect(),
         runs: p.runs.into_iter().map(Into::into).collect(),
     }
+}
+
+/// Inset from an inline sketch box's top-left corner to the sketch's
+/// local origin, in points. Shared by every platform so ink lines up.
+#[uniffi::export]
+pub fn inline_padding() -> f32 {
+    pcore::INLINE_PADDING
+}
+
+/// Height of an inline sketch box with no (or only shallow) ink, in points.
+#[uniffi::export]
+pub fn inline_min_height() -> f32 {
+    pcore::INLINE_MIN_HEIGHT
 }
