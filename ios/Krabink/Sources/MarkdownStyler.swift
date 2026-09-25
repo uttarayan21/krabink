@@ -9,6 +9,12 @@
 // selection alone, so a restyle after every keystroke is invisible to
 // the CRDT binding. Whole-text restyle per edit for now (fine to ~50 KB);
 // an incremental restyle is a follow-up.
+//
+// In the reading view an inline sketch embed line (`SketchEmbed` run) is
+// laid out but not shown: tiny transparent glyphs on a row as tall as
+// the sketch's box, so the box sits in the text flow and the view text
+// still equals the CRDT text. The box itself is drawn by
+// `InlineBoxOverlay`. In the editor the line is plain link text.
 
 import KrabinkCore
 import UIKit
@@ -47,11 +53,12 @@ enum MarkdownStyler {
     }
 
     /// Reset `storage` to the base look and apply `runs` over it.
-    /// `boxHeights` gives each inline sketch's box height (by sketch id);
-    /// an embed without one gets the minimum.
+    /// `boxHeights` gives each inline sketch's box height (by sketch id;
+    /// an embed without one gets the minimum) in the reading view; `nil`
+    /// is the editor, where an embed line reads as a link.
     static func restyle(
         _ storage: NSTextStorage, runs: [StyleRun], index: ScalarIndex,
-        boxHeights: [String: CGFloat] = [:]
+        boxHeights: [String: CGFloat]? = nil
     ) {
         let whole = NSRange(location: 0, length: storage.length)
         storage.beginEditing()
@@ -80,7 +87,7 @@ enum MarkdownStyler {
     }
 
     private static func apply(
-        _ kind: StyleKind, to storage: NSTextStorage, range: NSRange, boxHeights: [String: CGFloat]
+        _ kind: StyleKind, to storage: NSTextStorage, range: NSRange, boxHeights: [String: CGFloat]?
     ) {
         switch kind {
         case .heading(let level):
@@ -126,7 +133,16 @@ enum MarkdownStyler {
                     .underlineStyle: NSUnderlineStyle.single.rawValue,
                 ], range: range)
         case .sketchEmbed(let sketch):
-            // Hidden: the row is the sketch's box, the glyphs invisible.
+            guard let boxHeights else {
+                // Editor: the embed line is source text like any other.
+                storage.addAttributes(
+                    [
+                        .foregroundColor: UIColor.themeAccent,
+                        .underlineStyle: NSUnderlineStyle.single.rawValue,
+                    ], range: range)
+                return
+            }
+            // Reading view: the row is the sketch's box, the glyphs invisible.
             let height = boxHeights[sketch] ?? InlineGeometry.minHeight
             storage.addAttributes(
                 [

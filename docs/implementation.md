@@ -240,12 +240,13 @@ same ink sits on the same line in either view.
 `krabink://sketch/` plus a 26-char ULID, alone on its source line (only
 whitespace around it), for the first occurrence of that id. It is one
 run over the whole `![…](…)` span and never hosts `Marker` or `Link`
-runs, so both editors hide the line as a unit. Anything else (a bare
+runs, so both reading views hide the line as a unit. Anything else (a bare
 URI, an embed sharing its line, a repeat of an id, a malformed id) stays
 a `Link` with markers. The rule lives in the core so the two apps show
 a box for exactly the same lines. `preview_text` needs nothing extra:
 no char of an embed is dropped, the line survives and the run is
-remapped 1:1, so the box exists in the reading view too.
+remapped 1:1. The box shows in the reading view only; the editor styles
+the embed run as a link, so the line stays ordinary editable source.
 
 ## 4. Sync node (`krabink-local`) and cloud (`krabink-server`)
 
@@ -301,9 +302,12 @@ Bevy app with egui UI. Modules:
   resource: the galley, the visible window, every page element's
   origin (`resolve_anchor` → `pos_from_cursor`, translated through the
   preview's source map when it is showing; unresolvable anchors go to the
-  end of the text) and the inline boxes. An embed run is laid out as
-  transparent 8 pt text on a row `line_height` = box height (glyphs
-  top-aligned), so the box takes its place in the flow; `BoxHeights`
+  end of the text) and, in the reading view, the inline boxes. There an
+  embed run is laid out as transparent 8 pt text on a row `line_height`
+  = box height (glyphs top-aligned), so the box takes its place in the
+  flow (`layout_job` takes the heights as `Some`; the editor passes
+  `None` and shows the embed line as link text, so it can be edited and
+  selected like any other line); `BoxHeights`
   caches `sketch_box_height` per sketch on the doc version, re-measuring
   only sketches whose element count moved. Right after the `TextEdit`
   lays out, `inline_boxes` reads each embed's row top and the frame
@@ -447,17 +451,20 @@ Bonjour usage strings, file sharing for recordings).
   `sourceOf` map so the ink model only ever sees source scalars.
   `MarkdownStyler.swift`: applies the core's style runs as TextKit
   attributes over the whole text after every edit (attribute-only edits
-  do not fire `textViewDidChange` or move the selection). A `SketchEmbed`
-  run becomes a hidden row: 8 pt clear glyphs, paragraph line height
-  pinned to the sketch's box height, `.byClipping`. The canvas caches
+  do not fire `textViewDidChange` or move the selection). In the reading
+  view a `SketchEmbed` run becomes a hidden row: 8 pt clear glyphs,
+  paragraph line height pinned to the sketch's box height,
+  `.byClipping`; in the editor it is link text (`boxHeights: nil`), so
+  the line is edited and selected like any other. The canvas caches
   `sketchBoxHeight` per sketch (dropped when that sketch changes), and
   once each layout settles measures the boxes (`LineLayout.inlineBoxes`:
   x = the ink origin's left edge, top = the embed row's first fragment,
   width = the container's, height from the cache) and frames them with
   `InlineBoxOverlay`, a non-interactive subview of the text view (one
   `CAShapeLayer` border and `CATextLayer` "sketch" caption per box)
-  drawn above ink and text. The caret's source scalar is reported to the
-  model on every selection change.
+  drawn above ink and text. Leaving the reading view drops the boxes,
+  and with them the inline ink, until the next toggle. The caret's
+  source scalar is reported to the model on every selection change.
 - `SettingsScreen.swift`, `PairScreen.swift`, `ScanScreen.swift`,
   `PeerDiscovery.swift`: peers and routes, device registry, pairing QR out
   and in (VisionKit), Bonjour lookup (`_krabink._udp`, UDP resolve) of the
@@ -543,9 +550,11 @@ hold-to-shape, custom brush round trip, reopen keeps strokes, sidebar
 title, delete, bulk delete), `StyledEditorUITests` (source text preserved,
 ink follows its line when a heading above it changes),
 `PreviewUITests` (reading view hides markers and keeps the source),
-`InlineSketchUITests` (insert a sketch, draw inside it and below it,
-erase-last across layers, the box follows text typed above it, inline
-ink survives reopening, the reading view keeps the box), `SyncUITests`,
+`InlineSketchUITests` (insert a sketch, draw inside its box in the
+reading view and below it, erase-last across layers, the box follows
+text typed above it, inline ink survives reopening, the editor shows the
+embed as text and the box comes back with the reading view),
+`SyncUITests`,
 `PairUITests`, `SpikeUITests`, `DeviceSpikeUITests`.
 
 ## 8. The shared rendering contract
@@ -638,8 +647,9 @@ draws and types, the desktop shows page ink read-only. Known limits:
 - Inserting a newline exactly at a line start moves that line's ink down;
   typing elsewhere on the line does not.
 - Inline sketches (`![…](krabink://sketch/<id>)`, the legacy `sketches`
-  container) are boxes in the text flow, drawn in place on the iPad,
-  view-only on the desktop; they export to SVG as before. Ink is not
+  container) are boxes in the text flow of the reading view, drawn in
+  place there on the iPad, view-only on the desktop; in the editor the
+  embed is a plain source line. They export to SVG as before. Ink is not
   clipped to its box, so an old full-screen sketch gives a tall box with
   ink wider than the text. An embed must be alone on its line; a repeat
   of an id is plain link text; deleting the line hides the box (data

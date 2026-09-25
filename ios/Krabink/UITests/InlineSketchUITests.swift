@@ -1,4 +1,5 @@
-// Inline sketches: a box in the text flow the Pencil draws into. The
+// Inline sketches: in the editor the embed is a source line; in the
+// reading view it is a box in the text flow the Pencil draws into. The
 // simulator runs under `.anyInput`, so a one-finger drag inks. The status
 // line reports `inline=` (elements over every box) and `boxY=` (page y of
 // the first box) next to the overlay's `strokes=`.
@@ -64,8 +65,8 @@ final class InlineSketchUITests: XCTestCase {
                 withVelocity: .slow, thenHoldForDuration: 0.1)
     }
 
-    /// A new note with a heading and one inline sketch under it; returns
-    /// the editor and the box's page y.
+    /// A new note with a heading and one inline sketch under it, switched
+    /// to the reading view; returns the editor and the box's page y.
     private func noteWithSketch(_ app: XCUIApplication, heading: String) -> (XCUIElement, CGFloat) {
         app.buttons["newNote"].tap()
         let editor = editor(app)
@@ -73,13 +74,19 @@ final class InlineSketchUITests: XCTestCase {
         editor.typeText("# \(heading)\n")
         XCTAssertTrue(app.staticTexts[heading].waitForExistence(timeout: 5))
         app.buttons["newSketch"].tap()
+        // The editor shows the embed as text: no box yet.
+        XCTAssertTrue(
+            (editor.value as? String ?? "").contains("![sketch](krabink://sketch/"),
+            "embed line missing from the source: \(editor.value ?? "")")
+        waitBoxY(app, timeout: 5) { $0 == 0 }
+        app.buttons["previewToggle"].tap()
         let y = waitBoxY(app, timeout: 5) { $0 > 0 } ?? 0
         return (editor, CGFloat(y))
     }
 
-    /// Inserting a sketch puts a box under the caret's line; a drag inside
-    /// it is inline ink, a drag below it overlay ink; erase-last takes the
-    /// newest of either.
+    /// Inserting a sketch puts an embed line under the caret's line; in
+    /// the reading view it is a box: a drag inside it is inline ink, a
+    /// drag below it overlay ink; erase-last takes the newest of either.
     func testInsertSketchAndDrawInside() {
         let app = launch()
         let (editor, top) = noteWithSketch(app, heading: "Inline")
@@ -106,9 +113,13 @@ final class InlineSketchUITests: XCTestCase {
     func testBoxFollowsTextAbove() {
         let app = launch()
         let (editor, top) = noteWithSketch(app, heading: "Flow")
-        // Caret to the end of the heading line, then a line above the box.
+        // Back to the editor: caret to the end of the heading line, then a
+        // line above the embed.
+        app.buttons["previewToggle"].tap()
+        waitBoxY(app, timeout: 5) { $0 == 0 }
         editor.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.02)).tap()
         editor.typeText("\nabove the box")
+        app.buttons["previewToggle"].tap()
         waitBoxY(app, timeout: 5) { CGFloat($0) > top + 10 }
     }
 
@@ -123,25 +134,36 @@ final class InlineSketchUITests: XCTestCase {
         app.buttons["newNote"].tap()
         waitStatus(app, contains: "inline=0", timeout: 5)
         sidebar.staticTexts["Keep inline"].firstMatch.tap()
+        // A reopened note starts in the editor: the box comes back with
+        // the reading view.
+        XCTAssertTrue(editor.waitForExistence(timeout: 5))
+        app.buttons["previewToggle"].tap()
         waitStatus(app, contains: "inline=1", timeout: 10)
         waitBoxY(app, timeout: 5) { $0 > 0 }
     }
 
-    /// The reading view keeps the box (and its ink) where the embed line is.
-    func testPreviewKeepsBox() {
+    /// Leaving the reading view turns the box back into its source line:
+    /// the inline ink goes with it and the embed text is editable again.
+    func testEditorShowsEmbedAsText() {
         let app = launch()
-        let (editor, top) = noteWithSketch(app, heading: "Read")
+        let (editor, top) = noteWithSketch(app, heading: "Edit")
         draw(on: editor, from: CGPoint(x: 60, y: top + 50), to: CGPoint(x: 260, y: top + 90))
         waitStatus(app, contains: "inline=1", timeout: 10)
-
-        app.buttons["previewToggle"].tap()
-        XCTAssertTrue(editor.waitForExistence(timeout: 5))
-        waitBoxY(app, timeout: 5) { $0 > 0 }
-        waitStatus(app, contains: "inline=1", timeout: 5)
         XCTAssertFalse(app.buttons["newSketch"].isEnabled)
         let shot = XCTAttachment(screenshot: app.screenshot())
         shot.name = "inline-preview"
         shot.lifetime = .keepAlways
         add(shot)
+
+        app.buttons["previewToggle"].tap()
+        waitStatus(app, contains: "inline=0", timeout: 5)
+        waitBoxY(app, timeout: 5) { $0 == 0 }
+        XCTAssertTrue(app.buttons["newSketch"].isEnabled)
+        XCTAssertTrue((editor.value as? String ?? "").contains("![sketch](krabink://sketch/"))
+
+        // And back: same box, same ink.
+        app.buttons["previewToggle"].tap()
+        waitStatus(app, contains: "inline=1", timeout: 10)
+        waitBoxY(app, timeout: 5) { $0 > 0 }
     }
 }

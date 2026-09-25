@@ -21,12 +21,14 @@
 // map, so ink stays on its line and the Pencil still draws (anchors are
 // taken in source scalars either way).
 //
-// Inline sketches: every `SketchEmbed` run is laid out as a hidden row as
-// tall as the sketch's box (`MarkdownStyler`); once the layout settles
-// the boxes are measured (`LineLayout.inlineBoxes`) and framed by
-// `InlineBoxOverlay`, a non-interactive subview of the text view drawn
-// above ink and text. Heights come from the core per sketch and are
-// cached until that sketch changes.
+// Inline sketches show in the reading view only: there every
+// `SketchEmbed` run is laid out as a hidden row as tall as the sketch's
+// box (`MarkdownStyler`); once the layout settles the boxes are measured
+// (`LineLayout.inlineBoxes`) and framed by `InlineBoxOverlay`, a
+// non-interactive subview of the text view drawn above ink and text.
+// Heights come from the core per sketch and are cached until that sketch
+// changes. In the editor the embed line is ordinary (link-styled) source
+// text, so it can be edited and selected like any other line.
 //
 // CRDT binding, both ways, through one reconciliation (`reconcile`).
 // `shadow` is the text the view and the CRDT last agreed on. A local edit
@@ -229,7 +231,8 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
         restyle()
     }
 
-    /// Note the embeds among `runs` and make sure each has a height.
+    /// Note the embeds among `runs` (reading view) and make sure each has
+    /// a height.
     private func collectEmbeds(_ runs: [StyleRun]) {
         embeds = MarkdownStyler.embeds(in: runs)
         for embed in embeds where boxHeights[embed.sketch] == nil {
@@ -298,9 +301,8 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
         }
         let text = textView.text ?? ""
         if index.utf16Count != (text as NSString).length { index = ScalarIndex(text) }
-        let runs = styleRuns(text: text)
-        collectEmbeds(runs)
-        MarkdownStyler.restyle(textView.textStorage, runs: runs, index: index, boxHeights: boxHeights)
+        embeds = []
+        MarkdownStyler.restyle(textView.textStorage, runs: styleRuns(text: text), index: index)
         textView.typingAttributes = MarkdownStyler.baseAttributes
         scheduleLayoutNotify()
     }

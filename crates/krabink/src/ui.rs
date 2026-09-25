@@ -11,10 +11,12 @@
 //! stays on its line.
 //!
 //! Inline sketches (`![…](krabink://sketch/<id>)` alone on a line) show as
-//! a box in the text flow: the embed's chars are laid out invisible at
-//! the box's height (`krabink_core::sketch_box_height`), the sketch's ink
-//! renders inside it from the same texture, and a hairline frame with a
-//! caption is painted over the text. The desktop shows them read-only.
+//! a box in the text flow of the reading view: the embed's chars are laid
+//! out invisible at the box's height (`krabink_core::sketch_box_height`),
+//! the sketch's ink renders inside it from the same texture, and a
+//! hairline frame with a caption is painted over the text. In the editor
+//! the embed line is link-styled source text, editable and selectable
+//! like any other line. The desktop shows sketches read-only.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -699,7 +701,10 @@ fn editor_ui(
                             let runs = styled.runs_for(buffer);
                             (buffer, runs)
                         };
-                        let embeds = embeds_of(runs);
+                        // Boxes only in the reading view: the editor shows
+                        // the embed line as text, like any other source.
+                        let heights = preview.then_some(heights);
+                        let embeds = heights.map(|_| embeds_of(runs)).unwrap_or_default();
                         let mut layouter =
                             |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
                                 let job =
@@ -714,7 +719,11 @@ fn editor_ui(
                             .min_size(available)
                             .hint_text("Start writing…")
                             .show(ui);
-                        let boxes = inline_boxes(&output.galley, &embeds, heights, available.x);
+                        let boxes = heights
+                            .map(|heights| {
+                                inline_boxes(&output.galley, &embeds, heights, available.x)
+                            })
+                            .unwrap_or_default();
                         paint_inline_frames(ui.painter(), &palette, &boxes, output.galley_pos);
                         ui.add_space(available.y * TAIL_FRACTION);
                         if let Some(target) = &page_texture.0 {
@@ -1011,8 +1020,9 @@ impl CharStyle {
     };
 
     /// Paint `kind` over this style. `heights` gives inline boxes their
-    /// row height; an unknown sketch gets the minimum.
-    fn apply(&mut self, kind: StyleKind, heights: &HashMap<SketchId, f32>) {
+    /// row height (an unknown sketch gets the minimum); `None` is the
+    /// editor, where an embed is link text like any other source line.
+    fn apply(&mut self, kind: StyleKind, heights: Option<&HashMap<SketchId, f32>>) {
         match kind {
             StyleKind::Heading { level } => {
                 let scale = HEADING_SCALE[usize::from(level.clamp(1, 6)) - 1];
@@ -1035,14 +1045,22 @@ impl CharStyle {
                 self.color = Role::Accent;
                 self.underline = true;
             }
-            // The embed is laid out invisible, tiny (never wraps) and as
-            // tall as its box; the sketch renders in the row it holds open.
-            StyleKind::SketchEmbed { sketch } => {
-                self.size = EMBED_FONT_SIZE;
-                self.color = Role::Hidden;
-                self.underline = false;
-                self.line_height = Some(heights.get(&sketch).copied().unwrap_or(INLINE_MIN_HEIGHT));
-            }
+            // In the reading view the embed is laid out invisible, tiny
+            // (never wraps) and as tall as its box; the sketch renders in
+            // the row it holds open. In the editor it reads as a link.
+            StyleKind::SketchEmbed { sketch } => match heights {
+                Some(heights) => {
+                    self.size = EMBED_FONT_SIZE;
+                    self.color = Role::Hidden;
+                    self.underline = false;
+                    self.line_height =
+                        Some(heights.get(&sketch).copied().unwrap_or(INLINE_MIN_HEIGHT));
+                }
+                None => {
+                    self.color = Role::Accent;
+                    self.underline = true;
+                }
+            },
             StyleKind::Marker | StyleKind::ThematicBreak => {
                 self.color = Role::Muted;
                 self.underline = false;
@@ -1097,7 +1115,11 @@ impl CharStyle {
 }
 
 /// Per-char styles of `text` under `runs` (scalar offsets, clamped).
-fn char_styles(text: &str, runs: &[StyleRun], heights: &HashMap<SketchId, f32>) -> Vec<CharStyle> {
+fn char_styles(
+    text: &str,
+    runs: &[StyleRun],
+    heights: Option<&HashMap<SketchId, f32>>,
+) -> Vec<CharStyle> {
     let mut styles = vec![CharStyle::BODY; text.chars().count()];
     for run in runs {
         let end = run.end.min(styles.len());
@@ -1110,10 +1132,12 @@ fn char_styles(text: &str, runs: &[StyleRun], heights: &HashMap<SketchId, f32>) 
 
 /// The styled galley job: one section per maximal run of equally styled
 /// chars, split at newlines so every line of an indented block indents.
+/// `heights` is `Some` in the reading view (inline boxes) and `None` in
+/// the editor.
 fn layout_job(
     text: &str,
     runs: &[StyleRun],
-    heights: &HashMap<SketchId, f32>,
+    heights: Option<&HashMap<SketchId, f32>>,
     palette: &Palette,
     wrap_width: f32,
 ) -> LayoutJob {
@@ -1172,7 +1196,7 @@ mod tests {
     }
 
     fn job(text: &str) -> LayoutJob {
-        layout_job(text, &style_runs(text), &HashMap::new(), &palette(), 400.0)
+        layout_job(text, &style_runs(text), None, &palette(), 400.0)
     }
 
     fn sections(text: &str) -> Vec<(std::ops::Range<usize>, f32, f32)> {
@@ -1255,7 +1279,7 @@ mod tests {
             end: 99,
             kind: StyleKind::Strong,
         }];
-        let styles = char_styles("abc", &runs, &HashMap::new());
+        let styles = char_styles("abc", &runs, None);
         assert_eq!(styles.len(), 3);
         assert_eq!(styles[2].color, Role::Strong);
     }
@@ -1271,7 +1295,7 @@ mod tests {
         let text = embed_text();
         let sketch: SketchId = SKETCH.parse().unwrap();
         let heights = HashMap::from([(sketch, 240.0)]);
-        let job = layout_job(&text, &style_runs(&text), &heights, &palette(), 400.0);
+        let job = layout_job(&text, &style_runs(&text), Some(&heights), &palette(), 400.0);
         let embed = job
             .sections
             .iter()
@@ -1287,7 +1311,7 @@ mod tests {
         let job = layout_job(
             &text,
             &style_runs(&text),
-            &HashMap::new(),
+            Some(&HashMap::new()),
             &palette(),
             400.0,
         );
@@ -1300,6 +1324,21 @@ mod tests {
         // Body rows keep the font's height.
         assert_eq!(job.sections[0].format.line_height, None);
         assert_eq!(job.sections[0].format.valign, egui::Align::Center);
+    }
+
+    #[test]
+    fn embed_is_link_text_in_the_editor() {
+        let text = embed_text();
+        let job = layout_job(&text, &style_runs(&text), None, &palette(), 400.0);
+        let embed = job
+            .sections
+            .iter()
+            .find(|s| s.byte_range.start.0 == 2)
+            .unwrap();
+        assert_eq!(embed.format.color, palette().accent);
+        assert_eq!(embed.format.font_id.size, BODY_SIZE);
+        assert_eq!(embed.format.line_height, None);
+        assert_ne!(embed.format.underline, egui::Stroke::NONE);
     }
 
     #[test]

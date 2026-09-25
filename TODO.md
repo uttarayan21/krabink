@@ -55,8 +55,10 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
 - [ ] Ink anchors are per source line, first fragment: ink on a wrapped
       continuation drifts when the width changes (iPad and desktop widths
       differ).
-- [ ] Inline sketch ink is not clipped to its box: an old full-screen
-      sketch gives a tall box with ink wider than the text. Also: an embed
+- [ ] Inline sketches draw only in the reading view (the editor shows the
+      embed line as text); ink is not clipped to its box, so an old
+      full-screen sketch gives a tall box with ink wider than the text.
+      Also: an embed
       must be alone on its line, a repeated id shows one box, the box
       height depends on decodable brush specs (a build without the spec
       lays the text below out differently), and on the desktop a
