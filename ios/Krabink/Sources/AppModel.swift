@@ -196,6 +196,42 @@ final class AppModel {
         return model.id
     }
 
+    /// Copy a markdown file (Open in Krabink, or the sidebar importer) into
+    /// a new note; the title follows its first heading like any note. The
+    /// file itself is not linked: edits and ink stay in the note. Returns
+    /// the new note's id, nil if the file could not be read.
+    func importMarkdown(url: URL) -> String? {
+        guard let text = Self.readMarkdown(url: url),
+            let session = try? core.createNote(title: "untitled")
+        else { return nil }
+        if !text.isEmpty {
+            try? session.applyTextEdit(at: 0, del: 0, insert: text)
+        }
+        notes = core.listNotes()
+        return adopt(NoteModel(session: session)).id
+    }
+
+    /// Opened-in-place and picked files are security scoped and may live
+    /// with a file provider (iCloud Drive), so access is claimed and the
+    /// read coordinated. Undecodable bytes become U+FFFD rather than
+    /// failing the import; a BOM is dropped and CRLF folded to LF, since
+    /// the editor and ink anchors split lines on "\n" alone.
+    private static func readMarkdown(url: URL) -> String? {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        var data: Data?
+        var coordinationError: NSError?
+        NSFileCoordinator().coordinate(
+            readingItemAt: url, options: .withoutChanges, error: &coordinationError
+        ) { data = try? Data(contentsOf: $0) }
+        guard let data else { return nil }
+        var text = String(decoding: data, as: UTF8.self)
+        if text.hasPrefix("\u{FEFF}") { text.removeFirst() }
+        return text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+    }
+
     func note(for id: String) -> NoteModel? {
         if let model = open[id] { return model }
         guard let session = try? core.openNote(id: id) else { return nil }
