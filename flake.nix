@@ -70,10 +70,10 @@
         src = let
           filterBySuffix = path: exts: lib.any (ext: lib.hasSuffix ext path) exts;
           # Beyond Rust sources: C shims, the brush textures krabink-core
-          # embeds with include_bytes!, the desktop WGSL shader, and the
-          # stroke corpora / golden meshes / proptest regressions the tests
-          # read from disk.
-          sourceFilters = path: type: (craneLib.filterCargoSources path type) || filterBySuffix path [".c" ".h" ".hpp" ".cpp" ".cc" ".png" ".wgsl" ".txt"];
+          # embeds with include_bytes!, the desktop WGSL shader, the stroke
+          # corpora / golden meshes / proptest regressions the tests read
+          # from disk, and the desktop entry the Linux package installs.
+          sourceFilters = path: type: (craneLib.filterCargoSources path type) || filterBySuffix path [".c" ".h" ".hpp" ".cpp" ".cc" ".png" ".wgsl" ".txt" ".desktop"];
         in
           lib.cleanSourceWith {
             filter = sourceFilters;
@@ -161,6 +161,14 @@
                 $out/bin/${name} completions bash > $out/share/bash-completions/${name}.bash
                 $out/bin/${name} completions fish > $out/share/fish/vendor_completions.d/${name}.fish
                 $out/bin/${name} completions zsh > $out/share/zsh/site-functions/_${name}
+              ''
+              # Linux desktop entry: lists krabink under "Open With" for
+              # markdown files (it does not become the default handler) and
+              # hands them over as `krabink FILE…`, which imports each one
+              # as a note.
+              + lib.optionalString pkgs.stdenv.isLinux ''
+                install -Dm644 crates/krabink/assets/krabink.desktop $out/share/applications/${name}.desktop
+                install -Dm644 ios/Krabink/Assets.xcassets/AppIcon.appiconset/AppIcon.png $out/share/pixmaps/${name}.png
               '';
             });
           server = craneLib.buildPackage (commonArgs

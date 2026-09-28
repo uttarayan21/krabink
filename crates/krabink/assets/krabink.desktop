@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Krabink
+GenericName=Markdown Notes
+Comment=Markdown notes with live-synced pen ink
+Exec=krabink %F
+Icon=krabink
+Terminal=false
+Categories=Office;
+Keywords=markdown;notes;ink;sketch;
+MimeType=text/markdown;text/x-markdown;

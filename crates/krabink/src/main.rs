@@ -6,6 +6,7 @@ mod cli;
 mod config;
 mod docs;
 mod errors;
+mod import;
 mod ink_assets;
 mod ink_material;
 mod lab;
@@ -77,6 +78,10 @@ fn main() -> Result<()> {
 
 fn run_app(args: cli::Cli) -> Result<()> {
     let config = RuntimeConfig::resolve(args.data_dir, args.relay, args.token)?;
+    let files = match import::Launch::resolve(&config.open_socket_path, args.files) {
+        import::Launch::Forwarded => return Ok(()),
+        import::Launch::Primary(files) => files,
+    };
     sync::set_local_device_name(config.device_name.clone());
     let store = Store::open(&config.store_path)
         .change_context(Error)
@@ -84,6 +89,8 @@ fn run_app(args: cli::Cli) -> Result<()> {
     let docs = Docs::load(store)
         .change_context(Error)
         .attach("loading workspace")?;
+    // The store lock is held: this is the data dir's owner from here on.
+    let inbox = import::Inbox::listen(&config.open_socket_path, files);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -170,8 +177,10 @@ fn run_app(args: cli::Cli) -> Result<()> {
         crate::sketch::SketchPlugin,
         settings::SettingsPlugin,
         node::NodePlugin,
+        import::ImportPlugin,
     ))
     .insert_resource(docs)
+    .insert_resource(inbox)
     .insert_resource(theme.clear_color())
     .insert_resource(theme)
     .insert_resource(Runtime(runtime))

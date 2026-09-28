@@ -292,6 +292,16 @@ Bevy app with egui UI. Modules:
   `replay` (headless 120 Hz latency rig dialling a `--pair` URI),
   `brush-lab`.
 - `docs.rs`: workspace registry and open notes over the shared store.
+- `import.rs`: markdown files become notes (`Docs::import_note`: create,
+  splice the text, derive the title; one payload per commit). Sources are
+  `krabink FILE…` (what the Linux desktop entry `assets/krabink.desktop`,
+  installed by the nix package with `MimeType=text/markdown`, runs), later
+  launches and `.md`/`.markdown`/`.txt` files dropped on the window; the
+  last one imported opens. A launch with files first dials `open.sock` in
+  the data dir: when an app owns it, the NUL-separated absolute paths go
+  there and the launch exits. The owner binds the socket only after its
+  store lock is held, replacing a stale one. The file is copied, not
+  linked. No socket on non-unix targets.
 - `node.rs`: the `krabink-local` node as a Bevy resource (`SyncNode`),
   mDNS advertise/browse feeding `add_addr_hint`, and the QR's direct
   addresses following the endpoint's.
@@ -433,7 +443,9 @@ and copies `Krabink.swift`. `scripts/swift-smoke.sh` compiles
 
 Generated with XcodeGen from `project.yml` (bundle `dev.darksailor.krabink`,
 iOS 17, iPad and iPhone, `krabink://` URL scheme, camera, local network and
-Bonjour usage strings, file sharing for recordings).
+Bonjour usage strings, file sharing for recordings, and a Viewer / Alternate
+document type for `net.daringfireball.markdown`, imported as a UTI since
+iOS declares none).
 
 - `KrabinkApp.swift`, `AppModel.swift`: owns the UniFFI `Core`, the note
   list and one `NoteModel` per open note (each with its `PageInkModel`,
@@ -444,6 +456,9 @@ Bonjour usage strings, file sharing for recordings).
   after the caret's line through `applyTextEdit`, flowing into the view
   like a remote edit; disabled in preview), erase-last, and on iOS 17 a
   brush sheet. `-spike 1` and `-brushLab 1` replace the main UI.
+  Markdown files ("Open in Krabink", or the sidebar importer) go through
+  `AppModel.importMarkdown`: security-scoped, coordinated read, BOM and
+  CRLF dropped, one new note per file, the last one selected.
 - `NoteCanvasView.swift`: the one surface per note. A TextKit 1
   `UITextView` (`usingTextLayoutManager: false`: eager, deterministic line
   fragments) over an opaque Metal view cleared to the paper colour, so

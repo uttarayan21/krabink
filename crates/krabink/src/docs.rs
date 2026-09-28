@@ -19,6 +19,10 @@ pub struct MetaRefresh {
     pub workspace: Option<Vec<u8>>,
 }
 
+/// Sync payloads of one local change spanning several docs, in commit
+/// order.
+pub type Payloads = Vec<(DocKey, Vec<u8>)>;
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -90,6 +94,22 @@ impl Docs {
         self.persist(DocKey::WORKSPACE, &ws_payload)?;
 
         Ok((id, note_payload, ws_payload))
+    }
+
+    /// Create a note holding `text` (an imported markdown file), titled
+    /// from its first line like a typed note. Returns the id plus every
+    /// payload that needs syncing, in commit order.
+    pub fn import_note(&mut self, text: &str) -> krabink_core::Result<(NoteId, Payloads)> {
+        let (id, note, workspace) = self.create_note()?;
+        let key = DocKey::from(id);
+        let mut payloads = vec![(key, note), (DocKey::WORKSPACE, workspace)];
+        if !text.is_empty() {
+            payloads.push((key, self.splice(id, 0, 0, text)?));
+        }
+        let meta = self.refresh_meta(id)?;
+        payloads.extend(meta.note.map(|p| (key, p)));
+        payloads.extend(meta.workspace.map(|p| (DocKey::WORKSPACE, p)));
+        Ok((id, payloads))
     }
 
     /// Remove notes from the synced registry and close them here. Note
@@ -295,5 +315,30 @@ mod tests {
         reloaded.sort();
         assert_eq!(reloaded, ours);
         assert!(docs.delete_notes(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn imported_note_reaches_a_peer_with_text_and_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut docs = Docs::load(Store::open(&dir.path().join("t.redb")).unwrap()).unwrap();
+        let text = "# Reading list\n\n- one\n- two\n";
+        let (id, payloads) = docs.import_note(text).unwrap();
+
+        // A peer applying the payloads in order has the same note.
+        let (ws, note): (Vec<_>, Vec<_>) = payloads
+            .iter()
+            .partition(|(doc, _)| *doc == DocKey::WORKSPACE);
+        assert!(note.iter().all(|(doc, _)| *doc == DocKey::from(id)));
+        let peer_ws = WorkspaceDoc::from_bytes(None, ws.iter().map(|(_, p)| p.as_slice())).unwrap();
+        let peer_note =
+            NoteDoc::from_bytes(id, None, note.iter().map(|(_, p)| p.as_slice())).unwrap();
+        assert_eq!(peer_note.text(), text);
+        assert_eq!(peer_note.title().as_deref(), Some("Reading list"));
+        let row = peer_ws.notes().into_iter().find(|n| n.id == id).unwrap();
+        assert_eq!(row.title, "Reading list");
+
+        // An empty file is still a note.
+        let (empty, _) = docs.import_note("").unwrap();
+        assert_eq!(docs.note(empty).unwrap().text(), "");
     }
 }
