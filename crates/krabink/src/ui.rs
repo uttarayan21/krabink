@@ -51,6 +51,9 @@ const TAIL_FRACTION: f32 = 0.6;
 const EMBED_FONT_SIZE: f32 = 8.0;
 /// Inline box caption size.
 const CAPTION_SIZE: f32 = 10.0;
+/// Height of the transparent macOS titlebar drawn over the panels; content
+/// starts below it so the traffic lights and drag strip stay clear.
+const TITLEBAR_INSET: i8 = if cfg!(target_os = "macos") { 28 } else { 0 };
 
 /// When set, the newest note auto-opens as the library changes (replay rig).
 #[derive(Resource, Default)]
@@ -572,7 +575,12 @@ fn editor_ui(
         .frame(
             egui::Frame::new()
                 .fill(palette.sidebar)
-                .inner_margin(egui::Margin::symmetric(12, 16)),
+                .inner_margin(egui::Margin {
+                    left: 12,
+                    right: 12,
+                    top: 16 + TITLEBAR_INSET,
+                    bottom: 16,
+                }),
         )
         .show(&mut root, |ui| {
             brand(ui, &palette);
@@ -676,7 +684,10 @@ fn editor_ui(
         .frame(
             egui::Frame::new()
                 .fill(palette.bg)
-                .inner_margin(egui::Margin::same(18)),
+                .inner_margin(egui::Margin {
+                    top: 18 + TITLEBAR_INSET,
+                    ..egui::Margin::same(18)
+                }),
         )
         .show(&mut root, |ui| {
             let Some(id) = editor.open else {

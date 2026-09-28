@@ -148,6 +148,11 @@ fn run_app(args: cli::Cli) -> Result<()> {
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: "krabink".into(),
+            // macOS: draw content under a transparent titlebar so the
+            // traffic lights sit on the sidebar. Ignored elsewhere.
+            fullsize_content_view: true,
+            titlebar_transparent: true,
+            titlebar_show_title: false,
             ..default()
         }),
         ..default()
