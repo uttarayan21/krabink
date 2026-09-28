@@ -44,10 +44,14 @@
         };
         inherit (pkgs) lib;
 
-        # iOS cross targets for krabink-ffi staticlib builds (Mac only).
+        # Mac only: iOS cross targets for krabink-ffi staticlib builds, and
+        # both mac archs for the universal Mac App Store binary
+        # (scripts/archive-macos.sh).
         iosTargets = lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
           "aarch64-apple-ios"
           "aarch64-apple-ios-sim"
+          "aarch64-apple-darwin"
+          "x86_64-apple-darwin"
         ];
         toolchain = pkgs.rust-bin.nightly.latest.default.override {
           targets = iosTargets;

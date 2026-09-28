@@ -11,7 +11,7 @@ the app actually does.
 | App icon | `ios/Krabink/Assets.xcassets/AppIcon.appiconset/AppIcon.png` | 1024×1024 opaque RGB, rendered by `scripts/gen-app-icon.py` (pure Python, no deps). Regenerate after changing `LogoMark`/`Theme.accent`. |
 | Privacy manifest | `ios/Krabink/PrivacyInfo.xcprivacy` | No tracking, no collected data; required-reason APIs: UserDefaults (CA92.1), file timestamps (C617.1), system boot time (35F9.1). |
 | Version / build | `project.yml` → `MARKETING_VERSION`, `CURRENT_PROJECT_VERSION` | Marketing version is hand-bumped with `Cargo.toml`. Build number = `git rev-list --count HEAD`, set by `scripts/archive-ios.sh`. |
-| Store metadata in Info.plist | `project.yml` → `info.properties` | Display name, productivity category, launch screen, orientations, usage strings (camera, local network, Bonjour), `krabink://` URL scheme, `ITSAppUsesNonExemptEncryption`. |
+| Store metadata in Info.plist | `project.yml` → `info.properties` | Display name, productivity category, launch screen, orientations, usage strings (camera, local network, Bonjour), `krabink://` URL scheme. No encryption key until ASC issues a compliance code (see below). |
 | Release config | `project.yml` → `settings.configs.Release` | iPad-only (`TARGETED_DEVICE_FAMILY: 2`), dSYMs. Debug stays universal for iPhone simulator checks. |
 | Dev screens | `KrabinkApp.swift` | Spike and brush-lab screens are `#if DEBUG`; store builds cannot reach them. |
 | Archive + export | `scripts/archive-ios.sh` (`paseo run archive-ios`) | Rebuilds the Rust core, archives Release, exports an `.ipa` or uploads to App Store Connect. |
@@ -36,9 +36,11 @@ the app actually does.
    the honest answer to "uses non-exempt encryption" is yes. On the first
    upload ASC asks the questions; answer "standard algorithms, not
    proprietary", file the annual self-classification report with BIS
-   (standard for open-source TLS), and paste the returned
-   `ITSEncryptionExportComplianceCode` into `project.yml` so later builds
-   skip the prompt.
+   (standard for open-source TLS). Until ASC issues an
+   `ITSEncryptionExportComplianceCode`, `project.yml` leaves
+   `ITSAppUsesNonExemptEncryption` out entirely: `true` without a code is
+   rejected at upload (ITMS-90592). Once a code exists, set both keys so
+   later builds skip the prompt.
 
 ## Per release
 
@@ -50,6 +52,34 @@ the app actually does.
    `ios/Krabink/build-archive/export/Krabink.ipa` instead.
 3. In ASC: attach the build to the version, fill "What's New", submit.
    TestFlight is the same build; add internal testers on the build page.
+
+## TestFlight
+
+A build shows up under TestFlight 5–30 minutes after the upload, once
+processing finishes.
+
+- **Missing Compliance**: with no `ITSAppUsesNonExemptEncryption` key
+  in Info.plist, every build stops at "Missing Compliance" until the
+  encryption questions are answered on the build page. Testers cannot install it before that.
+- **Internal testers** (App Store Connect users on the team, up to 100)
+  get the build as soon as compliance is answered; no review.
+- **External testers** (email invites or a public link, up to 10,000)
+  need Beta App Review for the first build of each version. It uses the
+  "Test Information" page:
+  - Beta App Description: "Krabink is a markdown notebook for iPad where
+    Apple Pencil ink lives on the page next to the text. Notes and ink
+    sync peer-to-peer between your own devices; no account."
+  - Feedback email and a contact (name, phone, email) for the reviewer.
+  - Sign-in: not required.
+  - Review notes: the same text as the App Store review notes below.
+- **What to Test** (per build, shown to testers): write the headline
+  changes since the last uploaded build, plus the standing asks: write
+  and sketch in a note, check the reading view, pair with a desktop and
+  confirm text and ink sync both ways, report the local-network prompt
+  if it never appears.
+- Testers send feedback from the TestFlight app (screenshot + text) and
+  crashes arrive symbolicated under TestFlight → Crashes, since the
+  archive uploads dSYMs.
 
 ## App Store Connect form answers
 
