@@ -20,6 +20,10 @@ pub struct Cli {
     /// changes. Meant for demos and the replay latency rig.
     #[clap(long)]
     pub follow_latest: bool,
+    /// Markdown files to import, one new note each; the last one opens.
+    /// With krabink already running on the same data dir, they are handed
+    /// to it instead.
+    pub files: Vec<std::path::PathBuf>,
 }
 
 #[derive(Debug, clap::Subcommand)]

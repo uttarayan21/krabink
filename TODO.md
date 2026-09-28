@@ -68,9 +68,10 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
       container narrower than ~200 pt wraps the hidden embed line and
       doubles the box.
 - [ ] Reading view renders no images or tables (source shows through).
-- [ ] Markdown import (Open in Krabink / sidebar importer) copies the file
-      into a new note: no write-back to the file, re-opening the same file
-      makes a second note, and relative image links in it do not resolve.
+- [ ] Markdown import (iPad: Open in Krabink / sidebar importer; desktop:
+      `krabink FILE.md`, desktop entry, drop) copies the file into a new
+      note: no write-back to the file, re-opening the same file makes a
+      second note, and relative image links in it do not resolve.
 - [ ] Wet ink carries no per-point size yet; receivers (desktop and iPad, same
       ribbon code) fall back to `base_width * force` until the commit lands.
 
@@ -82,6 +83,9 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
       bounds drift ~10 units past the tolerance (`shape.rs:2388`).
 
 ### Desktop
+- [ ] No Finder association on macOS: the desktop ships as a bare binary,
+      and a bundle's document types arrive as Apple Events that winit does
+      not surface. `krabink FILE.md` and dropping a file on the window work.
 - [ ] Cursor can jump when a remote edit lands while typing in the same note
       (buffer rebuilt; egui clamps). Cursor remap through remote deltas queued.
 - [ ] No bundled bold face: `Strong` is full-strength colour against a

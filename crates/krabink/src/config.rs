@@ -48,6 +48,8 @@ pub struct RuntimeConfig {
     /// Last UDP port the node was bound to; rebound on the next start so
     /// pairings and mDNS hints survive a restart.
     pub node_port_path: PathBuf,
+    /// Where the running app takes markdown files a later launch opens.
+    pub open_socket_path: PathBuf,
     pub device: DeviceId,
     /// Per-install token this node always accepts; what our QR carries
     /// until we adopt a workspace.
@@ -118,6 +120,7 @@ impl RuntimeConfig {
             node_store_path: data_dir.join("node.redb"),
             node_key_path: data_dir.join("node_key"),
             node_port_path: data_dir.join("node_port"),
+            open_socket_path: data_dir.join("open.sock"),
             device: load_device_id(&data_dir.join("device_id"))?,
             workspace_token: load_workspace_token(&data_dir)?,
             relay,

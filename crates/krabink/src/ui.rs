@@ -1151,7 +1151,7 @@ fn create_note(
     }
 }
 
-fn open_note(docs: &mut Docs, editor: &mut EditorState, id: NoteId) {
+pub(crate) fn open_note(docs: &mut Docs, editor: &mut EditorState, id: NoteId) {
     let text = docs.note(id).map(|n| n.text()).unwrap_or_default();
     editor.open = Some(id);
     editor.buffer = text.clone();
