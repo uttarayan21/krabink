@@ -14,6 +14,9 @@
     },
     "run-desktop": {
       "command": "scripts/run-desktop.sh"
+    },
+    "archive-macos": {
+      "command": "scripts/archive-macos.sh"
     }
   }
 }

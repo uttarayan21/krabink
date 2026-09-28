@@ -35,7 +35,12 @@ use crate::ui::EditorUiPlugin;
 pub struct Runtime(pub tokio::runtime::Runtime);
 
 fn main() -> Result<()> {
-    let args = cli::Cli::parse();
+    // Finder/LaunchServices can still pass a `-psn_<n>_<n>` process serial
+    // number to bundled apps; clap would reject it and the app would quit
+    // on launch.
+    let args = cli::Cli::parse_from(
+        std::env::args_os().filter(|arg| !arg.to_string_lossy().starts_with("-psn_")),
+    );
     match args.cmd {
         Some(cli::SubCommand::Completions { shell }) => {
             cli::Cli::completions(shell);

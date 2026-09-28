@@ -1,0 +1,83 @@
+# XcodeGen spec for the Mac App Store build of the desktop app (bevy +
+# egui, crates/krabink). Xcode compiles nothing here: a pre-build script
+# drops the universal Rust binary into the bundle and Xcode only does
+# what the store needs from it: Info.plist, icon, sandbox entitlements,
+# signing, archive, .pkg export and upload. Driven by
+# scripts/archive-macos.sh, which builds the binary first.
+name: Krabink
+options:
+  bundleIdPrefix: dev.darksailor
+  deploymentTarget:
+    macOS: "12.0"
+targets:
+  Krabink:
+    type: application
+    platform: macOS
+    sources:
+      # App icon, every mac size rendered from the iPad icon by
+      # scripts/gen-mac-icon.sh.
+      - Assets.xcassets
+      - path: ../ios/Krabink/PrivacyInfo.xcprivacy
+        buildPhase: resources
+    preBuildScripts:
+      - name: Embed Rust binary
+        # lipo'd aarch64 + x86_64 build from scripts/archive-macos.sh.
+        # The store rejects arm64-only native Mac apps.
+        script: |
+          set -euo pipefail
+          bin="$SRCROOT/../target/universal-apple-darwin/release/krabink"
+          if [[ ! -f "$bin" ]]; then
+            echo "error: $bin missing; run scripts/archive-macos.sh" >&2
+            exit 1
+          fi
+          mkdir -p "$TARGET_BUILD_DIR/$EXECUTABLE_FOLDER_PATH"
+          cp "$bin" "$TARGET_BUILD_DIR/$EXECUTABLE_PATH"
+        inputFiles:
+          - $(SRCROOT)/../target/universal-apple-darwin/release/krabink
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: Krabink
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.productivity
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        NSHighResolutionCapable: true
+        NSHumanReadableCopyright: © 2026 servius
+        # No ITSAppUsesNonExemptEncryption: same reasoning as the iPad
+        # spec (ios/Krabink/project.yml).
+        # macOS 15+ gates LAN access like iOS: mDNS advertise/browse and
+        # direct dials to peers on the local network.
+        NSLocalNetworkUsageDescription: >-
+          Krabink finds your other devices on the local network to sync
+          notes directly with them.
+        NSBonjourServices: [_krabink._udp]
+    entitlements:
+      path: Krabink.entitlements
+      properties:
+        # Mandatory for the Mac App Store. Stores and config resolve
+        # through $HOME, which the sandbox points at the container.
+        com.apple.security.app-sandbox: true
+        # iroh dials peers and the relay, and accepts peers' dials;
+        # mDNS both sends and listens.
+        com.apple.security.network.client: true
+        com.apple.security.network.server: true
+    settings:
+      base:
+        PRODUCT_NAME: Krabink
+        # Same bundle id as the iPad app: one App Store Connect record,
+        # universal purchase.
+        PRODUCT_BUNDLE_IDENTIFIER: dev.darksailor.krabink
+        # Bump with the workspace version in Cargo.toml. The build number
+        # is the commit count, set by scripts/archive-macos.sh.
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: 1
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_HARDENED_RUNTIME: YES
+        # The binary is built outside Xcode: nothing to make dSYMs from,
+        # and the script writes into the bundle directly.
+        DEBUG_INFORMATION_FORMAT: dwarf
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+    scheme: {}
