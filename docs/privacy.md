@@ -16,4 +16,4 @@ devices. If you install the app through TestFlight, Apple may share
 crash reports and feedback you choose to send with the developer under
 Apple's own privacy policy.
 
-Questions: servius@darksailor.dev
+Questions: krabink@darksailor.dev
