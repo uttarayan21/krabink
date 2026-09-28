@@ -68,6 +68,9 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
       container narrower than ~200 pt wraps the hidden embed line and
       doubles the box.
 - [ ] Reading view renders no images or tables (source shows through).
+- [ ] Markdown import (Open in Krabink / sidebar importer) copies the file
+      into a new note: no write-back to the file, re-opening the same file
+      makes a second note, and relative image links in it do not resolve.
 - [ ] Wet ink carries no per-point size yet; receivers (desktop and iPad, same
       ribbon code) fall back to `base_width * force` until the commit lands.
 

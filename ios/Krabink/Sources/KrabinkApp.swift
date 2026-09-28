@@ -3,6 +3,7 @@
 
 import KrabinkCore
 import SwiftUI
+import UniformTypeIdentifiers
 
 @main
 struct KrabinkApp: App {
@@ -39,15 +40,17 @@ struct KrabinkApp: App {
 
     private var mainView: some View {
         ContentView(model: model)
-            .onOpenURL { url in
-                // Scanned pairing QR / deep link: adopt server+token.
-                _ = model.adoptPair(uri: url.absoluteString)
-            }
             // Light or dark follows the Catppuccin flavour; the page
             // paper is the flavour's card colour on both platforms.
             .preferredColorScheme(theme.flavor.colorScheme)
             .tint(Theme.accent)
     }
+}
+
+extension UTType {
+    /// Declared in project.yml (UTImportedTypeDeclarations): iOS has no
+    /// built-in markdown type.
+    static let markdownText = UTType(importedAs: "net.daringfireball.markdown", conformingTo: .plainText)
 }
 
 struct ContentView: View {
@@ -59,12 +62,36 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var confirmBulkDelete = false
     @State private var confirmBulkDeleteFinal = false
+    @State private var importing = false
+    @State private var importFailed: [String] = []
 
     var body: some View {
         NavigationSplitView {
             sidebar
         } detail: {
             detail
+        }
+        .onOpenURL { url in
+            if url.isFileURL {
+                // "Open in Krabink" on a markdown file.
+                importFiles([url])
+            } else {
+                // Scanned pairing QR / deep link: adopt server+token.
+                _ = model.adoptPair(uri: url.absoluteString)
+            }
+        }
+        .fileImporter(
+            isPresented: $importing,
+            allowedContentTypes: [.markdownText, .plainText],
+            allowsMultipleSelection: true
+        ) { result in
+            if case .success(let urls) = result { importFiles(urls) }
+        }
+        .alert(
+            "could not import \(importFailed.joined(separator: ", "))",
+            isPresented: Binding(get: { !importFailed.isEmpty }, set: { if !$0 { importFailed = [] } })
+        ) {
+            Button("ok", role: .cancel) {}
         }
     }
 
@@ -174,6 +201,15 @@ struct ContentView: View {
                     Image(systemName: "checkmark.circle")
                 }
                 .accessibilityIdentifier("selectNotes")
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    importing = true
+                } label: {
+                    Image(systemName: "square.and.arrow.down")
+                }
+                .accessibilityLabel("import markdown")
+                .accessibilityIdentifier("importMarkdown")
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -287,6 +323,24 @@ struct ContentView: View {
 
     private func createNote() {
         if let id = model.createNote() { selection = [id] }
+    }
+
+    /// One note per file; the last one imported opens.
+    private func importFiles(_ urls: [URL]) {
+        var opened: String?
+        var failed: [String] = []
+        for url in urls {
+            if let id = model.importMarkdown(url: url) {
+                opened = id
+            } else {
+                failed.append(url.lastPathComponent)
+            }
+        }
+        if let opened {
+            editMode = .inactive
+            selection = [opened]
+        }
+        importFailed = failed
     }
 
     private func bulkDelete() {

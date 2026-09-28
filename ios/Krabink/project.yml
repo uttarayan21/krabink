@@ -59,6 +59,25 @@ targets:
         CFBundleURLTypes:
           - CFBundleURLName: dev.darksailor.krabink.pair
             CFBundleURLSchemes: [krabink]
+        # "Open in Krabink" for markdown files (Files, share sheet, AirDrop):
+        # the file is imported as a new note to annotate with the Pencil.
+        # Viewer, not Editor: the note is a copy, the file is left as is.
+        # Alternate rank so a dedicated markdown editor stays the default.
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Markdown
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [net.daringfireball.markdown]
+        # iOS does not declare the markdown type itself; importing it makes
+        # .md/.markdown files resolve to it (a system or app declaration
+        # wins if one exists).
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: net.daringfireball.markdown
+            UTTypeDescription: Markdown
+            UTTypeConformsTo: [public.plain-text]
+            UTTypeTagSpecification:
+              public.filename-extension: [md, markdown, mdown, mkd]
+              public.mime-type: [text/markdown]
         NSCameraUsageDescription: >-
           Krabink uses the camera to scan another device's pairing QR code.
         NSLocalNetworkUsageDescription: >-
