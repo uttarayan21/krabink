@@ -51,7 +51,9 @@ pub use ids::{DeviceId, ElementId, NoteId, SketchId, StrokeId};
 pub use inline::{
     INLINE_MIN_HEIGHT, INLINE_PADDING, outline_bounds, points_bounds, sketch_box_height,
 };
-pub use markdown::{PreviewText, StyleKind, StyleRun, preview_text, style_runs};
+pub use markdown::{
+    PreviewText, StyleKind, StyleRun, preview_text, sketch_embed_title, style_runs,
+};
 pub use note::NoteDoc;
 pub use pair::PairInfo;
 pub use shape::{Recognition, RecognizerParams, Shape, recognize, recognize_with};

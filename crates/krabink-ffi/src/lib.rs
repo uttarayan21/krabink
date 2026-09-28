@@ -21,7 +21,8 @@ pub use brush::{
 };
 pub use engine::{Core, CoreListener, KrabinkError, NoteListener, NoteSession};
 pub use markdown::{
-    PreviewText, StyleKind, StyleRun, inline_min_height, inline_padding, preview_text, style_runs,
+    PreviewText, StyleKind, StyleRun, inline_min_height, inline_padding, preview_text,
+    sketch_embed_title, style_runs,
 };
 pub use types::{
     Binding, BrushInfo, DeviceInfo, Element, NoteInfo, PageElement, PageProbe, PairInfo, PeerInfo,

@@ -115,6 +115,14 @@ pub fn preview_text(text: String) -> PreviewText {
     }
 }
 
+/// The caption of an inline sketch from its embed text (the run's span
+/// of the source): the alt of `![title](krabink://sketch/…)`, trimmed;
+/// `None` when blank.
+#[uniffi::export]
+pub fn sketch_embed_title(embed: String) -> Option<String> {
+    pcore::sketch_embed_title(&embed).map(str::to_owned)
+}
+
 /// Inset from an inline sketch box's top-left corner to the sketch's
 /// local origin, in points. Shared by every platform so ink lines up.
 #[uniffi::export]

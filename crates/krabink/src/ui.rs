@@ -26,7 +26,7 @@ use bevy_egui::{EguiContexts, EguiPrimaryContextPass, egui};
 use egui::text::{ByteIndex, CCursor, LayoutJob, LayoutSection, TextFormat};
 use krabink_core::{
     Anchor, DocKey, ElementId, INLINE_MIN_HEIGHT, INLINE_PADDING, NoteDoc, NoteId, SketchId,
-    StyleKind, StyleRun, preview_text, sketch_box_height, style_runs,
+    StyleKind, StyleRun, preview_text, sketch_box_height, sketch_embed_title, style_runs,
 };
 
 use crate::docs::Docs;
@@ -168,10 +168,12 @@ impl StyledCache {
 }
 
 /// An inline sketch's box in galley space.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InlineBox {
     pub sketch: SketchId,
     pub rect: egui::Rect,
+    /// The embed's alt text, the box caption; `None` for a blank alt.
+    pub title: Option<String>,
 }
 
 impl InlineBox {
@@ -292,11 +294,19 @@ impl PageLayout {
     }
 }
 
-/// `(sketch, start)` of every inline embed run, in text order.
-fn embeds_of(runs: &[StyleRun]) -> Vec<(SketchId, usize)> {
+/// An inline embed run: `(sketch, start, title)`, the title being the
+/// embed's alt text in `text` (the text the runs were made for).
+type Embed = (SketchId, usize, Option<String>);
+
+/// Every inline embed run, in text order.
+fn embeds_of(runs: &[StyleRun], text: &str) -> Vec<Embed> {
     runs.iter()
         .filter_map(|r| match r.kind {
-            StyleKind::SketchEmbed { sketch } => Some((sketch, r.start)),
+            StyleKind::SketchEmbed { sketch } => {
+                let embed: String = text.chars().skip(r.start).take(r.end - r.start).collect();
+                let title = sketch_embed_title(&embed).map(str::to_owned);
+                Some((sketch, r.start, title))
+            }
             _ => None,
         })
         .collect()
@@ -307,18 +317,19 @@ fn embeds_of(runs: &[StyleRun]) -> Vec<(SketchId, usize)> {
 /// container).
 fn inline_boxes(
     galley: &egui::Galley,
-    embeds: &[(SketchId, usize)],
+    embeds: &[Embed],
     heights: &HashMap<SketchId, f32>,
     width: f32,
 ) -> Vec<InlineBox> {
     embeds
         .iter()
-        .map(|&(sketch, start)| {
-            let top = galley.pos_from_cursor(CCursor::new(start)).min.y;
-            let height = heights.get(&sketch).copied().unwrap_or(INLINE_MIN_HEIGHT);
+        .map(|(sketch, start, title)| {
+            let top = galley.pos_from_cursor(CCursor::new(*start)).min.y;
+            let height = heights.get(sketch).copied().unwrap_or(INLINE_MIN_HEIGHT);
             InlineBox {
-                sketch,
+                sketch: *sketch,
                 rect: egui::Rect::from_min_size(egui::pos2(0.0, top), egui::vec2(width, height)),
+                title: title.clone(),
             }
         })
         .collect()
@@ -342,7 +353,7 @@ fn paint_inline_frames(
         painter.text(
             rect.min + egui::vec2(INLINE_PADDING, 2.0),
             egui::Align2::LEFT_TOP,
-            "sketch",
+            b.title.as_deref().unwrap_or("sketch"),
             egui::FontId::proportional(CAPTION_SIZE),
             palette.muted,
         );
@@ -749,7 +760,9 @@ fn editor_ui(
                         // Boxes only in the reading view: the editor shows
                         // the embed line as text, like any other source.
                         let heights = preview.then_some(heights);
-                        let embeds = heights.map(|_| embeds_of(runs)).unwrap_or_default();
+                        let embeds = heights
+                            .map(|_| embeds_of(runs, text.as_str()))
+                            .unwrap_or_default();
                         let mut layouter =
                             |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
                                 let job =
@@ -1502,9 +1515,20 @@ mod tests {
     #[test]
     fn embeds_are_listed_in_text_order() {
         let text = format!("{}![again](krabink://sketch/{SKETCH})\n", embed_text());
-        let embeds = embeds_of(&style_runs(&text));
-        assert_eq!(embeds, vec![(SKETCH.parse().unwrap(), 2)]);
-        assert!(embeds_of(&style_runs("plain\n")).is_empty());
+        let embeds = embeds_of(&style_runs(&text), &text);
+        assert_eq!(
+            embeds,
+            vec![(SKETCH.parse().unwrap(), 2, Some("sketch".into()))]
+        );
+        assert!(embeds_of(&style_runs("plain\n"), "plain\n").is_empty());
+        // The caption is the alt text; a blank alt has none.
+        let text = format!("![Daemon Diagram](krabink://sketch/{SKETCH})\n");
+        assert_eq!(
+            embeds_of(&style_runs(&text), &text)[0].2.as_deref(),
+            Some("Daemon Diagram")
+        );
+        let text = format!("![](krabink://sketch/{SKETCH})\n");
+        assert_eq!(embeds_of(&style_runs(&text), &text)[0].2, None);
     }
 
     #[test]
@@ -1512,6 +1536,7 @@ mod tests {
         let b = InlineBox {
             sketch: SKETCH.parse().unwrap(),
             rect: egui::Rect::from_min_size(egui::pos2(0.0, 30.0), egui::vec2(500.0, 160.0)),
+            title: None,
         };
         assert_eq!(
             b.origin(),

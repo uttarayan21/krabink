@@ -123,6 +123,8 @@ enum InlineGeometry {
 struct InlineBox: Equatable {
     let sketch: String
     let rect: CGRect
+    /// The box caption: the embed's alt text, `nil` when blank.
+    let title: String?
     /// The sketch's (0, 0): the box corner inset by the padding.
     var origin: CGPoint {
         CGPoint(x: rect.minX + InlineGeometry.padding, y: rect.minY + InlineGeometry.padding)
@@ -224,7 +226,7 @@ struct LineLayout {
     /// The boxes of `embeds` (sketch id, display scalar of the embed's
     /// first char): each spans the text's width at the top of its line,
     /// `heights[sketch]` tall (the minimum when unknown).
-    func inlineBoxes(embeds: [(sketch: String, scalar: Int)], heights: [String: CGFloat]) -> [InlineBox] {
+    func inlineBoxes(embeds: [MarkdownStyler.Embed], heights: [String: CGFloat]) -> [InlineBox] {
         guard !embeds.isEmpty else { return [] }
         let inset = textView.textContainerInset
         let width = max(0, container.size.width - 2 * container.lineFragmentPadding)
@@ -234,7 +236,8 @@ struct LineLayout {
             let height = heights[embed.sketch] ?? InlineGeometry.minHeight
             return InlineBox(
                 sketch: embed.sketch,
-                rect: CGRect(x: anchorLeft, y: top, width: width, height: height))
+                rect: CGRect(x: anchorLeft, y: top, width: width, height: height),
+                title: embed.title)
         }
     }
 

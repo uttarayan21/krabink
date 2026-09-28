@@ -321,7 +321,7 @@ Bevy app with egui UI. Modules:
   caches `sketch_box_height` per sketch on the doc version, re-measuring
   only sketches whose element count moved. Right after the `TextEdit`
   lays out, `inline_boxes` reads each embed's row top and the frame
-  (hairline border, "sketch" caption) is painted with the egui painter
+  (hairline border, caption = the embed's alt text, "sketch" when blank) is painted with the egui painter
   above the text; `PageLayout.boxes` / `box_origin` hand the padded
   corner to the scene. The page texture is painted under the text at the
   scrolled rect. `settings.rs`: sync state, devices, pairing QR,
@@ -471,7 +471,7 @@ Bonjour usage strings, file sharing for recordings).
   x = the ink origin's left edge, top = the embed row's first fragment,
   width = the container's, height from the cache) and frames them with
   `InlineBoxOverlay`, a non-interactive subview of the text view (one
-  `CAShapeLayer` border and `CATextLayer` "sketch" caption per box)
+  `CAShapeLayer` border and `CATextLayer` caption per box, the alt text or "sketch")
   drawn above ink and text. Leaving the reading view drops the boxes,
   and with them the inline ink, until the next toggle. The caret's
   source scalar is reported to the model on every selection change.

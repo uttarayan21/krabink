@@ -72,7 +72,7 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
     private let boxOverlay = InlineBoxOverlay()
     private var index = ScalarIndex("")
     /// Inline sketch embeds of the displayed text (display scalars).
-    private var embeds: [(sketch: String, scalar: Int)] = []
+    private var embeds: [MarkdownStyler.Embed] = []
     /// Box height per sketch, dropped when the sketch changes.
     private var boxHeights: [String: CGFloat] = [:]
     /// The boxes as of the last completed layout.
@@ -234,7 +234,7 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
     /// Note the embeds among `runs` (reading view) and make sure each has
     /// a height.
     private func collectEmbeds(_ runs: [StyleRun]) {
-        embeds = MarkdownStyler.embeds(in: runs)
+        embeds = MarkdownStyler.embeds(in: runs, text: (textView.text ?? "") as NSString, index: index)
         for embed in embeds where boxHeights[embed.sketch] == nil {
             let height = (try? model.session.sketchBoxHeight(sketch: embed.sketch)).map { CGFloat($0) }
             boxHeights[embed.sketch] = height ?? InlineGeometry.minHeight
@@ -473,8 +473,9 @@ final class CanvasLineLayout: LineLayoutProvider {
 }
 
 /// Frames the inline sketch boxes: a hairline rounded border and a
-/// "sketch" caption per box, in the text view's content space, above
-/// the ink and the text. Takes no touches.
+/// caption (the embed's alt text, "sketch" when blank) per box, in the
+/// text view's content space, above the ink and the text. Takes no
+/// touches.
 @MainActor
 final class InlineBoxOverlay: UIView {
     private static let cornerRadius: CGFloat = 8
@@ -505,11 +506,10 @@ final class InlineBoxOverlay: UIView {
             layer.addSublayer(frame)
             frames.append(frame)
             let caption = CATextLayer()
-            caption.string = "sketch"
             caption.font = UIFont.systemFont(ofSize: Self.captionSize)
             caption.fontSize = Self.captionSize
             caption.isWrapped = false
-            caption.truncationMode = .none
+            caption.truncationMode = .end
             layer.addSublayer(caption)
             captions.append(caption)
         }
@@ -519,9 +519,11 @@ final class InlineBoxOverlay: UIView {
             frames[i].path = UIBezierPath(
                 roundedRect: box.rect.insetBy(dx: 0.5, dy: 0.5), cornerRadius: Self.cornerRadius
             ).cgPath
+            captions[i].string = box.title ?? "sketch"
             captions[i].frame = CGRect(
                 x: box.rect.minX + InlineGeometry.padding, y: box.rect.minY + 2,
-                width: 80, height: Self.captionSize + 4)
+                width: max(0, box.rect.width - 2 * InlineGeometry.padding),
+                height: Self.captionSize + 4)
         }
         CATransaction.commit()
         recolor()

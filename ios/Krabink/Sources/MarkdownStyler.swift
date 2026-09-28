@@ -71,12 +71,17 @@ enum MarkdownStyler {
         storage.endEditing()
     }
 
-    /// The inline sketches among `runs`, in text order: sketch id and the
-    /// scalar the embed starts at (in the text the runs were made for).
-    static func embeds(in runs: [StyleRun]) -> [(sketch: String, scalar: Int)] {
+    /// An inline sketch embed: sketch id, the scalar the embed starts at
+    /// and its caption (the alt text; `nil` when blank).
+    typealias Embed = (sketch: String, scalar: Int, title: String?)
+
+    /// The inline sketches among `runs`, in text order; `text` and `index`
+    /// are the text the runs were made for.
+    static func embeds(in runs: [StyleRun], text: NSString, index: ScalarIndex) -> [Embed] {
         runs.compactMap { run in
-            if case .sketchEmbed(let sketch) = run.kind { return (sketch, Int(run.start)) }
-            return nil
+            guard case .sketchEmbed(let sketch) = run.kind else { return nil }
+            let range = utf16Range(run, index: index, length: text.length)
+            return (sketch, Int(run.start), sketchEmbedTitle(embed: text.substring(with: range)))
         }
     }
 

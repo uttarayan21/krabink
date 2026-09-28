@@ -173,6 +173,16 @@ pub fn style_runs(text: &str) -> Vec<StyleRun> {
     runs
 }
 
+/// The caption of an inline sketch from its embed text,
+/// `![title](krabink://sketch/…)`: the image's alt text, trimmed. `None`
+/// when blank, so the editors fall back to a generic label.
+pub fn sketch_embed_title(embed: &str) -> Option<&str> {
+    let inner = embed.trim().strip_prefix("![")?;
+    let end = inner.rfind("](")?;
+    let title = inner[..end].trim();
+    (!title.is_empty()).then_some(title)
+}
+
 /// The sketch an image at byte `range` embeds: its destination is a
 /// `krabink://sketch/` URI with a ULID, the image is the only non-blank
 /// content of its source line, and the id was not embedded before.
@@ -706,6 +716,31 @@ mod tests {
             .collect();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].0, EMBED.chars().count() + 2);
+    }
+
+    #[test]
+    fn sketch_embed_title_is_the_alt_text() {
+        assert_eq!(sketch_embed_title(EMBED), Some("sketch"));
+        assert_eq!(
+            sketch_embed_title(
+                "  ![ Daemon Diagram ](krabink://sketch/01ARZ3NDEKTSV4RRFFQ69G5FAV)\n"
+            ),
+            Some("Daemon Diagram")
+        );
+        assert_eq!(
+            sketch_embed_title("![](krabink://sketch/01ARZ3NDEKTSV4RRFFQ69G5FAV)"),
+            None
+        );
+        assert_eq!(
+            sketch_embed_title("![ ](krabink://sketch/01ARZ3NDEKTSV4RRFFQ69G5FAV)"),
+            None
+        );
+        assert_eq!(sketch_embed_title("plain"), None);
+        // A `](` inside the title still splits at the destination.
+        assert_eq!(
+            sketch_embed_title("![a](b](krabink://sketch/01ARZ3NDEKTSV4RRFFQ69G5FAV)"),
+            Some("a](b")
+        );
     }
 
     #[test]
