@@ -480,11 +480,14 @@ private struct NoteDetail: View {
                     .foregroundStyle(Theme.muted)
             }
             // Live ink counters: what the UI tests and on-device checks read.
+            // Dev tooling only: store (Release) builds ship without them.
+            #if DEBUG
             Text(note.ink.status)
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(Theme.muted)
                 .lineLimit(1)
                 .accessibilityIdentifier("sketchStatus")
+            #endif
             Caption(preview ? "preview" : "markdown")
         }
         .padding(.horizontal, Theme.pagePadding + 4)

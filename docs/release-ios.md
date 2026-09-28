@@ -92,6 +92,14 @@ processing finishes.
   iPad-only apps. Capture from the archive build on the M4 iPad Pro: note
   list with a note open, the reading view of a note with ink on it, the
   page mid-stroke with the keyboard up, settings with a paired desktop.
+  A simulator set with placeholder notes and ink lives in
+  `docs/screenshots/ipad/` (git LFS; 2752×2064, iPad Pro 13" landscape).
+  `UITests/ScreenshotUITests.swift` regenerates it: on a fresh iPad Pro
+  13" simulator, `xcodebuild test -configuration Release
+  -only-testing:KrabinkUITests/ScreenshotUITests -resultBundlePath …`,
+  then `xcrun xcresulttool export attachments`. The exported PNGs carry
+  an orientation tag rather than rotated pixels: strip the `eXIf`/`iTXt`
+  chunks and `sips -r 270` them before uploading.
 - **Review notes**: the app is fully usable unpaired (local notes and
   ink). Pairing needs a second device running the desktop app or
   `krabink-server`; say so, and that no account exists. If review asks
