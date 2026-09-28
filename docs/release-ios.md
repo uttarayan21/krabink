@@ -51,6 +51,35 @@ the app actually does.
 3. In ASC: attach the build to the version, fill "What's New", submit.
    TestFlight is the same build; add internal testers on the build page.
 
+## TestFlight
+
+A build shows up under TestFlight 5–30 minutes after the upload, once
+processing finishes.
+
+- **Missing Compliance**: `ITSAppUsesNonExemptEncryption` is `true` and
+  there is no `ITSEncryptionExportComplianceCode` yet, so every build
+  stops at "Missing Compliance" until the encryption questions are
+  answered on the build page. Testers cannot install it before that.
+- **Internal testers** (App Store Connect users on the team, up to 100)
+  get the build as soon as compliance is answered; no review.
+- **External testers** (email invites or a public link, up to 10,000)
+  need Beta App Review for the first build of each version. It uses the
+  "Test Information" page:
+  - Beta App Description: "Krabink is a markdown notebook for iPad where
+    Apple Pencil ink lives on the page next to the text. Notes and ink
+    sync peer-to-peer between your own devices; no account."
+  - Feedback email and a contact (name, phone, email) for the reviewer.
+  - Sign-in: not required.
+  - Review notes: the same text as the App Store review notes below.
+- **What to Test** (per build, shown to testers): write the headline
+  changes since the last uploaded build, plus the standing asks: write
+  and sketch in a note, check the reading view, pair with a desktop and
+  confirm text and ink sync both ways, report the local-network prompt
+  if it never appears.
+- Testers send feedback from the TestFlight app (screenshot + text) and
+  crashes arrive symbolicated under TestFlight → Crashes, since the
+  archive uploads dSYMs.
+
 ## App Store Connect form answers
 
 - **App Privacy**: "Data Not Collected". The device registry (name,
