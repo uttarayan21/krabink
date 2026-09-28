@@ -40,12 +40,13 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSApplicationCategoryType: public.app-category.productivity
-        # iroh ships its own TLS (rustls/ring) rather than using the OS
-        # stack, which Apple does not treat as exempt: App Store Connect
-        # asks the export-compliance questions on the first upload and
-        # hands back an ITSEncryptionExportComplianceCode to add here.
+        # No ITSAppUsesNonExemptEncryption on purpose: iroh ships its own
+        # TLS (rustls/ring) rather than the OS stack, so the honest value
+        # is true, but ASC rejects true without an
+        # ITSEncryptionExportComplianceCode (ITMS-90592). Leaving the key
+        # out makes ASC ask the export-compliance questions per build
+        # instead; once it issues a code, set both keys here.
         # See docs/release-ios.md.
-        ITSAppUsesNonExemptEncryption: true
         UILaunchScreen: {}
         # Documents visible in Files, for `-recordStrokes 1` recordings.
         UIFileSharingEnabled: true
