@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 
 use crate::brush::AssetInfo;
 use crate::engine::{CoreListener, NoteListener, Shared};
-use crate::types::{BrushInfo, DeviceInfo, NoteInfo, SyncState, rgba_to_u32};
+use crate::types::{AppearanceInfo, BrushInfo, DeviceInfo, NoteInfo, SyncState, rgba_to_u32};
 
 pub(crate) enum Cmd {
     Subscribe(DocKey),
@@ -409,6 +409,7 @@ enum Notify {
     Brushes(Arc<dyn CoreListener>, Vec<BrushInfo>),
     Assets(Arc<dyn CoreListener>, Vec<AssetInfo>),
     Devices(Arc<dyn CoreListener>, Vec<DeviceInfo>),
+    Appearance(Arc<dyn CoreListener>, Option<AppearanceInfo>),
     Text(Arc<dyn NoteListener>, String),
     Page(Arc<dyn NoteListener>),
     Strokes(Arc<dyn NoteListener>, String),
@@ -421,6 +422,7 @@ impl Notify {
             Self::Brushes(listener, brushes) => listener.brushes_changed(brushes),
             Self::Assets(listener, assets) => listener.assets_changed(assets),
             Self::Devices(listener, devices) => listener.devices_changed(devices),
+            Self::Appearance(listener, appearance) => listener.appearance_changed(appearance),
             Self::Text(listener, text) => listener.text_changed(text),
             Self::Page(listener) => listener.page_changed(),
             Self::Strokes(listener, sketch) => listener.strokes_changed(sketch),
@@ -473,7 +475,10 @@ impl ClientDocs for Docs<'_> {
                     .into_iter()
                     .map(Into::into)
                     .collect();
-                self.pending.push(Notify::Devices(listener, devices));
+                self.pending
+                    .push(Notify::Devices(listener.clone(), devices));
+                let appearance = state.workspace.appearance().map(Into::into);
+                self.pending.push(Notify::Appearance(listener, appearance));
             }
             return Ok(changed);
         }

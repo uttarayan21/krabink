@@ -28,6 +28,8 @@ struct FileConfig {
     theme: Option<Flavor>,
     /// Sketch paper as `#rrggbb`; the flavour's card colour when unset.
     paper: Option<String>,
+    /// Follow (and share) the workspace's look; on when unset.
+    sync_theme: Option<bool>,
     /// Nodes this desktop dials.
     #[serde(default)]
     peers: Vec<PeerFile>,
@@ -67,6 +69,8 @@ pub struct RuntimeConfig {
     pub theme: Flavor,
     /// Picked sketch paper colour; `None` follows the flavour.
     pub paper: Option<Color32>,
+    /// Whether the theme follows the workspace's shared look.
+    pub sync_theme: bool,
 }
 
 impl RuntimeConfig {
@@ -140,6 +144,7 @@ impl RuntimeConfig {
                 }
                 paper
             }),
+            sync_theme: file.sync_theme.unwrap_or(true),
         })
     }
 
@@ -240,6 +245,19 @@ pub fn persist_theme(theme: Flavor) -> Result<std::path::PathBuf> {
 /// Remember the picked paper colour (`None`: follow the flavour).
 pub fn persist_paper(paper: Option<Color32>) -> Result<std::path::PathBuf> {
     update_config(|file| file.paper = paper.map(theme::to_hex))
+}
+
+/// Remember a look adopted from the workspace, in one write.
+pub fn persist_appearance(flavor: Flavor, paper: Option<Color32>) -> Result<std::path::PathBuf> {
+    update_config(|file| {
+        file.theme = Some(flavor);
+        file.paper = paper.map(theme::to_hex);
+    })
+}
+
+/// Remember whether this desktop syncs its theme with the workspace.
+pub fn persist_sync_theme(enabled: bool) -> Result<std::path::PathBuf> {
+    update_config(|file| file.sync_theme = Some(enabled))
 }
 
 /// The machine's hostname: what a desktop is called until renamed.

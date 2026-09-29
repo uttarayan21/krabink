@@ -36,12 +36,12 @@ struct SettingsScreen: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 6)
                     PaperPicker(theme: theme)
+                    Toggle("sync theme with other devices", isOn: $theme.syncTheme)
+                        .accessibilityIdentifier("syncTheme")
                 } header: {
                     Caption("Appearance")
                 } footer: {
-                    Text(theme.paper == nil
-                        ? "Catppuccin flavours, lightest to darkest. Sketch paper follows the card colour; pick on the wheel for your own."
-                        : "Catppuccin flavours, lightest to darkest. Notes are drawn on the picked paper whatever the flavour; text switches to stay readable.")
+                    Text(appearanceFooter)
                         .foregroundStyle(Theme.muted)
                 }
 
@@ -263,6 +263,16 @@ struct SettingsScreen: View {
         }
         .preferredColorScheme(theme.flavor.colorScheme)
         .tint(Theme.accent)
+    }
+
+    private var appearanceFooter: String {
+        let paper = theme.paper == nil
+            ? "Sketch paper follows the card colour; pick on the wheel for your own."
+            : "Notes are drawn on the picked paper whatever the flavour; text switches to stay readable."
+        let sync = theme.syncTheme
+            ? "Flavour and paper follow the workspace: a change here, or on any device syncing its theme, restyles them all."
+            : "This iPad keeps its own flavour and paper."
+        return "Catppuccin flavours, lightest to darkest. \(paper) \(sync)"
     }
 
     private func row(_ label: String, _ value: String, mono: Bool = false) -> some View {

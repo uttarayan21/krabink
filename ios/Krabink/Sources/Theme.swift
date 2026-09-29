@@ -100,16 +100,31 @@ struct Palette {
         warn: Color(hex: 0xF9E2AF), danger: Color(hex: 0xF38BA8))
 }
 
+/// A look as the workspace shares it (`AppearanceInfo` over the FFI):
+/// flavour by raw value, paper as `0xRRGGBB`.
+struct SharedLook: Equatable {
+    var flavor: String
+    var paper: UInt32?
+}
+
 /// The chosen flavour and paper, persisted as `theme` and `paper` in
 /// UserDefaults. Views that read any `Theme.*` colour in their body
 /// observe it and restyle when it changes; UIKit-backed views take the
 /// flavour and paper as inputs so their `updateUIView` runs too.
+///
+/// With `syncTheme` on (the default) the look is the workspace's: local
+/// changes are shared through the core, and a shared look that changes
+/// is applied here. The desktop does the same (`ThemeSync` in
+/// crates/krabink/src/theme.rs).
 @Observable
 final class ThemeStore {
     static let shared = ThemeStore()
 
     var flavor: ThemeFlavor {
-        didSet { UserDefaults.standard.set(flavor.rawValue, forKey: "theme") }
+        didSet {
+            UserDefaults.standard.set(flavor.rawValue, forKey: "theme")
+            localChanged()
+        }
     }
 
     /// Picked paper as `0xRRGGBB`, kept across flavour switches; `nil`
@@ -121,7 +136,70 @@ final class ThemeStore {
             } else {
                 UserDefaults.standard.removeObject(forKey: "paper")
             }
+            localChanged()
         }
+    }
+
+    /// Follow and share the workspace's look. Turning it on takes the
+    /// workspace's look if it has one, else offers this iPad's.
+    var syncTheme: Bool {
+        didSet {
+            UserDefaults.standard.set(syncTheme, forKey: "syncTheme")
+            lastShared = nil
+            pendingShare?.cancel()
+            guard syncTheme else { return }
+            if let shared = readShared?() {
+                sharedChanged(shared)
+            } else {
+                shareSoon(after: 0)
+            }
+        }
+    }
+
+    /// The workspace's look through the core; wired up by `AppModel`.
+    @ObservationIgnored var readShared: (() -> SharedLook?)?
+    @ObservationIgnored var writeShared: ((SharedLook) -> Void)?
+    /// The shared look last seen. Only a change is applied, so a local
+    /// pick not yet shared (the wheel mid-drag) is not snapped back by an
+    /// unrelated workspace update.
+    @ObservationIgnored private var lastShared: SharedLook?
+    @ObservationIgnored private var applyingShared = false
+    @ObservationIgnored private var pendingShare: DispatchWorkItem?
+
+    /// This device's look, as the workspace would share it.
+    var look: SharedLook { SharedLook(flavor: flavor.rawValue, paper: paper) }
+
+    /// The workspace's look as of the latest workspace update: applied
+    /// when it changed since last seen and this iPad syncs its theme.
+    func sharedChanged(_ shared: SharedLook?) {
+        guard syncTheme, shared != lastShared else { return }
+        lastShared = shared
+        guard let shared, shared != look,
+            let flavor = ThemeFlavor(rawValue: shared.flavor)
+        else { return }
+        // The peer's pick is newer than whatever was waiting to go out.
+        pendingShare?.cancel()
+        applyingShared = true
+        self.flavor = flavor
+        paper = shared.paper
+        applyingShared = false
+    }
+
+    /// Share a local pick, debounced so dragging the wheel sends only
+    /// where it settles.
+    private func localChanged() {
+        guard syncTheme, !applyingShared else { return }
+        shareSoon(after: 0.3)
+    }
+
+    private func shareSoon(after delay: TimeInterval) {
+        pendingShare?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.syncTheme else { return }
+            self.writeShared?(self.look)
+        }
+        pendingShare = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
     var palette: Palette { flavor.palette }
@@ -158,6 +236,7 @@ final class ThemeStore {
         let stored = defaults.string(forKey: "theme") ?? ""
         flavor = ThemeFlavor(rawValue: stored) ?? .mocha
         paper = (defaults.object(forKey: "paper") as? Int).map { UInt32(truncatingIfNeeded: $0) & 0xFF_FFFF }
+        syncTheme = defaults.object(forKey: "syncTheme") as? Bool ?? true
     }
 }
 

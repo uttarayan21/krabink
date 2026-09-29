@@ -52,6 +52,16 @@ pub struct AssetMeta {
     pub added_ms: u64,
 }
 
+/// The workspace's shared look, for devices that sync their theme: the
+/// Catppuccin flavour by key (`latte`, `frappe`, `macchiato`, `mocha`;
+/// unknown keys are for the app to ignore) and the paper colour.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Appearance {
+    pub flavor: String,
+    /// Paper as `0xRRGGBB`; `None` follows the flavour's card colour.
+    pub paper: Option<u32>,
+}
+
 /// CRDT doc listing every note in the library.
 pub struct WorkspaceDoc {
     doc: LoroDoc,
@@ -61,6 +71,7 @@ const NOTES: &str = "notes";
 const DEVICES: &str = "devices";
 const BRUSHES: &str = "brushes";
 const ASSETS: &str = "assets";
+const APPEARANCE: &str = "appearance";
 
 impl WorkspaceDoc {
     pub fn new() -> Self {
@@ -309,6 +320,35 @@ impl WorkspaceDoc {
         out
     }
 
+    /// Share a look: every key is written, so the last device to change
+    /// the theme sets both flavour and paper.
+    pub fn set_appearance(&self, appearance: &Appearance) -> Result<()> {
+        let map = self.doc.get_map(APPEARANCE);
+        map.insert("flavor", appearance.flavor.as_str())?;
+        match appearance.paper {
+            Some(paper) => map.insert("paper", i64::from(paper))?,
+            None => map.delete("paper")?,
+        }
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// The shared look; `None` until some device shared one.
+    pub fn appearance(&self) -> Option<Appearance> {
+        let map = self.doc.get_map(APPEARANCE);
+        let flavor = match map.get("flavor")? {
+            ValueOrContainer::Value(LoroValue::String(s)) => s.to_string(),
+            _ => return None,
+        };
+        let paper = match map.get("paper") {
+            Some(ValueOrContainer::Value(LoroValue::I64(v))) => {
+                u32::try_from(v).ok().filter(|p| *p <= 0xFF_FFFF)
+            }
+            _ => None,
+        };
+        Some(Appearance { flavor, paper })
+    }
+
     // Same sync surface as NoteDoc.
 
     pub fn version(&self) -> Vec<u8> {
@@ -437,6 +477,32 @@ mod tests {
         a.import_update(&b.export_updates_since(&a.version()).unwrap())
             .unwrap();
         assert!(a.assets().is_empty());
+    }
+
+    #[test]
+    fn appearance_roundtrip() {
+        let a = WorkspaceDoc::new();
+        assert_eq!(a.appearance(), None);
+        let cream = Appearance {
+            flavor: "mocha".into(),
+            paper: Some(0xf5efe0),
+        };
+        a.set_appearance(&cream).unwrap();
+
+        let b = WorkspaceDoc::new();
+        b.import_update(&a.export_updates_since(&[]).unwrap())
+            .unwrap();
+        assert_eq!(b.appearance(), Some(cream));
+
+        // Back to the flavour's paper: the colour goes on every peer.
+        let latte = Appearance {
+            flavor: "latte".into(),
+            paper: None,
+        };
+        b.set_appearance(&latte).unwrap();
+        a.import_update(&b.export_updates_since(&a.version()).unwrap())
+            .unwrap();
+        assert_eq!(a.appearance(), Some(latte));
     }
 
     #[test]

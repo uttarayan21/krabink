@@ -34,7 +34,7 @@ use crate::settings::Settings;
 use crate::sketch::PageTexture;
 use crate::sync::SyncTransport;
 use crate::sync::{LocalCommit, SubscribeNeeded};
-use crate::theme::{self, Palette, Theme};
+use crate::theme::{self, Palette, Theme, ThemeSync};
 
 /// Body font size. Anchor space is defined at this size on every platform
 /// (the iPad pins its text view to 16 pt too), so ink lines up.
@@ -442,6 +442,7 @@ fn editor_ui(
     mut adopted: MessageWriter<crate::settings::PairAdopted>,
     follow: Res<FollowLatest>,
     mut theme: ResMut<Theme>,
+    mut theme_sync: ResMut<ThemeSync>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     let scale = ctx.pixels_per_point();
@@ -458,6 +459,7 @@ fn editor_ui(
         flavor: theme.flavor(),
         palette,
         custom_paper: theme.paper().is_some(),
+        sync_theme: theme_sync.enabled,
     };
     match settings.window(ctx, &view) {
         Some(crate::settings::SettingsAction::Join(info)) => {
@@ -531,11 +533,31 @@ fn editor_ui(
             if let Err(err) = crate::config::persist_theme(flavor) {
                 tracing::error!(%err, "persisting theme failed");
             }
+            if theme_sync.enabled {
+                share_theme(&theme, &mut docs, &mut commits);
+            }
         }
         Some(crate::settings::SettingsAction::Paper { color, persist }) => {
             theme.set_paper(color);
-            if persist && let Err(err) = crate::config::persist_paper(color) {
-                tracing::error!(%err, "persisting paper failed");
+            if persist {
+                if let Err(err) = crate::config::persist_paper(color) {
+                    tracing::error!(%err, "persisting paper failed");
+                }
+                // Mid-drag picks stay local; the released one is shared.
+                if theme_sync.enabled {
+                    share_theme(&theme, &mut docs, &mut commits);
+                }
+            }
+        }
+        Some(crate::settings::SettingsAction::SyncTheme(enabled)) => {
+            theme_sync.set_enabled(enabled);
+            if let Err(err) = crate::config::persist_sync_theme(enabled) {
+                tracing::error!(%err, "persisting theme sync failed");
+            }
+            // Joining in: take the workspace's look if it has one (applied
+            // next frame), else offer ours.
+            if enabled && docs.workspace.appearance().is_none() {
+                share_theme(&theme, &mut docs, &mut commits);
             }
         }
         None => {}
@@ -1076,6 +1098,20 @@ fn delete_selected(
     editor.selected.clear();
     editor.select_mode = false;
     editor.confirm_delete = DeleteConfirm::None;
+}
+
+/// Publish `theme` as the workspace's shared look.
+fn share_theme(theme: &Theme, docs: &mut Docs, commits: &mut MessageWriter<LocalCommit>) {
+    match docs.set_appearance(&ThemeSync::appearance(theme)) {
+        Ok(payload) if !payload.is_empty() => {
+            commits.write(LocalCommit {
+                doc: DocKey::WORKSPACE,
+                payload,
+            });
+        }
+        Ok(_) => {}
+        Err(err) => tracing::error!(%err, "sharing theme failed"),
+    }
 }
 
 /// Paper card filling `height`: the editor's frame.

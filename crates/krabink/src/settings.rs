@@ -106,6 +106,8 @@ pub enum SettingsAction {
         color: Option<egui::Color32>,
         persist: bool,
     },
+    /// Follow and share the workspace's look, or keep this desktop's own.
+    SyncTheme(bool),
 }
 
 /// Read-only snapshot the window renders each frame; gathered by the
@@ -123,6 +125,8 @@ pub struct SettingsView {
     pub palette: Palette,
     /// Whether the paper is a picked colour rather than the flavour's.
     pub custom_paper: bool,
+    /// Whether the theme follows the workspace's shared look.
+    pub sync_theme: bool,
 }
 
 #[derive(Resource)]
@@ -298,6 +302,20 @@ impl Settings {
             if let Some(paper) = self.paper_picker(ui, view) {
                 picked = Some(paper);
             }
+            ui.add_space(12.0);
+            let mut sync = view.sync_theme;
+            if ui
+                .checkbox(&mut sync, "Sync theme with other devices")
+                .changed()
+            {
+                picked = Some(SettingsAction::SyncTheme(sync));
+            }
+            ui.weak(if view.sync_theme {
+                "Flavour and paper follow the workspace: a change here, or on any \
+                 device syncing its theme, restyles them all."
+            } else {
+                "This desktop keeps its own flavour and paper."
+            });
             picked
         })
     }

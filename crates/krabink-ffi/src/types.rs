@@ -216,6 +216,25 @@ impl From<pcore::DeviceMeta> for DeviceInfo {
     }
 }
 
+/// The workspace's shared look (see [`crate::Core::set_appearance`]).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AppearanceInfo {
+    /// Catppuccin flavour key: `latte`, `frappe`, `macchiato` or `mocha`.
+    /// Ignore keys this build does not know.
+    pub flavor: String,
+    /// Paper as `0xRRGGBB`; `None` follows the flavour's card colour.
+    pub paper: Option<u32>,
+}
+
+impl From<pcore::Appearance> for AppearanceInfo {
+    fn from(a: pcore::Appearance) -> Self {
+        Self {
+            flavor: a.flavor,
+            paper: a.paper,
+        }
+    }
+}
+
 /// Sync coordinates carried by a `krabink://pair` URI (QR pairing).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct PairInfo {

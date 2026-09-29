@@ -184,6 +184,7 @@ fn run_app(args: cli::Cli) -> Result<()> {
     .insert_resource(inbox)
     .insert_resource(theme.clear_color())
     .insert_resource(theme)
+    .insert_resource(theme::ThemeSync::new(config.sync_theme))
     .insert_resource(Runtime(runtime))
     .insert_resource(sync_node)
     .insert_resource(transport)

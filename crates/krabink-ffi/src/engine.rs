@@ -21,8 +21,8 @@ use tokio::sync::mpsc;
 use crate::brush::{AssetInfo, AssetKind};
 use crate::net::{self, Cmd};
 use crate::types::{
-    BrushInfo, DeviceInfo, Element, NoteInfo, PageElement, PageProbe, PairInfo, PeerInfo,
-    ShapeElement, Stroke, StrokePoint, SyncState, Tilt, Tool, rgba_from_u32,
+    AppearanceInfo, BrushInfo, DeviceInfo, Element, NoteInfo, PageElement, PageProbe, PairInfo,
+    PeerInfo, ShapeElement, Stroke, StrokePoint, SyncState, Tilt, Tool, rgba_from_u32,
 };
 
 /// Errors crossing the FFI boundary. Flattened to message-carrying variants;
@@ -63,6 +63,9 @@ pub trait CoreListener: Send + Sync {
     /// The synced device registry changed (a peer joined, was renamed or
     /// removed); the full list, most recently seen first.
     fn devices_changed(&self, devices: Vec<DeviceInfo>);
+    /// The workspace's shared look changed (or any workspace update
+    /// arrived: compare before restyling); `None` until a device shared one.
+    fn appearance_changed(&self, appearance: Option<AppearanceInfo>);
     fn sync_state(&self, state: SyncState);
 }
 
@@ -669,6 +672,35 @@ impl Core {
             .into_iter()
             .map(Into::into)
             .collect()
+    }
+
+    /// The workspace's shared look; `None` until a device shared one.
+    pub fn appearance(&self) -> Option<AppearanceInfo> {
+        self.shared
+            .lock_state()
+            .workspace
+            .appearance()
+            .map(Into::into)
+    }
+
+    /// Share this device's look with the workspace: every device syncing
+    /// its theme follows (via `CoreListener::appearance_changed`).
+    pub fn set_appearance(&self, appearance: AppearanceInfo) -> Result<()> {
+        let appearance = pcore::Appearance {
+            flavor: appearance.flavor,
+            paper: appearance.paper,
+        };
+        let payload = {
+            let mut state = self.shared.lock_state();
+            commit_workspace(&mut state, |ws| ws.set_appearance(&appearance))?
+        };
+        if let Some(payload) = payload {
+            let _ = self.shared.cmd.send(Cmd::Update {
+                doc: DocKey::WORKSPACE,
+                payload,
+            });
+        }
+        Ok(())
     }
 
     /// The workspace's brush library, newest edit first. Bundled brushes

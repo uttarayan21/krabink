@@ -32,6 +32,21 @@ impl Flavor {
     /// Every flavour, lightest first: the order the pickers list them in.
     pub const ALL: [Self; 4] = [Self::Latte, Self::Frappe, Self::Macchiato, Self::Mocha];
 
+    /// Key in config.toml and the workspace's shared appearance; the
+    /// iPad's `ThemeFlavor` raw values.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Latte => "latte",
+            Self::Frappe => "frappe",
+            Self::Macchiato => "macchiato",
+            Self::Mocha => "mocha",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.key() == key)
+    }
+
     /// Human name for pickers.
     pub const fn label(self) -> &'static str {
         match self {
@@ -548,7 +563,79 @@ pub struct ThemePlugin;
 
 impl Plugin for ThemePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(bevy_egui::EguiPrimaryContextPass, apply);
+        app.add_systems(Update, follow_shared)
+            .add_systems(bevy_egui::EguiPrimaryContextPass, apply);
+    }
+}
+
+/// Whether this device follows the workspace's shared look (flavour and
+/// paper), and the shared look it last saw. While on, local changes are
+/// published ([`ThemeSync::appearance`]) and a shared look that changes
+/// (a peer's pick, or the stored one at launch) is applied and persisted.
+#[derive(Resource, Debug, Clone, PartialEq, Eq)]
+pub struct ThemeSync {
+    pub enabled: bool,
+    /// Compared against the workspace each frame; only a change is
+    /// applied, so a local pick not yet published (the paper wheel mid
+    /// drag) is not snapped back.
+    seen: Option<krabink_core::Appearance>,
+}
+
+impl ThemeSync {
+    pub const fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            seen: None,
+        }
+    }
+
+    /// Turn syncing on or off. Turning it on forgets the look last seen,
+    /// so a shared one is applied on the next frame.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        self.seen = None;
+    }
+
+    /// `theme` as the workspace's shared look.
+    pub fn appearance(theme: &Theme) -> krabink_core::Appearance {
+        krabink_core::Appearance {
+            flavor: theme.flavor().key().to_string(),
+            paper: theme
+                .paper()
+                .map(|p| u32::from_be_bytes([0, p.r(), p.g(), p.b()])),
+        }
+    }
+}
+
+/// Apply the workspace's shared look when it changed and this device
+/// syncs its theme.
+fn follow_shared(
+    docs: Res<crate::docs::Docs>,
+    mut sync: ResMut<ThemeSync>,
+    mut theme: ResMut<Theme>,
+) {
+    if !sync.enabled {
+        return;
+    }
+    let shared = docs.workspace.appearance();
+    if sync.seen == shared {
+        return;
+    }
+    sync.seen.clone_from(&shared);
+    let Some(shared) = shared else {
+        return;
+    };
+    let Some(flavor) = Flavor::from_key(&shared.flavor) else {
+        tracing::warn!(flavor = shared.flavor, "ignoring unknown shared flavour");
+        return;
+    };
+    let paper = shared.paper.map(rgb);
+    if theme.flavor() == flavor && theme.paper() == paper {
+        return;
+    }
+    *theme = Theme::new(flavor, paper);
+    if let Err(err) = crate::config::persist_appearance(flavor, paper) {
+        tracing::error!(%err, "persisting shared theme failed");
     }
 }
 
@@ -604,6 +691,24 @@ mod tests {
         assert_eq!(theme.palette().paper(), paper);
         theme.set_paper(None);
         assert_eq!(theme.palette().paper(), Flavor::Frappe.palette().surface);
+    }
+
+    #[test]
+    fn shared_look_carries_flavour_key_and_paper() {
+        for flavor in Flavor::ALL {
+            assert_eq!(Flavor::from_key(flavor.key()), Some(flavor));
+        }
+        assert_eq!(Flavor::from_key("sepia"), None);
+
+        let theme = Theme::new(Flavor::Frappe, Some(Color32::from_rgb(0xf5, 0xef, 0xe0)));
+        let shared = ThemeSync::appearance(&theme);
+        assert_eq!(shared.flavor, "frappe");
+        assert_eq!(shared.paper, Some(0xf5efe0));
+        assert_eq!(shared.paper.map(rgb), theme.paper());
+        assert_eq!(
+            ThemeSync::appearance(&Theme::new(Flavor::Mocha, None)).paper,
+            None
+        );
     }
 
     #[test]

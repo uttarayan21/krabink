@@ -39,6 +39,7 @@ final class AppModel {
         devices = core.listDevices()
         core.setListener(listener: CoreEvents(model: self))
         BrushLibrary.shared.attach(core)
+        attachTheme()
         InkAssets.shared.setShared(core.listAssets())
 
         // The pairing persists as its URI; `-pairURI krabink://pair?…` as a
@@ -81,6 +82,18 @@ final class AppModel {
         // Announce this device in the synced registry so peers can list it.
         registerDevice()
         return true
+    }
+
+    /// Route the theme's sharing through the workspace, and take the
+    /// stored shared look (the last one this iPad heard of) at launch.
+    private func attachTheme() {
+        let core = core
+        let theme = ThemeStore.shared
+        theme.readShared = { core.appearance().map(SharedLook.init) }
+        theme.writeShared = { look in
+            try? core.setAppearance(appearance: AppearanceInfo(flavor: look.flavor, paper: look.paper))
+        }
+        theme.sharedChanged(core.appearance().map(SharedLook.init))
     }
 
     /// Upsert our row (name, platform, last seen) in the synced registry.
@@ -340,6 +353,12 @@ final class NoteModel: Identifiable {
 
 }
 
+extension SharedLook {
+    init(_ info: AppearanceInfo) {
+        self.init(flavor: info.flavor, paper: info.paper)
+    }
+}
+
 // Nonisolated bridges: uniffi calls these from the Rust network thread.
 
 private final class CoreEvents: CoreListener {
@@ -364,6 +383,11 @@ private final class CoreEvents: CoreListener {
             model.devices = devices
             model.reconcilePairing()
         }
+    }
+
+    func appearanceChanged(appearance: AppearanceInfo?) {
+        let shared = appearance.map(SharedLook.init)
+        Task { @MainActor in ThemeStore.shared.sharedChanged(shared) }
     }
 
     func syncState(state: SyncState) {
