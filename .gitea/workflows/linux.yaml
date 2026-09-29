@@ -1,10 +1,9 @@
 name: linux
 
+# Release tags only (v0.1.2, …); pushes and PRs don't build.
 on:
   push:
-    branches: [master]
-  pull_request:
-    branches: [master]
+    tags: ['v*']
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
