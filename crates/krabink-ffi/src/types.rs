@@ -481,6 +481,12 @@ pub enum Shape {
         radii: Point2,
         angle: f32,
     },
+    /// A rhombus inscribed in the rotated box of full `size`.
+    Diamond {
+        center: Point2,
+        size: Point2,
+        angle: f32,
+    },
 }
 
 impl From<pcore::Shape> for Shape {
@@ -510,6 +516,15 @@ impl From<pcore::Shape> for Shape {
             } => Self::Ellipse {
                 center: center.into(),
                 radii: radii.into(),
+                angle,
+            },
+            pcore::Shape::Diamond {
+                center,
+                size,
+                angle,
+            } => Self::Diamond {
+                center: center.into(),
+                size: size.into(),
                 angle,
             },
         }
@@ -545,6 +560,15 @@ impl From<Shape> for pcore::Shape {
                 radii: radii.into(),
                 angle,
             },
+            Shape::Diamond {
+                center,
+                size,
+                angle,
+            } => Self::Diamond {
+                center: center.into(),
+                size: size.into(),
+                angle,
+            },
         }
     }
 }
@@ -567,7 +591,8 @@ impl From<pcore::Recognition> for Recognition {
 
 /// A line or arrow end attached to another element (Excalidraw
 /// `fixedPoint`): `fixed_point` in the target's unit square, `gap` the
-/// distance kept from its outline. Reserved; v1 never writes one.
+/// distance kept from its outline. The end is re-derived from the target
+/// whenever it moves; see `resolve_page_bindings`.
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct Binding {
     pub element: String,
@@ -725,4 +750,39 @@ pub struct PageProbe {
     pub element: String,
     pub x: f32,
     pub y: f32,
+}
+
+/// Where one page element's anchor space sits in page space: its anchored
+/// line's layout origin. Lets the core relate elements anchored to
+/// different lines (bound arrows, moves).
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct ElementOrigin {
+    /// The element's id.
+    pub element: String,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// Origins by element id; an element without one sits at the page origin.
+pub(crate) fn origin_lookup(
+    origins: &[ElementOrigin],
+) -> impl Fn(pcore::ElementId) -> [f32; 2] + use<> {
+    let map: std::collections::HashMap<pcore::ElementId, [f32; 2]> = origins
+        .iter()
+        .filter_map(|o| Some((o.element.parse().ok()?, [o.x, o.y])))
+        .collect();
+    move |id| map.get(&id).copied().unwrap_or([0.0, 0.0])
+}
+
+/// One page element's move for `NoteSession::move_page_elements`.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct PageMove {
+    /// The element's id.
+    pub element: String,
+    /// Translation in the space of the line it ends up anchored to.
+    pub dx: f32,
+    pub dy: f32,
+    /// The line it is re-anchored to (bytes from `anchor_at`); `None`
+    /// keeps its anchor.
+    pub anchor: Option<Vec<u8>>,
 }

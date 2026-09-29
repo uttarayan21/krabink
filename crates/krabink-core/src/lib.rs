@@ -15,6 +15,7 @@
 //! assert_eq!(b.text(), "# shared note");
 //! ```
 
+mod binding;
 mod brush;
 pub mod corpus;
 mod element;
@@ -33,6 +34,10 @@ mod sync_doc;
 mod wetink;
 mod workspace;
 
+pub use binding::{
+    BINDING_CENTER, BINDING_GAP, aim_point, binding_at, bound_end, bound_to, contains, outline_hit,
+    resolve_arrow, resolve_bindings,
+};
 pub use brush::{
     Asset, AssetId, AssetKind, BUILTIN_CHALK, BUILTIN_CRAYON, BUILTIN_PENCIL_GRAINY, Behavior,
     Blend, BrushId, BrushKnobs, BrushModeler, BrushSpec, BuiltinBrush, Curve, CustomBrush,
@@ -42,7 +47,7 @@ pub use brush::{
 };
 #[cfg(feature = "ism")]
 pub use brush::{IsmModel, IsmParams, UNITS_PER_CM};
-pub use element::{Anchor, Binding, Element, PageElement, ShapeElement, Style};
+pub use element::{Anchor, Binding, Element, ElementMove, PageElement, ShapeElement, Style};
 pub use export::{ExportAsset, ExportBundle, SKETCH_URI_PREFIX, elements_to_svg};
 pub use geom::{
     DEFAULT_TOLERANCE, GrainStyle, Ink, InkMesh, InkStyle, InkVertex, MAX_DABS, MaskStyle,
@@ -54,7 +59,7 @@ pub use inline::{
 pub use markdown::{
     PreviewText, StyleKind, StyleRun, preview_text, sketch_embed_title, style_runs,
 };
-pub use note::NoteDoc;
+pub use note::{InkChanges, NoteDoc};
 pub use pair::PairInfo;
 pub use shape::{Recognition, RecognizerParams, Shape, recognize, recognize_with};
 pub use store::{DocKey, Flush, Store, StoredDoc};

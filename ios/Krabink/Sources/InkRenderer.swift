@@ -376,6 +376,10 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     /// The Pencil Pro hover preview: one dab above everything.
     private let hover: GPUGeometry
     private var hasHover = false
+    /// The select tool's outline around the selection, and the shape an
+    /// arrow end would bind to.
+    private let selection: GPUGeometry
+    private var hasSelection = false
     private var localMesh: InkMesh?
     private var localOrigin = CGPoint.zero
     private var hasLocal = false
@@ -437,6 +441,7 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         batch = GPUGeometry(device: device)
         local = GPUGeometry(device: device)
         hover = GPUGeometry(device: device)
+        selection = GPUGeometry(device: device)
         super.init()
         // New texture arrays move layers: restyle everything on screen.
         assetsObserver = NotificationCenter.default.addObserver(
@@ -580,11 +585,17 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     // MARK: committed ink
 
     /// Show a committed element, stroke or shape, meshed in its own space
-    /// and placed at `origin` (idempotent; re-show only updates z and
-    /// origin). Replaces the settling local copy of the same id.
+    /// and placed at `origin` (idempotent: re-showing the same element
+    /// only updates z and origin; a changed one — moved, reshaped, its
+    /// arrow re-routed — is meshed again). Replaces the settling local copy
+    /// of the same id.
     func show(_ element: Element, z: Int, origin: CGPoint = .zero) {
         let id = element.id
         if locals.removeValue(forKey: id) != nil { localsOrder.removeAll { $0 == id } }
+        if let entry = committed[id], entry.element != element {
+            committed[id] = nil
+            order.removeAll { $0 == id }
+        }
         if committed[id] != nil {
             var changed = false
             if committed[id]?.z != z {
@@ -621,6 +632,18 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         needsDisplay()
     }
 
+    /// Re-mesh a committed element in place (a drag preview), keeping its
+    /// z and origin. Ids not on screen are ignored.
+    func update(_ element: Element) {
+        guard let entry = committed[element.id], entry.element != element else { return }
+        show(element, z: entry.z, origin: entry.origin)
+    }
+
+    /// The element as last shown and where it is; `nil` when not shown.
+    func shown(_ id: String) -> (element: Element, origin: CGPoint)? {
+        committed[id].map { ($0.element, $0.origin) }
+    }
+
     /// Where a committed element's ink is on the page; `nil` when not
     /// shown.
     func bounds(for id: String) -> CGRect? {
@@ -645,6 +668,7 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         localMesh = nil
         locals = [:]
         localsOrder = []
+        hasSelection = false
         inkBounds = .null
         needsDisplay()
     }
@@ -810,6 +834,24 @@ final class InkRenderer: NSObject, MTKViewDelegate {
         needsDisplay()
     }
 
+    // MARK: selection
+
+    /// Outline the selection (and a would-be binding target): each mesh
+    /// placed at its origin, drawn above the ink; replaces what was shown.
+    func setSelection(meshes: [(mesh: InkMesh, origin: CGPoint)]) {
+        var geometry = InkGeometry()
+        for (mesh, origin) in meshes { geometry.append(mesh, depth: Self.hoverDepth, offset: origin) }
+        selection.upload(geometry)
+        hasSelection = !geometry.isEmpty
+        needsDisplay()
+    }
+
+    func clearSelection() {
+        guard hasSelection else { return }
+        hasSelection = false
+        needsDisplay()
+    }
+
     // MARK: drawing
 
     func needsDisplay() {
@@ -858,6 +900,7 @@ final class InkRenderer: NSObject, MTKViewDelegate {
                 }
                 if hasLocal { draw(local) }
                 if hasHover { draw(hover) }
+                if hasSelection { draw(selection) }
             }
         }
         encoder.endEncoding()

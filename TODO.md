@@ -41,15 +41,18 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
       advertises, so two iPads on a relay-less LAN cannot find each other.
 - [ ] Note close/unsubscribe not exposed over FFI — open notes stay subscribed
       for the session.
-- [ ] Change events are coarse (full-text + page-length, not deltas). Fine
-      until a consumer needs cursor-stable patches.
+- [ ] Change events are coarse (full text; page/sketch "something changed",
+      not deltas). Fine until a consumer needs cursor-stable patches.
 
 ### iPad
 - [x] Stroke identity keyed by `PKStrokePath.creationDate` — gone: PencilKit is
       input-only, ink layers are keyed by CRDT stroke id.
 - [ ] Eraser is whole-stroke only (core hit test); PencilKit's pixel eraser
       (stroke splitting) is not reproduced.
-- [ ] Lasso tool does nothing (no PKDrawing to select from).
+- [ ] Lasso tool does nothing (no PKDrawing to select from); the toolbar's
+      select tool moves one element at a time, no multi-select or marquee.
+- [ ] Shape and move edits have no undo, and peers see a drag only at
+      pen-up (no wet preview of a move).
 - [ ] Marker translucency not round-tripped through the stroke schema.
 - [ ] IME / marked-text composition not guarded in the remote-apply path of the
       text editor.

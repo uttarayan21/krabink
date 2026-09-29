@@ -443,6 +443,32 @@ private struct NoteDetail: View {
                 }
             }
             ToolbarItem(placement: .primaryAction) {
+                HStack(spacing: 8) {
+                    if note.ink.selected != nil {
+                        Button {
+                            note.ink.deleteSelected()
+                        } label: {
+                            Label("delete selection", systemImage: "trash")
+                        }
+                        .accessibilityIdentifier("deleteSelected")
+                    }
+                    Menu {
+                        Picker("Tool", selection: tool) {
+                            Label("Draw", systemImage: "pencil.tip").tag(CanvasTool.draw)
+                            Label("Select", systemImage: "cursorarrow").tag(CanvasTool.select)
+                            ForEach(ShapeKind.allCases) { kind in
+                                Label(kind.title, systemImage: kind.symbol)
+                                    .tag(CanvasTool.shape(kind))
+                            }
+                        }
+                    } label: {
+                        Label("tool", systemImage: toolSymbol)
+                    }
+                    .accessibilityIdentifier("canvasTool")
+                }
+                .disabled(preview)
+            }
+            ToolbarItem(placement: .primaryAction) {
                 Button {
                     note.insertSketch()
                 } label: {
@@ -462,6 +488,19 @@ private struct NoteDetail: View {
         }
         .sheet(isPresented: $showBrushes) { BrushSheet(model: note.ink) }
         .onDisappear { note.ink.pointerGone() }
+    }
+
+    /// The toolbar tool of this note's ink (draw, a preset shape, select).
+    private var tool: SwiftUI.Binding<CanvasTool> {
+        SwiftUI.Binding(get: { note.ink.tool }, set: { note.ink.tool = $0 })
+    }
+
+    private var toolSymbol: String {
+        switch note.ink.tool {
+        case .draw: "pencil.tip"
+        case .select: "cursorarrow"
+        case .shape(let kind): kind.symbol
+        }
     }
 
     private var header: some View {

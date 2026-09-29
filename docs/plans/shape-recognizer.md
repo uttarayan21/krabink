@@ -247,10 +247,33 @@ unchanged. No desktop recognition (no pen input there).
 
 ## Not in v1 (reserved by the schema)
 
-Bindings UI (auto-bind arrow ends to nearby shapes, derive endpoints from
-the target on move), `update_shape`, move/resize handles, unsnap (needs the
-sender to keep the last freehand points), native SVG primitives, triangles
-and polygons.
+Unsnap (needs the sender to keep the last freehand points), native SVG
+primitives, triangles and polygons.
+
+## Since v1: preset shapes, moving, bound arrows
+
+- `Shape::Diamond` (schema kind `diamond`, rect keys) joins the presets the
+  iPad's shape tool drags out (rect, diamond, ellipse, line, arrow); the
+  recognizer never yields one.
+- Bindings are live (`binding.rs`): an end bound to a rect, diamond or
+  ellipse sits where the ray from the other end's aim point toward the
+  target's aim point (`fixed_point`, the center for new bindings) crosses
+  the outline, pulled back by `gap`. Closed form and one-way, so no
+  constraint solver: every peer derives the same ends from the same
+  targets. Sketches resolve on read (`NoteDoc::elements`); the page layer
+  resolves in the renderers with each element's line origin
+  (`resolve_bindings`, FFI `resolve_page_bindings`), since the core cannot
+  place lines.
+- Moves and edits merge per key: `move_page_elements` / `move_elements`
+  rewrite a shape's geometry keys or bump a stroke's `ox`/`oy` offset (its
+  point chunks stay), re-anchor page ink to the line it was dropped on, and
+  re-route the stored ends of bound arrows in the same commit.
+  `update_page_shape` / `update_shape` do the same for resizes and re-bound
+  ends. A line or arrow moved without its targets lets go of them.
+- The iPad's select tool hit-tests without erasing (`hit_page_at`,
+  `hit_at`; a closed shape is hit anywhere inside), previews drags by
+  re-placing and re-meshing on screen, and commits at pen-up. Draw-and-hold
+  lines and arrows bind their ends like drawn ones.
 
 ## Order and effort
 
