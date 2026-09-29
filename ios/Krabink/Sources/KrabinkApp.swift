@@ -41,7 +41,7 @@ struct KrabinkApp: App {
     private var mainView: some View {
         ContentView(model: model)
             // Light or dark follows the Catppuccin flavour; the page
-            // paper is the flavour's card colour on both platforms.
+            // paper is the flavour's card colour unless one was picked.
             .preferredColorScheme(theme.flavor.colorScheme)
             .tint(Theme.accent)
     }
@@ -400,8 +400,8 @@ private struct NoteDetail: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
-            NoteCanvas(model: note, flavor: theme.flavor, preview: preview)
-                .card()
+            NoteCanvas(model: note, flavor: theme.flavor, paper: theme.paper, preview: preview)
+                .card(fill: Theme.paper)
                 .padding(.horizontal, Theme.pagePadding)
                 .padding(.bottom, Theme.pagePadding)
         }

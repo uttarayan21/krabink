@@ -6,11 +6,12 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use bevy_egui::egui::Color32;
 use krabink_core::{DeviceId, PairInfo};
 use krabink_local::{EndpointId, PeerKind, PeerTarget, RelayTarget, RelayUrl};
 
 use crate::errors::{Error, Report, Result, ResultExt};
-use crate::theme::Flavor;
+use crate::theme::{self, Flavor};
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct FileConfig {
@@ -25,6 +26,10 @@ struct FileConfig {
     replica: Option<String>,
     /// Catppuccin flavour the UI is drawn in; Mocha when unset.
     theme: Option<Flavor>,
+    /// Sketch paper as `#rrggbb`; the flavour's card colour when unset.
+    paper: Option<String>,
+    /// Follow (and share) the workspace's look; on when unset.
+    sync_theme: Option<bool>,
     /// Nodes this desktop dials.
     #[serde(default)]
     peers: Vec<PeerFile>,
@@ -62,6 +67,10 @@ pub struct RuntimeConfig {
     pub peers: Vec<PeerTarget>,
     /// Catppuccin flavour the UI starts in.
     pub theme: Flavor,
+    /// Picked sketch paper colour; `None` follows the flavour.
+    pub paper: Option<Color32>,
+    /// Whether the theme follows the workspace's shared look.
+    pub sync_theme: bool,
 }
 
 impl RuntimeConfig {
@@ -128,6 +137,14 @@ impl RuntimeConfig {
             replica,
             peers,
             theme: file.theme.unwrap_or_default(),
+            paper: file.paper.as_deref().and_then(|raw| {
+                let paper = theme::parse_hex(raw);
+                if paper.is_none() {
+                    tracing::warn!(raw, "ignoring unreadable paper colour");
+                }
+                paper
+            }),
+            sync_theme: file.sync_theme.unwrap_or(true),
         })
     }
 
@@ -223,6 +240,24 @@ pub fn persist_device_name(name: &str) -> Result<std::path::PathBuf> {
 /// Remember the chosen Catppuccin flavour across launches.
 pub fn persist_theme(theme: Flavor) -> Result<std::path::PathBuf> {
     update_config(|file| file.theme = Some(theme))
+}
+
+/// Remember the picked paper colour (`None`: follow the flavour).
+pub fn persist_paper(paper: Option<Color32>) -> Result<std::path::PathBuf> {
+    update_config(|file| file.paper = paper.map(theme::to_hex))
+}
+
+/// Remember a look adopted from the workspace, in one write.
+pub fn persist_appearance(flavor: Flavor, paper: Option<Color32>) -> Result<std::path::PathBuf> {
+    update_config(|file| {
+        file.theme = Some(flavor);
+        file.paper = paper.map(theme::to_hex);
+    })
+}
+
+/// Remember whether this desktop syncs its theme with the workspace.
+pub fn persist_sync_theme(enabled: bool) -> Result<std::path::PathBuf> {
+    update_config(|file| file.sync_theme = Some(enabled))
 }
 
 /// The machine's hostname: what a desktop is called until renamed.

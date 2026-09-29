@@ -165,6 +165,19 @@ impl Docs {
         Ok(payload)
     }
 
+    /// Share a look with the workspace; returns the workspace payload for
+    /// the wire.
+    pub fn set_appearance(
+        &mut self,
+        appearance: &krabink_core::Appearance,
+    ) -> krabink_core::Result<Vec<u8>> {
+        let before = self.workspace.version();
+        self.workspace.set_appearance(appearance)?;
+        let payload = self.workspace.export_updates_since(&before)?;
+        self.persist(DocKey::WORKSPACE, &payload)?;
+        Ok(payload)
+    }
+
     /// Drop `id` from the synced device registry; returns the workspace
     /// payload for the wire.
     pub fn remove_device(&mut self, id: DeviceId) -> krabink_core::Result<Vec<u8>> {

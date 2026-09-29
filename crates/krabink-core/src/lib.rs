@@ -67,7 +67,7 @@ pub use sync::{
 };
 pub use sync_doc::SyncDoc;
 pub use wetink::WetInk;
-pub use workspace::{AssetMeta, BrushMeta, DeviceMeta, NoteMeta, WorkspaceDoc};
+pub use workspace::{Appearance, AssetMeta, BrushMeta, DeviceMeta, NoteMeta, WorkspaceDoc};
 
 /// Errors produced by the core document model.
 #[derive(Debug, thiserror::Error)]

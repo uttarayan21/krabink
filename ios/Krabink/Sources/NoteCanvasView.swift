@@ -250,17 +250,24 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
 
     // MARK: theme
 
-    /// The flavour the paper was last cleared for.
-    private var paperFlavor: ThemeFlavor?
+    /// What the paper and text are coloured by.
+    private struct PaperKey: Equatable {
+        let flavor: ThemeFlavor
+        let paper: UInt32?
+    }
 
-    /// Colours for the current flavour: the paper the ink layer clears to
-    /// (and the highlighter blend for it), the text's palette.
+    /// The flavour and paper the page was last cleared for.
+    private var paperKey: PaperKey?
+
+    /// Colours for the current flavour and paper: the paper the ink layer
+    /// clears to (and the highlighter blend for it), the text's palette.
     func applyTheme() {
-        textView.tintColor = .themeAccent
-        textView.keyboardAppearance = ThemeStore.shared.flavor.colorScheme == .dark ? .dark : .light
-        let flavor = ThemeStore.shared.flavor
-        guard flavor != paperFlavor else { return }
-        paperFlavor = flavor
+        let store = ThemeStore.shared
+        textView.tintColor = .paperAccent
+        textView.keyboardAppearance = store.flavor.colorScheme == .dark ? .dark : .light
+        let key = PaperKey(flavor: store.flavor, paper: store.paper)
+        guard key != paperKey else { return }
+        paperKey = key
         backgroundColor = .paper
         applyBackground()
         boxOverlay.recolor()
@@ -276,7 +283,7 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
     override func traitCollectionDidChange(_ previous: UITraitCollection?) {
         super.traitCollectionDidChange(previous)
         if traitCollection.hasDifferentColorAppearance(comparedTo: previous) {
-            paperFlavor = nil
+            paperKey = nil
             applyTheme()
         }
     }
@@ -534,9 +541,9 @@ final class InlineBoxOverlay: UIView {
 
     func recolor() {
         let scale = traitCollection.displayScale
-        for frame in frames { frame.strokeColor = UIColor.themeBorder.cgColor }
+        for frame in frames { frame.strokeColor = UIColor.paperBorder.cgColor }
         for caption in captions {
-            caption.foregroundColor = UIColor.themeMuted.cgColor
+            caption.foregroundColor = UIColor.paperMuted.cgColor
             caption.contentsScale = scale
         }
     }
@@ -547,6 +554,8 @@ struct NoteCanvas: UIViewRepresentable {
     /// Passed in (not read from the store) so a switch re-runs
     /// `updateUIView` and the paper and text colours follow.
     let flavor: ThemeFlavor
+    /// The picked paper, passed in for the same reason.
+    let paper: UInt32?
     /// Reading view instead of the editor.
     let preview: Bool
 

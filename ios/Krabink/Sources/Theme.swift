@@ -3,8 +3,9 @@
 // lavender as the accent, cards on a page, roomier padding. The chosen
 // flavour lives in `ThemeStore.shared` (persisted in UserDefaults); every
 // `Theme.*` colour reads it, so views observing the store restyle at once.
-// The sketch paper (`UIColor.paper`) is the flavour's card colour, the
-// same value the desktop clears its render targets to.
+// The sketch paper (`UIColor.paper`) is the flavour's card colour unless
+// the user picked another (`ThemeStore.paper`), the same value the desktop
+// clears its render targets to; text on it takes the paper's tone.
 
 import SwiftUI
 import UIKit
@@ -45,7 +46,7 @@ struct Palette {
     let bg: Color
     /// Note list and toolbars [mantle].
     let sidebar: Color
-    /// Cards, editor, inputs and sketch paper [surface0].
+    /// Cards, editor, inputs and, by default, sketch paper [surface0].
     let surface: Color
     /// Hovered or selected rows, code [surface1].
     let surfaceRaised: Color
@@ -99,23 +100,143 @@ struct Palette {
         warn: Color(hex: 0xF9E2AF), danger: Color(hex: 0xF38BA8))
 }
 
-/// The chosen flavour, persisted as `theme` in UserDefaults. Views that
-/// read any `Theme.*` colour in their body observe it and restyle when it
-/// changes; UIKit-backed views take the flavour as an input so their
-/// `updateUIView` runs too.
+/// A look as the workspace shares it (`AppearanceInfo` over the FFI):
+/// flavour by raw value, paper as `0xRRGGBB`.
+struct SharedLook: Equatable {
+    var flavor: String
+    var paper: UInt32?
+}
+
+/// The chosen flavour and paper, persisted as `theme` and `paper` in
+/// UserDefaults. Views that read any `Theme.*` colour in their body
+/// observe it and restyle when it changes; UIKit-backed views take the
+/// flavour and paper as inputs so their `updateUIView` runs too.
+///
+/// With `syncTheme` on (the default) the look is the workspace's: local
+/// changes are shared through the core, and a shared look that changes
+/// is applied here. The desktop does the same (`ThemeSync` in
+/// crates/krabink/src/theme.rs).
 @Observable
 final class ThemeStore {
     static let shared = ThemeStore()
 
     var flavor: ThemeFlavor {
-        didSet { UserDefaults.standard.set(flavor.rawValue, forKey: "theme") }
+        didSet {
+            UserDefaults.standard.set(flavor.rawValue, forKey: "theme")
+            localChanged()
+        }
+    }
+
+    /// Picked paper as `0xRRGGBB`, kept across flavour switches; `nil`
+    /// follows the flavour's card colour.
+    var paper: UInt32? {
+        didSet {
+            if let paper {
+                UserDefaults.standard.set(Int(paper), forKey: "paper")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "paper")
+            }
+            localChanged()
+        }
+    }
+
+    /// Follow and share the workspace's look. Turning it on takes the
+    /// workspace's look if it has one, else offers this iPad's.
+    var syncTheme: Bool {
+        didSet {
+            UserDefaults.standard.set(syncTheme, forKey: "syncTheme")
+            lastShared = nil
+            pendingShare?.cancel()
+            guard syncTheme else { return }
+            if let shared = readShared?() {
+                sharedChanged(shared)
+            } else {
+                shareSoon(after: 0)
+            }
+        }
+    }
+
+    /// The workspace's look through the core; wired up by `AppModel`.
+    @ObservationIgnored var readShared: (() -> SharedLook?)?
+    @ObservationIgnored var writeShared: ((SharedLook) -> Void)?
+    /// The shared look last seen. Only a change is applied, so a local
+    /// pick not yet shared (the wheel mid-drag) is not snapped back by an
+    /// unrelated workspace update.
+    @ObservationIgnored private var lastShared: SharedLook?
+    @ObservationIgnored private var applyingShared = false
+    @ObservationIgnored private var pendingShare: DispatchWorkItem?
+
+    /// This device's look, as the workspace would share it.
+    var look: SharedLook { SharedLook(flavor: flavor.rawValue, paper: paper) }
+
+    /// The workspace's look as of the latest workspace update: applied
+    /// when it changed since last seen and this iPad syncs its theme.
+    func sharedChanged(_ shared: SharedLook?) {
+        guard syncTheme, shared != lastShared else { return }
+        lastShared = shared
+        guard let shared, shared != look,
+            let flavor = ThemeFlavor(rawValue: shared.flavor)
+        else { return }
+        // The peer's pick is newer than whatever was waiting to go out.
+        pendingShare?.cancel()
+        applyingShared = true
+        self.flavor = flavor
+        paper = shared.paper
+        applyingShared = false
+    }
+
+    /// Share a local pick, debounced so dragging the wheel sends only
+    /// where it settles.
+    private func localChanged() {
+        guard syncTheme, !applyingShared else { return }
+        shareSoon(after: 0.3)
+    }
+
+    private func shareSoon(after delay: TimeInterval) {
+        pendingShare?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.syncTheme else { return }
+            self.writeShared?(self.look)
+        }
+        pendingShare = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
     var palette: Palette { flavor.palette }
 
+    /// The page's colour: the picked paper, else the flavour's card.
+    var paperColor: Color { paper.map { Color(hex: $0) } ?? palette.surface }
+
+    /// `paperColor` as `0xRRGGBB`.
+    var paperHex: UInt32 { paper ?? UIColor(palette.surface).rgbHex }
+
+    /// Colours for what sits on the paper (editor text, inline frames):
+    /// the flavour's while the paper keeps its tone, else Latte's (light
+    /// paper) or Mocha's (dark paper). Mirrors `Palette::on_paper` in
+    /// crates/krabink/src/theme.rs.
+    var paperPalette: Palette {
+        let flavorDark = flavor.colorScheme == .dark
+        let paperDark = paper.map(Self.isDark) ?? flavorDark
+        if paperDark == flavorDark { return palette }
+        return paperDark ? .mocha : .latte
+    }
+
+    /// Linear luminance under 0.5: the cut-off `InkRenderer.isDark` and
+    /// the desktop use.
+    static func isDark(_ hex: UInt32) -> Bool {
+        func linear(_ byte: UInt32) -> Double {
+            let c = Double(byte & 0xFF) / 255
+            return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * linear(hex >> 16) + 0.7152 * linear(hex >> 8) + 0.0722 * linear(hex) < 0.5
+    }
+
     private init() {
-        let stored = UserDefaults.standard.string(forKey: "theme") ?? ""
+        let defaults = UserDefaults.standard
+        let stored = defaults.string(forKey: "theme") ?? ""
         flavor = ThemeFlavor(rawValue: stored) ?? .mocha
+        paper = (defaults.object(forKey: "paper") as? Int).map { UInt32(truncatingIfNeeded: $0) & 0xFF_FFFF }
+        syncTheme = defaults.object(forKey: "syncTheme") as? Bool ?? true
     }
 }
 
@@ -126,8 +247,10 @@ enum Theme {
     static var bg: Color { palette.bg }
     /// Note list and toolbars.
     static var sidebar: Color { palette.sidebar }
-    /// Cards, editor, inputs. Equal to `UIColor.paper`.
+    /// Cards, inputs; the paper too unless another was picked.
     static var surface: Color { palette.surface }
+    /// The page under notes: `UIColor.paper`.
+    static var paper: Color { ThemeStore.shared.paperColor }
     /// Hovered or selected rows, code.
     static var surfaceRaised: Color { palette.surfaceRaised }
     /// Hairlines around cards.
@@ -165,19 +288,34 @@ extension Color {
 extension UIColor {
     static var themeBg: UIColor { UIColor(Theme.bg) }
     static var themeSurface: UIColor { UIColor(Theme.surface) }
-    /// Code spans and blocks in the editor.
-    static var themeSurfaceRaised: UIColor { UIColor(Theme.surfaceRaised) }
     static var themeText: UIColor { UIColor(Theme.text) }
-    static var themeMuted: UIColor { UIColor(Theme.muted) }
-    static var themeBorder: UIColor { UIColor(Theme.border) }
-    static var themeAccent: UIColor { UIColor(Theme.accent) }
 
-    /// Page paper: the flavour's card colour, the desktop's
-    /// `Palette::paper` in crates/krabink/src/theme.rs. Both platforms
-    /// clear the ink layer to this, under the text, so ink reads alike
-    /// everywhere; the renderer picks the highlighter blend from its
-    /// luminance.
-    static var paper: UIColor { UIColor(Theme.surface) }
+    /// Page paper: the picked colour or the flavour's card colour, the
+    /// desktop's `Palette::paper` in crates/krabink/src/theme.rs. Both
+    /// platforms clear the ink layer to this, under the text, so ink
+    /// reads alike everywhere; the renderer picks the highlighter blend
+    /// from its luminance.
+    static var paper: UIColor { UIColor(Theme.paper) }
+
+    // What sits on the paper, in its tone (`ThemeStore.paperPalette`).
+    private static var onPaper: Palette { ThemeStore.shared.paperPalette }
+    static var paperText: UIColor { UIColor(onPaper.text) }
+    static var paperMuted: UIColor { UIColor(onPaper.muted) }
+    static var paperAccent: UIColor { UIColor(onPaper.accent) }
+    static var paperBorder: UIColor { UIColor(onPaper.border) }
+    /// Code spans and blocks in the editor.
+    static var paperSurfaceRaised: UIColor { UIColor(onPaper.surfaceRaised) }
+
+    /// The sRGB components as `0xRRGGBB`, the inverse of `Color(hex:)`.
+    var rgbHex: UInt32 {
+        var r: CGFloat = 0
+        var g: CGFloat = 0
+        var b: CGFloat = 0
+        var a: CGFloat = 0
+        getRed(&r, green: &g, blue: &b, alpha: &a)
+        func byte(_ c: CGFloat) -> UInt32 { UInt32(min(max((c * 255).rounded(), 0), 255)) }
+        return byte(r) << 16 | byte(g) << 8 | byte(b)
+    }
 }
 
 /// How the app reads a sync status line (`AppModel.syncState`).

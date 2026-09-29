@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use krabink_ffi::{
-    AssetInfo, AssetKind, BrushInfo, Core, CoreListener, DeviceInfo, Element, NoteInfo,
-    NoteListener, PageProbe, PairInfo, Point2, PointKind, Route, Shape, ShapeElement, Stroke,
-    StrokePoint, StyleKind, SyncState, Tool, inline_min_height, inline_padding, style_runs,
+    AppearanceInfo, AssetInfo, AssetKind, BrushInfo, Core, CoreListener, DeviceInfo, Element,
+    NoteInfo, NoteListener, PageProbe, PairInfo, Point2, PointKind, Route, Shape, ShapeElement,
+    Stroke, StrokePoint, StyleKind, SyncState, Tool, inline_min_height, inline_padding, style_runs,
 };
 
 fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
@@ -100,6 +100,7 @@ struct RecCore {
     assets: Mutex<Vec<AssetInfo>>,
     devices: Mutex<Vec<DeviceInfo>>,
     states: Mutex<Vec<SyncState>>,
+    appearance: Mutex<Option<AppearanceInfo>>,
 }
 
 impl CoreListener for RecCore {
@@ -117,6 +118,10 @@ impl CoreListener for RecCore {
 
     fn devices_changed(&self, devices: Vec<DeviceInfo>) {
         *self.devices.lock().unwrap() = devices;
+    }
+
+    fn appearance_changed(&self, appearance: Option<AppearanceInfo>) {
+        *self.appearance.lock().unwrap() = appearance;
     }
 
     fn sync_state(&self, state: SyncState) {
@@ -320,6 +325,40 @@ fn device_rows_converge_both_ways() {
     let has = |core: &Core, id: &str| core.list_devices().iter().any(|d| d.id == id);
     wait_for("B lists A", || has(&core_b, &core_a.device_id()));
     wait_for("A lists B", || has(&core_a, &core_b.device_id()));
+}
+
+/// A shared look reaches the paired core's listener, and the latest
+/// change (here: back to the flavour's paper) wins on both.
+#[test]
+fn appearance_converges_direct() {
+    let dir = tempfile::tempdir().unwrap();
+    let core_a = Core::new(dir.path().join("a").to_str().unwrap().into()).unwrap();
+    let core_b = Core::new(dir.path().join("b").to_str().unwrap().into()).unwrap();
+    let rec_b = Arc::new(RecCore::default());
+    core_b.set_listener(rec_b.clone());
+    assert_eq!(core_a.appearance(), None);
+
+    let mut pair = core_a.pair_info();
+    pair.addrs = vec![format!("127.0.0.1:{}", core_a.bound_port().unwrap())];
+    core_b.set_pairing(pair).unwrap();
+    wait_for("B connects to A", || connected(&core_b.sync_state()));
+
+    let cream = AppearanceInfo {
+        flavor: "mocha".into(),
+        paper: Some(0xf5efe0),
+    };
+    core_a.set_appearance(cream.clone()).unwrap();
+    wait_for("B's listener gets the paper", || {
+        *rec_b.appearance.lock().unwrap() == Some(cream.clone())
+    });
+
+    let latte = AppearanceInfo {
+        flavor: "latte".into(),
+        paper: None,
+    };
+    core_b.set_appearance(latte.clone()).unwrap();
+    wait_for("A follows B", || core_a.appearance() == Some(latte.clone()));
+    assert_eq!(core_b.appearance(), Some(latte));
 }
 
 /// Renaming is an upsert of our own row: the peer's listener gets the new

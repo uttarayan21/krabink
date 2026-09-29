@@ -7,9 +7,10 @@ use bevy_egui::egui;
 use krabink_core::{DeviceId, DeviceMeta, PairInfo};
 use krabink_local::{PeerKind, PeerState, PeerStatus, PeerTarget, RelayHealth, RelayTarget, Route};
 
+use crate::color_wheel::{self, Hsv};
 use crate::node::SyncNode;
 use crate::sync::{LOCAL_PLATFORM, local_device_name};
-use crate::theme::{Flavor, Palette};
+use crate::theme::{self, Flavor, Palette};
 
 /// Quiet-zone border around the QR matrix, in modules (spec minimum is 4).
 const QUIET_ZONE: usize = 4;
@@ -99,6 +100,14 @@ pub enum SettingsAction {
     Unpair,
     /// Draw the app in another Catppuccin flavour.
     Theme(Flavor),
+    /// Draw notes on this paper (`None`: the flavour's card colour).
+    /// Applied live while the wheel is dragged; `persist` once released.
+    Paper {
+        color: Option<egui::Color32>,
+        persist: bool,
+    },
+    /// Follow and share the workspace's look, or keep this desktop's own.
+    SyncTheme(bool),
 }
 
 /// Read-only snapshot the window renders each frame; gathered by the
@@ -112,8 +121,12 @@ pub struct SettingsView {
     pub now_ms: u64,
     /// The flavour currently applied (the picker's selection).
     pub flavor: Flavor,
-    /// Its colours, for the window's own chrome.
+    /// Its colours, for the window's own chrome; `paper` is the page's.
     pub palette: Palette,
+    /// Whether the paper is a picked colour rather than the flavour's.
+    pub custom_paper: bool,
+    /// Whether the theme follows the workspace's shared look.
+    pub sync_theme: bool,
 }
 
 #[derive(Resource)]
@@ -134,6 +147,9 @@ pub struct Settings {
     pending_remove: Option<DeviceId>,
     /// "Leave workspace" was clicked once; second click confirms.
     pending_unpair: bool,
+    /// The paper wheel's position; re-read from the paper whenever that
+    /// changed elsewhere (flavour switch, reset).
+    paper_hsv: Hsv,
 }
 
 impl Settings {
@@ -148,6 +164,7 @@ impl Settings {
             name_edit: local_device_name(),
             pending_remove: None,
             pending_unpair: false,
+            paper_hsv: Hsv::from_color(egui::Color32::BLACK),
         }
     }
 
@@ -225,8 +242,8 @@ impl Settings {
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.add_space(6.0);
-                        if let Some(flavor) = Self::appearance_section(ui, view) {
-                            action = Some(SettingsAction::Theme(flavor));
+                        if let Some(asked) = self.appearance_section(ui, view) {
+                            action = Some(asked);
                         }
                         if let Some(asked) = self.sync_section(ui, view) {
                             action = Some(asked);
@@ -244,8 +261,13 @@ impl Settings {
         action
     }
 
-    /// One button per Catppuccin flavour; returns a newly picked one.
-    fn appearance_section(ui: &mut egui::Ui, view: &SettingsView) -> Option<Flavor> {
+    /// One button per Catppuccin flavour, then the paper wheel; returns a
+    /// newly picked flavour or paper.
+    fn appearance_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        view: &SettingsView,
+    ) -> Option<SettingsAction> {
         let palette = &view.palette;
         palette.section(ui, "Appearance", |ui| {
             let mut picked = None;
@@ -270,16 +292,86 @@ impl Settings {
                     .corner_radius(egui::CornerRadius::same(crate::theme::RADIUS))
                     .min_size(egui::Vec2::new(96.0, 34.0));
                     if ui.add(button).clicked() && !selected {
-                        picked = Some(flavor);
+                        picked = Some(SettingsAction::Theme(flavor));
                     }
                 }
             });
             ui.add_space(4.0);
-            ui.weak(
-                "Catppuccin flavours, lightest to darkest. Sketch paper follows the card colour.",
-            );
+            ui.weak("Catppuccin flavours, lightest to darkest.");
+            ui.add_space(12.0);
+            if let Some(paper) = self.paper_picker(ui, view) {
+                picked = Some(paper);
+            }
+            ui.add_space(12.0);
+            let mut sync = view.sync_theme;
+            if ui
+                .checkbox(&mut sync, "Sync theme with other devices")
+                .changed()
+            {
+                picked = Some(SettingsAction::SyncTheme(sync));
+            }
+            ui.weak(if view.sync_theme {
+                "Flavour and paper follow the workspace: a change here, or on any \
+                 device syncing its theme, restyles them all."
+            } else {
+                "This desktop keeps its own flavour and paper."
+            });
             picked
         })
+    }
+
+    /// The paper wheel, the colour's hex, and the way back to the
+    /// flavour's card colour.
+    fn paper_picker(&mut self, ui: &mut egui::Ui, view: &SettingsView) -> Option<SettingsAction> {
+        let palette = &view.palette;
+        if self.paper_hsv.to_color() != palette.paper {
+            self.paper_hsv = Hsv::from_color(palette.paper);
+        }
+        let mut action = None;
+        ui.label(egui::RichText::new("Paper").strong().color(palette.text));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let response = color_wheel::picker(ui, &mut self.paper_hsv, 150.0, palette.border);
+            let released = response.drag_stopped() || response.clicked();
+            if response.changed() || released {
+                action = Some(SettingsAction::Paper {
+                    color: Some(self.paper_hsv.to_color()),
+                    persist: released,
+                });
+            }
+            ui.add_space(12.0);
+            ui.vertical(|ui| {
+                let (swatch, _) =
+                    ui.allocate_exact_size(egui::Vec2::new(64.0, 40.0), egui::Sense::hover());
+                ui.painter().rect(
+                    swatch,
+                    egui::CornerRadius::same(theme::RADIUS),
+                    palette.paper,
+                    egui::Stroke::new(1.0, palette.border),
+                    egui::StrokeKind::Inside,
+                );
+                ui.monospace(
+                    egui::RichText::new(theme::to_hex(palette.paper)).color(palette.muted),
+                );
+                ui.add_space(6.0);
+                if ui
+                    .add_enabled(view.custom_paper, egui::Button::new("Follow theme"))
+                    .clicked()
+                {
+                    action = Some(SettingsAction::Paper {
+                        color: None,
+                        persist: true,
+                    });
+                }
+            });
+        });
+        ui.add_space(4.0);
+        ui.weak(if view.custom_paper {
+            "Notes are drawn on this colour whatever the flavour; text switches to stay readable."
+        } else {
+            "Following the flavour's card colour. Pick on the wheel for your own paper."
+        });
+        action
     }
 
     /// Peers, relay, this device (with its editable name) and, when a

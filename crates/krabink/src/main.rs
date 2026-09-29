@@ -3,6 +3,7 @@
 #![recursion_limit = "256"]
 
 mod cli;
+mod color_wheel;
 mod config;
 mod docs;
 mod errors;
@@ -154,7 +155,7 @@ fn run_app(args: cli::Cli) -> Result<()> {
         replica: config.replica.map(|id| id.to_string()),
     };
     let sync_node = SyncNode::new(node, &runtime);
-    let theme = theme::Theme::new(config.theme);
+    let theme = theme::Theme::new(config.theme, config.paper);
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -183,6 +184,7 @@ fn run_app(args: cli::Cli) -> Result<()> {
     .insert_resource(inbox)
     .insert_resource(theme.clear_color())
     .insert_resource(theme)
+    .insert_resource(theme::ThemeSync::new(config.sync_theme))
     .insert_resource(Runtime(runtime))
     .insert_resource(sync_node)
     .insert_resource(transport)

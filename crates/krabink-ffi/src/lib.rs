@@ -25,7 +25,7 @@ pub use markdown::{
     sketch_embed_title, style_runs,
 };
 pub use types::{
-    Binding, BrushInfo, DeviceInfo, Element, NoteInfo, PageElement, PageProbe, PairInfo, PeerInfo,
-    PeerKind, Point2, PointKind, Recognition, Route, Shape, ShapeElement, Stroke, StrokePoint,
-    SyncState, Tilt, Tool, build_pair_uri, parse_pair_uri,
+    AppearanceInfo, Binding, BrushInfo, DeviceInfo, Element, NoteInfo, PageElement, PageProbe,
+    PairInfo, PeerInfo, PeerKind, Point2, PointKind, Recognition, Route, Shape, ShapeElement,
+    Stroke, StrokePoint, SyncState, Tilt, Tool, build_pair_uri, parse_pair_uri,
 };

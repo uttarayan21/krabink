@@ -5,7 +5,9 @@
 //!
 //! The active flavour lives in the [`Theme`] resource; every screen reads
 //! its [`Palette`] each frame, so switching in Settings restyles the app
-//! at once. The iPad mirrors the same palettes in Theme.swift.
+//! at once. The sketch paper follows the flavour's card colour unless the
+//! user picked another, whatever the flavour. The iPad mirrors the same
+//! palettes in Theme.swift.
 
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
@@ -29,6 +31,21 @@ pub enum Flavor {
 impl Flavor {
     /// Every flavour, lightest first: the order the pickers list them in.
     pub const ALL: [Self; 4] = [Self::Latte, Self::Frappe, Self::Macchiato, Self::Mocha];
+
+    /// Key in config.toml and the workspace's shared appearance; the
+    /// iPad's `ThemeFlavor` raw values.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Latte => "latte",
+            Self::Frappe => "frappe",
+            Self::Macchiato => "macchiato",
+            Self::Mocha => "mocha",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.key() == key)
+    }
 
     /// Human name for pickers.
     pub const fn label(self) -> &'static str {
@@ -55,6 +72,7 @@ impl Flavor {
                 bg: rgb(0xeff1f5),
                 sidebar: rgb(0xe6e9ef),
                 surface: rgb(0xccd0da),
+                paper: rgb(0xccd0da),
                 surface_raised: rgb(0xbcc0cc),
                 surface_pressed: rgb(0xacb0be),
                 border: rgb(0xbcc0cc),
@@ -70,6 +88,7 @@ impl Flavor {
                 bg: rgb(0x303446),
                 sidebar: rgb(0x292c3c),
                 surface: rgb(0x414559),
+                paper: rgb(0x414559),
                 surface_raised: rgb(0x51576d),
                 surface_pressed: rgb(0x626880),
                 border: rgb(0x51576d),
@@ -85,6 +104,7 @@ impl Flavor {
                 bg: rgb(0x24273a),
                 sidebar: rgb(0x1e2030),
                 surface: rgb(0x363a4f),
+                paper: rgb(0x363a4f),
                 surface_raised: rgb(0x494d64),
                 surface_pressed: rgb(0x5b6078),
                 border: rgb(0x494d64),
@@ -100,6 +120,7 @@ impl Flavor {
                 bg: rgb(0x1e1e2e),
                 sidebar: rgb(0x181825),
                 surface: rgb(0x313244),
+                paper: rgb(0x313244),
                 surface_raised: rgb(0x45475a),
                 surface_pressed: rgb(0x585b70),
                 border: rgb(0x45475a),
@@ -130,6 +151,38 @@ pub enum PaperTone {
     Dark,
 }
 
+/// Light or dark, by linear luminance.
+fn tone(color: Color32) -> PaperTone {
+    let [r, g, b, _] = color.to_normalized_gamma_f32();
+    let linear = |c: f32| {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+    if luminance < 0.5 {
+        PaperTone::Dark
+    } else {
+        PaperTone::Light
+    }
+}
+
+/// `#rrggbb` for config.toml and the settings window.
+pub fn to_hex(color: Color32) -> String {
+    format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b())
+}
+
+/// Parse `#rrggbb` (the `#` optional) into an opaque colour.
+pub fn parse_hex(raw: &str) -> Option<Color32> {
+    let digits = raw.trim().trim_start_matches('#');
+    if digits.len() != 6 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(digits, 16).ok().map(rgb)
+}
+
 /// Every colour the app uses, by role. Catppuccin roles in brackets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
@@ -137,8 +190,11 @@ pub struct Palette {
     pub bg: Color32,
     /// Library sidebar [mantle].
     pub sidebar: Color32,
-    /// Cards, windows, input backgrounds and sketch paper [surface0].
+    /// Cards, windows and input backgrounds [surface0].
     pub surface: Color32,
+    /// Sketch paper under the editor's text and ink: [surface0] unless
+    /// the user picked another colour (see [`Theme::new`]).
+    pub paper: Color32,
     /// Hovered rows, striped table rows, code blocks [surface1].
     pub surface_raised: Color32,
     /// Pressed widgets [surface2].
@@ -173,25 +229,32 @@ impl Palette {
     /// the editor's text with no visible frame. The iPad pins its canvas to
     /// the same colour (`UIColor.paper` in InkRenderer.swift).
     pub const fn paper(&self) -> Color32 {
-        self.surface
+        self.paper
     }
 
     /// Light or dark paper, by linear luminance (the iPad applies the same
     /// cut-off in `InkRenderer.isDark`).
     pub fn paper_tone(&self) -> PaperTone {
-        let [r, g, b, _] = self.paper().to_normalized_gamma_f32();
-        let linear = |c: f32| {
-            if c <= 0.04045 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
+        tone(self.paper)
+    }
+
+    /// Colours for what sits on the paper (editor text, inline frames):
+    /// the palette itself while the paper keeps the flavour's tone, else
+    /// Latte's (light paper) or Mocha's (dark paper), so text stays
+    /// readable on a picked colour of the other tone. Mirrors
+    /// `ThemeStore.paperPalette` in Theme.swift.
+    pub fn on_paper(&self) -> Palette {
+        let paper_tone = self.paper_tone();
+        if paper_tone == tone(self.surface) {
+            return *self;
+        }
+        let base = match paper_tone {
+            PaperTone::Light => Flavor::Latte,
+            PaperTone::Dark => Flavor::Mocha,
         };
-        let luminance = 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
-        if luminance < 0.5 {
-            PaperTone::Dark
-        } else {
-            PaperTone::Light
+        Palette {
+            paper: self.paper,
+            ..base.palette()
         }
     }
 
@@ -438,20 +501,28 @@ impl Palette {
     }
 }
 
-/// The active flavour. Change it with [`Theme::set_flavor`]; the
-/// [`apply`] system restyles egui and the bevy clear colour on the next
-/// frame, and the sketch module recolours its paper.
+/// The active flavour and paper. Change them with [`Theme::set_flavor`]
+/// and [`Theme::set_paper`]; the [`apply`] system restyles egui and the
+/// bevy clear colour on the next frame, and the sketch module recolours
+/// its paper.
 #[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     flavor: Flavor,
+    /// The user's paper colour; `None` follows the flavour's card colour.
+    paper: Option<Color32>,
     palette: Palette,
 }
 
 impl Theme {
-    pub const fn new(flavor: Flavor) -> Self {
+    pub const fn new(flavor: Flavor, paper: Option<Color32>) -> Self {
+        let mut palette = flavor.palette();
+        if let Some(paper) = paper {
+            palette.paper = paper;
+        }
         Self {
             flavor,
-            palette: flavor.palette(),
+            paper,
+            palette,
         }
     }
 
@@ -459,12 +530,23 @@ impl Theme {
         self.flavor
     }
 
+    /// The picked paper colour, if any (the palette's `paper` either way).
+    pub const fn paper(&self) -> Option<Color32> {
+        self.paper
+    }
+
     pub const fn palette(&self) -> &Palette {
         &self.palette
     }
 
+    /// Switch flavour; a picked paper colour stays.
     pub fn set_flavor(&mut self, flavor: Flavor) {
-        *self = Self::new(flavor);
+        *self = Self::new(flavor, self.paper);
+    }
+
+    /// Pick a paper colour, or `None` to follow the flavour again.
+    pub fn set_paper(&mut self, paper: Option<Color32>) {
+        *self = Self::new(self.flavor, paper);
     }
 
     /// The window's clear colour for this theme.
@@ -481,7 +563,79 @@ pub struct ThemePlugin;
 
 impl Plugin for ThemePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(bevy_egui::EguiPrimaryContextPass, apply);
+        app.add_systems(Update, follow_shared)
+            .add_systems(bevy_egui::EguiPrimaryContextPass, apply);
+    }
+}
+
+/// Whether this device follows the workspace's shared look (flavour and
+/// paper), and the shared look it last saw. While on, local changes are
+/// published ([`ThemeSync::appearance`]) and a shared look that changes
+/// (a peer's pick, or the stored one at launch) is applied and persisted.
+#[derive(Resource, Debug, Clone, PartialEq, Eq)]
+pub struct ThemeSync {
+    pub enabled: bool,
+    /// Compared against the workspace each frame; only a change is
+    /// applied, so a local pick not yet published (the paper wheel mid
+    /// drag) is not snapped back.
+    seen: Option<krabink_core::Appearance>,
+}
+
+impl ThemeSync {
+    pub const fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            seen: None,
+        }
+    }
+
+    /// Turn syncing on or off. Turning it on forgets the look last seen,
+    /// so a shared one is applied on the next frame.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        self.seen = None;
+    }
+
+    /// `theme` as the workspace's shared look.
+    pub fn appearance(theme: &Theme) -> krabink_core::Appearance {
+        krabink_core::Appearance {
+            flavor: theme.flavor().key().to_string(),
+            paper: theme
+                .paper()
+                .map(|p| u32::from_be_bytes([0, p.r(), p.g(), p.b()])),
+        }
+    }
+}
+
+/// Apply the workspace's shared look when it changed and this device
+/// syncs its theme.
+fn follow_shared(
+    docs: Res<crate::docs::Docs>,
+    mut sync: ResMut<ThemeSync>,
+    mut theme: ResMut<Theme>,
+) {
+    if !sync.enabled {
+        return;
+    }
+    let shared = docs.workspace.appearance();
+    if sync.seen == shared {
+        return;
+    }
+    sync.seen.clone_from(&shared);
+    let Some(shared) = shared else {
+        return;
+    };
+    let Some(flavor) = Flavor::from_key(&shared.flavor) else {
+        tracing::warn!(flavor = shared.flavor, "ignoring unknown shared flavour");
+        return;
+    };
+    let paper = shared.paper.map(rgb);
+    if theme.flavor() == flavor && theme.paper() == paper {
+        return;
+    }
+    *theme = Theme::new(flavor, paper);
+    if let Err(err) = crate::config::persist_appearance(flavor, paper) {
+        tracing::error!(%err, "persisting shared theme failed");
     }
 }
 
@@ -510,4 +664,66 @@ pub fn install(ctx: &egui::Context, theme: &Theme) {
         egui::Theme::Light => egui::ThemePreference::Light,
     });
     ctx.set_style_of(base, theme.palette().style(base));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_roundtrips_and_rejects_garbage() {
+        let paper = Color32::from_rgb(0xf5, 0xef, 0xe0);
+        assert_eq!(to_hex(paper), "#f5efe0");
+        assert_eq!(parse_hex("#f5efe0"), Some(paper));
+        assert_eq!(parse_hex("F5EFE0"), Some(paper));
+        for bad in ["", "#fff", "#f5efe0ff", "+12345", "#gggggg"] {
+            assert_eq!(parse_hex(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn picked_paper_survives_flavour_switch() {
+        let paper = Color32::from_rgb(0xf5, 0xef, 0xe0);
+        let mut theme = Theme::new(Flavor::Mocha, None);
+        assert_eq!(theme.palette().paper(), Flavor::Mocha.palette().surface);
+        theme.set_paper(Some(paper));
+        theme.set_flavor(Flavor::Frappe);
+        assert_eq!(theme.palette().paper(), paper);
+        theme.set_paper(None);
+        assert_eq!(theme.palette().paper(), Flavor::Frappe.palette().surface);
+    }
+
+    #[test]
+    fn shared_look_carries_flavour_key_and_paper() {
+        for flavor in Flavor::ALL {
+            assert_eq!(Flavor::from_key(flavor.key()), Some(flavor));
+        }
+        assert_eq!(Flavor::from_key("sepia"), None);
+
+        let theme = Theme::new(Flavor::Frappe, Some(Color32::from_rgb(0xf5, 0xef, 0xe0)));
+        let shared = ThemeSync::appearance(&theme);
+        assert_eq!(shared.flavor, "frappe");
+        assert_eq!(shared.paper, Some(0xf5efe0));
+        assert_eq!(shared.paper.map(rgb), theme.paper());
+        assert_eq!(
+            ThemeSync::appearance(&Theme::new(Flavor::Mocha, None)).paper,
+            None
+        );
+    }
+
+    #[test]
+    fn text_on_paper_follows_the_paper_tone() {
+        let mocha = Flavor::Mocha.palette();
+        assert_eq!(mocha.on_paper(), mocha);
+
+        let cream = Color32::from_rgb(0xf5, 0xef, 0xe0);
+        let light = Theme::new(Flavor::Mocha, Some(cream));
+        let ink = light.palette().on_paper();
+        assert_eq!(ink.paper_tone(), PaperTone::Light);
+        assert_eq!(ink.text, Flavor::Latte.palette().text);
+        assert_eq!(ink.paper, cream);
+
+        let dark = Theme::new(Flavor::Latte, Some(Color32::from_rgb(0x10, 0x20, 0x30)));
+        assert_eq!(dark.palette().on_paper().text, Flavor::Mocha.palette().text);
+    }
 }

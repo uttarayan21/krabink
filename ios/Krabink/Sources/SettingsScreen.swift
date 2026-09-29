@@ -35,10 +35,13 @@ struct SettingsScreen: View {
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 6)
+                    PaperPicker(theme: theme)
+                    Toggle("sync theme with other devices", isOn: $theme.syncTheme)
+                        .accessibilityIdentifier("syncTheme")
                 } header: {
                     Caption("Appearance")
                 } footer: {
-                    Text("Catppuccin flavours, lightest to darkest. Sketch paper follows the card colour on every device.")
+                    Text(appearanceFooter)
                         .foregroundStyle(Theme.muted)
                 }
 
@@ -262,6 +265,16 @@ struct SettingsScreen: View {
         .tint(Theme.accent)
     }
 
+    private var appearanceFooter: String {
+        let paper = theme.paper == nil
+            ? "Sketch paper follows the card colour; pick on the wheel for your own."
+            : "Notes are drawn on the picked paper whatever the flavour; text switches to stay readable."
+        let sync = theme.syncTheme
+            ? "Flavour and paper follow the workspace: a change here, or on any device syncing its theme, restyles them all."
+            : "This iPad keeps its own flavour and paper."
+        return "Catppuccin flavours, lightest to darkest. \(paper) \(sync)"
+    }
+
     private func row(_ label: String, _ value: String, mono: Bool = false) -> some View {
         LabeledContent(label) {
             Text(value)
@@ -319,6 +332,58 @@ struct SettingsScreen: View {
         guard ms > 0 else { return "never" }
         let date = Date(timeIntervalSince1970: TimeInterval(ms) / 1000)
         return date.formatted(.relative(presentation: .named))
+    }
+}
+
+/// The paper wheel and its brightness bar, the colour's swatch and hex,
+/// and the way back to the flavour's card colour. Edits apply (and
+/// persist) as the wheel moves.
+private struct PaperPicker: View {
+    let theme: ThemeStore
+    /// The wheel's position; re-read from the paper whenever that changed
+    /// elsewhere (flavour switch, reset).
+    @State private var hsv = HSV(h: 0, s: 0, v: 0)
+
+    var body: some View {
+        HStack(spacing: 16) {
+            ColorWheel(hsv: $hsv)
+                .frame(width: 160, height: 160)
+                .accessibilityIdentifier("paperWheel")
+            BrightnessBar(hsv: $hsv)
+                .frame(width: 22, height: 160)
+                .accessibilityIdentifier("paperBrightness")
+            VStack(alignment: .leading, spacing: 8) {
+                Text("paper")
+                    .foregroundStyle(Theme.text)
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Theme.paper)
+                    .frame(width: 64, height: 40)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(Theme.border, lineWidth: 1)
+                    }
+                Text(String(format: "#%06x", theme.paperHex))
+                    .font(.body.monospaced())
+                    .foregroundStyle(Theme.muted)
+                    .accessibilityIdentifier("paperHex")
+                Button("follow theme") { theme.paper = nil }
+                    .buttonStyle(.borderless)
+                    .disabled(theme.paper == nil)
+                    .accessibilityIdentifier("paperFollowTheme")
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 6)
+        .onAppear(perform: sync)
+        .onChange(of: theme.paperHex) { sync() }
+        .onChange(of: hsv) { _, picked in
+            if picked.hex != theme.paperHex { theme.paper = picked.hex }
+        }
+    }
+
+    private func sync() {
+        let current = theme.paperHex
+        if hsv.hex != current { hsv = HSV(hex: current) }
     }
 }
 
