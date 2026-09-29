@@ -1,0 +1,14 @@
+# `cargo make web-build` / `web-serve`. In production the relay is
+# same-origin (its host serves this build). In development the page is
+# opened with `?relay=http://127.0.0.1:3340` pointing at a local
+# `krabink-server --dev --open`: trunk's websocket proxy re-does the
+# handshake without the relay's subprotocol, so the relay cannot sit
+# behind it.
+
+[build]
+target = "index.html"
+dist = "../../target/web-dist"
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080

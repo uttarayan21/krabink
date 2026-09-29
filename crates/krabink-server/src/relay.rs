@@ -9,7 +9,7 @@ use iroh_relay::server::{
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
-use crate::config::{RelayOpts, TlsOpts};
+use crate::config::{self, RelayOpts, TlsOpts};
 use crate::errors::{Error, Result, ResultExt};
 
 /// Admit a relay client only if it presents one of the workspace tokens.
@@ -27,15 +27,28 @@ impl AccessControl for TokenAccess {
     }
 }
 
+/// Admit every relay client: the open default relay.
+#[derive(Debug)]
+pub struct OpenAccess;
+
+impl AccessControl for OpenAccess {
+    async fn on_connect(&self, _request: &ClientRequest) -> Access {
+        Access::Allow
+    }
+}
+
 /// Spawn the relay. Drop or `shutdown()` the returned server to stop it.
-pub async fn spawn(opts: RelayOpts, tokens: Vec<String>) -> Result<Server> {
+pub async fn spawn(opts: RelayOpts, access: config::Access, tokens: Vec<String>) -> Result<Server> {
     // The relay's TLS stack wants a process-wide provider; harmless if the
     // embedding process already installed one.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut relay = RelayServerConfig::new(opts.http_listen);
     relay.key_cache_capacity = Some(1024);
-    relay.access = Arc::new(TokenAccess(tokens));
+    relay.access = match access {
+        config::Access::Tokens => Arc::new(TokenAccess(tokens)),
+        config::Access::Open => Arc::new(OpenAccess),
+    };
     relay.tls = match &opts.tls {
         Some(tls) => Some(tls_config(tls).await?),
         None => None,

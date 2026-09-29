@@ -60,9 +60,9 @@ pub use markdown::{
     PreviewText, StyleKind, StyleRun, preview_text, sketch_embed_title, style_runs,
 };
 pub use note::{InkChanges, NoteDoc};
-pub use pair::PairInfo;
+pub use pair::{DEFAULT_RELAY, PairInfo};
 pub use shape::{Frame, Recognition, RecognizerParams, Shape, recognize, recognize_with};
-pub use store::{DocKey, Flush, Store, StoredDoc};
+pub use store::{DocKey, Flush, Store, StoreImage, StoreOp, StoreSink, StoredDoc};
 pub use stroke::{
     PointKind, PointSize, Rgba, Stroke, StrokePoint, Tilt, Tool, decode_chunks, encode_chunks,
 };
@@ -83,6 +83,7 @@ pub enum Error {
     Crdt(#[from] loro::LoroError),
     #[error("crdt encode error")]
     Encode(#[from] loro::LoroEncodeError),
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("storage error")]
     Storage(#[from] redb::Error),
     #[error("codec error")]

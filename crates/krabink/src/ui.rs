@@ -440,7 +440,7 @@ fn editor_ui(
     mut settings: ResMut<Settings>,
     transport: Res<SyncTransport>,
     mut sync: ResMut<crate::node::SyncNode>,
-    runtime: Res<crate::Runtime>,
+    runtime: Res<crate::runtime::Runtime>,
     mut adopted: MessageWriter<crate::settings::PairAdopted>,
     follow: Res<FollowLatest>,
     mut theme: ResMut<Theme>,
@@ -470,7 +470,7 @@ fn editor_ui(
         Some(crate::settings::SettingsAction::RemoveDevice(id)) => {
             // Sever the live link both ways: the peer hears the unpair and
             // forgets this desktop; we drop its row from the registry.
-            sync.unpair(&runtime.0, id);
+            sync.unpair(&runtime, id);
             match docs.remove_device(id) {
                 Ok(payload) if !payload.is_empty() => {
                     commits.write(LocalCommit {
@@ -487,7 +487,7 @@ fn editor_ui(
             if let Err(err) = crate::config::persist_device_name(&name) {
                 tracing::error!(%err, "persisting device name failed");
             }
-            sync.readvertise(&runtime.0, &name);
+            sync.readvertise(&runtime, &name);
             match docs.register_device(transport.device(), &name, crate::sync::LOCAL_PLATFORM) {
                 Ok(payload) if !payload.is_empty() => {
                     commits.write(LocalCommit {
@@ -521,11 +521,14 @@ fn editor_ui(
             if old_token != own.token {
                 node.remove_token(&old_token);
             }
-            runtime.0.spawn(async move {
-                tokio::time::sleep(crate::settings::UNPAIR_LINGER).await;
+            runtime.spawn(async move {
+                n0_future::time::sleep(crate::settings::UNPAIR_LINGER).await;
                 node.set_peers(Vec::new()).await;
-                if let Err(err) = node.set_relay(None).await {
-                    tracing::warn!(%err, "dropping relay after leaving failed");
+                if let Err(err) = node
+                    .set_relay(Some(krabink_local::RelayTarget::default_relay()))
+                    .await
+                {
+                    tracing::warn!(%err, "resetting relay after leaving failed");
                 }
             });
             settings.adopt(own);

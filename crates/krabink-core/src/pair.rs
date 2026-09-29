@@ -12,6 +12,11 @@
 //! always-on cloud node of the same workspace, if there is one. All accept
 //! the same token.
 
+/// The relay every node homes on when none is configured. The same origin
+/// serves the web build, so a browser reaches it without CORS or mixed
+/// content. It admits anyone; the workspace token is checked by the peers.
+pub const DEFAULT_RELAY: &str = "https://krabink.darksailor.dev";
+
 /// Sync coordinates carried by a pairing URI.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PairInfo {
@@ -28,6 +33,9 @@ pub struct PairInfo {
 }
 
 const SCHEME_AND_PATH: &str = "krabink://pair?";
+/// Fragment that carries a pairing URI to the web build. A fragment never
+/// reaches the server, so the token stays out of its logs.
+const WEB_FRAGMENT: &str = "#pair=";
 
 impl PairInfo {
     pub fn to_uri(&self) -> String {
@@ -49,6 +57,21 @@ impl PairInfo {
             uri.push_str(&percent_encode(replica));
         }
         uri
+    }
+
+    /// A link that opens the web build at `base` (e.g. [`DEFAULT_RELAY`])
+    /// already paired with this node.
+    pub fn web_link(&self, base: &str) -> String {
+        format!(
+            "{}/{WEB_FRAGMENT}{}",
+            base.trim_end_matches('/'),
+            percent_encode(&self.to_uri())
+        )
+    }
+
+    /// The pairing a web link's fragment (`location.hash`) carries.
+    pub fn from_web_fragment(fragment: &str) -> Option<Self> {
+        Self::parse(&percent_decode(fragment.strip_prefix(WEB_FRAGMENT)?)?)
     }
 
     /// Parse a pairing URI. Returns `None` for anything that is not a
@@ -168,6 +191,26 @@ mod tests {
         assert!(parsed.addrs.is_empty());
         assert_eq!(parsed.relay, None);
         assert_eq!(parsed.replica, None);
+    }
+
+    #[test]
+    fn web_link_roundtrip() {
+        let info = PairInfo {
+            node: NODE.into(),
+            token: "a&b=c %/ü".into(),
+            relay: Some(DEFAULT_RELAY.into()),
+            ..Default::default()
+        };
+        let link = info.web_link("https://krabink.darksailor.dev/");
+        let (base, fragment) = link.split_once('#').unwrap();
+        assert_eq!(base, "https://krabink.darksailor.dev/");
+        assert!(!fragment.contains('&'), "{fragment}");
+        assert_eq!(
+            PairInfo::from_web_fragment(&format!("#{fragment}")),
+            Some(info)
+        );
+        assert_eq!(PairInfo::from_web_fragment("#other"), None);
+        assert_eq!(PairInfo::from_web_fragment(""), None);
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub struct Inbox {
 }
 
 /// How a launch with files to open resolved.
+#[cfg(not(target_arch = "wasm32"))]
 pub enum Launch {
     /// Another app owns the data dir and took the files.
     Forwarded,
@@ -41,6 +42,7 @@ pub enum Launch {
     Primary(Vec<PathBuf>),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Launch {
     /// Hand `files` to the app already running on `socket`, if any.
     /// Paths are made absolute first: the running app has its own working
@@ -62,12 +64,22 @@ impl Inbox {
     /// Start listening for forwarded files. Call only once the stores are
     /// open: their lock is what makes this launch the owner, so a socket
     /// left by a crashed run can be replaced safely.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn listen(socket: &Path, pending: Vec<PathBuf>) -> Self {
         let forwarded = platform::listen(socket)
             .inspect_err(|err| tracing::warn!(%err, "not listening for opened files"))
             .ok()
             .map(Mutex::new);
         Self { pending, forwarded }
+    }
+
+    /// Nothing to open and nobody forwarding (the browser).
+    #[cfg(target_arch = "wasm32")]
+    pub fn empty() -> Self {
+        Self {
+            pending: Vec::new(),
+            forwarded: None,
+        }
     }
 
     /// Everything queued since the last call.
@@ -214,7 +226,7 @@ mod platform {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_arch = "wasm32")))]
 mod platform {
     //! No single-instance hand-off: a second launch opens its files itself
     //! (and fails on the locked store if another app owns the data dir).

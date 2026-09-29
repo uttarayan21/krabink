@@ -10,11 +10,16 @@ use iroh_relay::server::Server;
 use krabink_core::NoteId;
 use krabink_local::testing::{App, TOKEN, node, node_with_role, relay_target, wait_connected};
 use krabink_local::{PeerKind, RelayTarget, Role};
-use krabink_server::RelayOpts;
+use krabink_server::{Access, RelayOpts};
 
 async fn dev_relay() -> (Server, RelayUrl) {
+    spawn_relay(Access::Tokens).await
+}
+
+async fn spawn_relay(access: Access) -> (Server, RelayUrl) {
     let server = krabink_server::relay::spawn(
         RelayOpts::dev(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        access,
         vec![TOKEN.into()],
     )
     .await
@@ -28,7 +33,7 @@ async fn dev_relay() -> (Server, RelayUrl) {
 fn relay(url: &RelayUrl, token: &str) -> Option<RelayTarget> {
     Some(RelayTarget {
         url: url.clone(),
-        token: token.into(),
+        token: Some(token.into()),
     })
 }
 
@@ -57,6 +62,37 @@ async fn three_nodes_converge_over_relay() {
     app_c.pump_until(|app| app.text(note) == "via relay").await;
 
     c.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    a.shutdown().await.unwrap();
+}
+
+/// The shared default relay: nobody sends it a token, and peers paired
+/// without a relay URL are dialled through the node's own relay.
+#[tokio::test]
+async fn open_relay_admits_tokenless_clients() {
+    let (_server, url) = spawn_relay(Access::Open).await;
+    let open = || {
+        Some(RelayTarget {
+            url: url.clone(),
+            token: None,
+        })
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let a = node(&dir, "a", &[TOKEN], open()).await;
+    let b = node(&dir, "b", &[TOKEN], open()).await;
+    let note = NoteId::new();
+    let mut app_a = App::open(&a, note).await;
+    let mut app_b = App::open(&b, note).await;
+
+    let mut target = relay_target(&a, TOKEN, PeerKind::Desktop);
+    target.relay = None;
+    b.set_peers(vec![target]).await;
+    wait_connected(&b, &a).await;
+    assert!(b.relay_health().error.is_none());
+
+    app_a.edit(note, "open relay");
+    app_b.pump_until(|app| app.text(note) == "open relay").await;
+
     b.shutdown().await.unwrap();
     a.shutdown().await.unwrap();
 }

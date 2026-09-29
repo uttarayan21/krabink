@@ -1,0 +1,35 @@
+[package]
+name = "krabink-idb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "IndexedDB persistence for the browser build of krabink"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+krabink-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+futures.workspace = true
+hex.workspace = true
+wasm-bindgen = "0.2.126"
+wasm-bindgen-futures = "0.4.76"
+js-sys = "0.3.103"
+web-sys = { version = "0.3.103", features = [
+  "DomException",
+  "DomStringList",
+  "Event",
+  "IdbCursor",
+  "IdbCursorWithValue",
+  "IdbDatabase",
+  "IdbFactory",
+  "IdbKeyRange",
+  "IdbObjectStore",
+  "IdbOpenDbRequest",
+  "IdbRequest",
+  "IdbTransaction",
+  "IdbTransactionMode",
+  "IdbVersionChangeEvent",
+] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"

@@ -26,7 +26,12 @@ ism = ["krabink-core/ism"]
 krabink-core.workspace = true
 krabink-local.workspace = true
 uniffi.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+  "net",
+  "time",
+  "signal",
+] }
 thiserror.workspace = true
 tracing.workspace = true
 ulid.workspace = true

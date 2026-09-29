@@ -3,6 +3,7 @@
 //! does everything else (peers, relay, fan-out), so the link never goes
 //! down; a fatal session error just reopens it after a pause.
 
+use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use krabink_core::{ClientEffect, ClientSession, DeviceId, DocKey, ServerMsg};
 use krabink_local::{LocalLink, Node};
@@ -33,7 +34,7 @@ pub struct SyncTransport {
     link: LocalLink,
     session: Option<ClientSession>,
     token: String,
-    reopen_at: Option<std::time::Instant>,
+    reopen_at: Option<Instant>,
 }
 
 impl SyncTransport {
@@ -80,7 +81,11 @@ pub fn set_local_device_name(name: String) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(name);
 }
 
+/// What this build calls its platform in the device registry.
+#[cfg(not(target_arch = "wasm32"))]
 pub const LOCAL_PLATFORM: &str = std::env::consts::OS;
+#[cfg(target_arch = "wasm32")]
+pub const LOCAL_PLATFORM: &str = "web";
 
 pub struct SyncPlugin;
 
@@ -93,7 +98,7 @@ impl Plugin for SyncPlugin {
 }
 
 fn drive_sync(
-    runtime: Res<crate::Runtime>,
+    runtime: Res<crate::runtime::Runtime>,
     mut transport: ResMut<SyncTransport>,
     mut docs: ResMut<Docs>,
     mut editor: ResMut<EditorState>,
@@ -105,15 +110,14 @@ fn drive_sync(
 
     // 0. Handshake (first frame), or reopen after a fatal error.
     if transport.session.is_none() {
-        let due = transport
-            .reopen_at
-            .is_none_or(|at| at <= std::time::Instant::now());
+        let due = transport.reopen_at.is_none_or(|at| at <= Instant::now());
         if !due {
             return;
         }
         if transport.reopen_at.take().is_some() {
             tracing::info!("reopening local sync link after fatal error");
-            let _guard = runtime.0.enter();
+            #[allow(clippy::let_unit_value)]
+            let _guard = runtime.enter();
             transport.link = transport.node.local_link();
         }
         let mut session = ClientSession::new(device, transport.token.clone());
@@ -240,7 +244,7 @@ fn apply_effects(
             ClientEffect::Fatal(err) => {
                 tracing::error!(%err, "sync session failed; reopening link shortly");
                 transport.session = None;
-                transport.reopen_at = Some(std::time::Instant::now() + REOPEN_AFTER);
+                transport.reopen_at = Some(Instant::now() + REOPEN_AFTER);
             }
             // The desktop app talks only to its own node over the local
             // link, which never sends an unpair.

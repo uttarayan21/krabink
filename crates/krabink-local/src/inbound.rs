@@ -8,6 +8,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, TransportAddr};
+use n0_future::{task, time};
 use tokio::sync::mpsc;
 
 use crate::framing::{Lane, read_frame, read_lane, write_frame};
@@ -19,7 +20,7 @@ use crate::serve::{PeerIo, serve_peer};
 pub(crate) async fn accept_loop(endpoint: Endpoint, hub: Arc<Hub>) {
     while let Some(incoming) = endpoint.accept().await {
         let hub = hub.clone();
-        tokio::spawn(async move {
+        task::spawn(async move {
             let accepting = match incoming.accept() {
                 Ok(accepting) => accepting,
                 Err(err) => {
@@ -59,7 +60,7 @@ pub(crate) async fn serve_connection(conn: Connection, hub: Arc<Hub>) {
             device: None,
         },
     );
-    let mut serve = tokio::spawn(serve_peer(
+    let mut serve = task::spawn(serve_peer(
         hub.clone(),
         peer_id,
         PeerIo {
@@ -68,7 +69,7 @@ pub(crate) async fn serve_connection(conn: Connection, hub: Arc<Hub>) {
             eph: eph_tx,
         },
     ));
-    let routes = tokio::spawn(watch_routes(conn.clone(), hub.clone(), peer_id));
+    let routes = task::spawn(watch_routes(conn.clone(), hub.clone(), peer_id));
 
     let mut docs_rx = Some(docs_rx);
     let mut eph_rx = Some(eph_rx);
@@ -103,8 +104,8 @@ pub(crate) async fn serve_connection(conn: Connection, hub: Arc<Hub>) {
                     tracing::warn!(remote = %remote.fmt_short(), ?lane, "lane opened twice; closing");
                     break;
                 };
-                readers.push(tokio::spawn(pump_in(recv, in_tx.clone())));
-                writers.push(tokio::spawn(pump_out(send, out)));
+                readers.push(task::spawn(pump_in(recv, in_tx.clone())));
+                writers.push(task::spawn(pump_out(send, out)));
             }
             _ = &mut serve => break, // session asked to disconnect
             _ = conn.closed() => break,
@@ -118,7 +119,7 @@ pub(crate) async fn serve_connection(conn: Connection, hub: Arc<Hub>) {
     routes.abort();
     hub.deregister(peer_id);
     for writer in writers {
-        let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
+        let _ = time::timeout(Duration::from_secs(1), writer).await;
     }
     for reader in readers {
         reader.abort();

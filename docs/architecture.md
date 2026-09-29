@@ -80,7 +80,15 @@ Rules the diagram encodes:
   nobody. A node skips dialling a peer it already holds an inbound
   connection from (`Hub::has_inbound_from`), and the changed-gated fan-out
   (§3) makes a transient duplicate harmless.
-- **One token, every door.** The workspace token gates the relay
+- **A default relay, no setup.** Unless configured otherwise every node
+  homes on `https://krabink.darksailor.dev` (`krabink_core::DEFAULT_RELAY`),
+  a krabink-server in `access = "open"` mode: it admits every client and
+  only ever forwards end-to-end encrypted QUIC, so no token is ever sent to
+  it (`RelayTarget::for_workspace`). A self-hosted relay in `tokens` mode
+  still works as before; `relay = "off"` (or `--relay off`) keeps a desktop
+  LAN-only. Peers paired without a relay URL are dialled through the
+  node's own relay.
+- **One token, every door.** The workspace token gates a self-hosted relay
   (`AccessControl::on_connect`) and the `Hello` on every connection. Node
   keys are transport encryption and identity only; possessing the token is
   what admits a device. A desktop always accepts its own per-install
@@ -328,6 +336,21 @@ UDP still sync through the relay's HTTPS path, which is why production
 needs TLS. Ctrl-C shuts the replica down (final checkpoint) before the
 relay. Without TLS (`--dev`) there is no public-address discovery, so peers
 behind different NATs stay on the relay path; fine on one LAN.
+
+### The default relay and the web build
+
+`krabink.darksailor.dev` serves both the relay (`/relay`, `/ping`) and the
+web build (`cargo make web-build` → `target/web-dist`) behind one reverse
+proxy (`deploy/Caddyfile`), with krabink-server on plain HTTP
+(`access = "open"`, no replica). The browser build is the desktop app
+compiled to `wasm32-unknown-unknown` (Bevy on WebGL2, so Firefox on Linux
+works): its node is relay-only (browsers have no UDP), homes on the page's
+origin, keeps its key, device id, token, config and both stores in
+IndexedDB (`krabink-idb`: memory `Store`s preloaded at start, every write
+queued back in order), and holds a Web Lock so a second tab refuses to
+start. A "Copy web link" in the desktop's pairing section gives
+`https://krabink.darksailor.dev/#pair=<uri>`; the fragment never reaches
+the server and is stripped from history once adopted.
 
 ## 8. Failure modes and what happens
 

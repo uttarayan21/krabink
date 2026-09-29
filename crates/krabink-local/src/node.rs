@@ -1,7 +1,10 @@
 //! [`Node`]: the endpoint, the hub and the set of peers it keeps dialling.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(not(target_arch = "wasm32"))]
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,9 +14,10 @@ use iroh::endpoint::presets;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMode, RelayUrl, SecretKey, Watcher,
 };
-use krabink_core::{DeviceId, Store};
+use krabink_core::{DEFAULT_RELAY, DeviceId, Store};
+use n0_future::task::{self, JoinHandle};
+use n0_future::time;
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
 
 use crate::docs::{IdleDocs, ServerDocs};
 use crate::hub::{Hub, OutCmd, PeerSink};
@@ -28,12 +32,35 @@ pub const MAINTAIN_EVERY: Duration = Duration::from_secs(30);
 /// `Endpoint::close` waits for peers to acknowledge; never hang a suspend.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The home relay: handshake broker and fallback path.
+/// The home relay: handshake broker and fallback path (the only path for a
+/// browser node).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayTarget {
     pub url: RelayUrl,
-    /// Sent as the relay's auth token; the relay admits workspace tokens.
-    pub token: String,
+    /// Sent as the relay's auth token; a self-hosted relay admits workspace
+    /// tokens. `None` for the open default relay, which must never see one.
+    pub token: Option<String>,
+}
+
+impl RelayTarget {
+    /// The open relay every node homes on unless configured otherwise.
+    pub fn default_relay() -> Self {
+        Self {
+            url: DEFAULT_RELAY.parse().expect("DEFAULT_RELAY is a valid url"),
+            token: None,
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.url == Self::default_relay().url
+    }
+
+    /// The relay at `url` for a workspace with `token`: self-hosted relays
+    /// gate on the token, the default relay gets none.
+    pub fn for_workspace(url: RelayUrl, token: &str) -> Self {
+        let token = (url != Self::default_relay().url).then(|| token.to_owned());
+        Self { url, token }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +72,8 @@ pub enum Role {
     Replica,
 }
 
+/// A node whose key and store live in files.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     /// ed25519 secret key file (created on first run).
@@ -55,8 +84,25 @@ pub struct NodeConfig {
     pub device: DeviceId,
     /// Tokens accepted in `Hello` from peers.
     pub tokens: Vec<String>,
+    /// `None` disables relaying: direct paths (LAN) only.
     pub relay: Option<RelayTarget>,
     /// Pin the UDP port (replicas, so direct addresses survive restarts).
+    pub bind_port: Option<u16>,
+    pub role: Role,
+}
+
+/// Everything but the key and the store, for [`Node::start_with`].
+#[derive(Debug, Clone)]
+pub struct NodeOptions {
+    /// CRDT device id used in `Hello` and the device registry.
+    pub device: DeviceId,
+    /// Tokens accepted in `Hello` from peers.
+    pub tokens: Vec<String>,
+    /// `None` disables relaying: direct paths (LAN) only. Browsers have no
+    /// direct paths, so there it is an error.
+    pub relay: Option<RelayTarget>,
+    /// Pin the UDP port (replicas, so direct addresses survive restarts).
+    /// Ignored in the browser.
     pub bind_port: Option<u16>,
     pub role: Role,
 }
@@ -101,11 +147,18 @@ struct Inner {
 #[derive(Clone)]
 pub struct Node(Arc<Inner>);
 
+// Apps keep the node in a Bevy resource, on every target.
+const _: fn() = || {
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<Node>();
+};
+
 impl Node {
     /// Load the key, bind the endpoint, then open the store. Must run on
     /// the tokio runtime that will drive the node. Binding first means a
     /// taken port fails before anything else is held open, so the caller
     /// can retry with another port.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn start(cfg: NodeConfig) -> Result<Self> {
         let secret = crate::identity::load_or_create_secret_key(&cfg.key_path)?;
         let endpoint = bind_endpoint(&secret, cfg.relay.clone(), cfg.bind_port).await?;
@@ -117,8 +170,31 @@ impl Node {
                 return Err(err.into());
             }
         };
+        let opts = NodeOptions {
+            device: cfg.device,
+            tokens: cfg.tokens,
+            relay: cfg.relay,
+            bind_port: cfg.bind_port,
+            role: cfg.role,
+        };
+        Ok(Self::assemble(secret, store, opts, endpoint).await)
+    }
+
+    /// Start with a key and store the caller already holds (the browser
+    /// keeps both in IndexedDB).
+    pub async fn start_with(secret: SecretKey, store: Store, opts: NodeOptions) -> Result<Self> {
+        let endpoint = bind_endpoint(&secret, opts.relay.clone(), opts.bind_port).await?;
+        Ok(Self::assemble(secret, store, opts, endpoint).await)
+    }
+
+    async fn assemble(
+        secret: SecretKey,
+        store: Store,
+        cfg: NodeOptions,
+        endpoint: Endpoint,
+    ) -> Self {
         let hub = Hub::new(cfg.device, ServerDocs::new(store), cfg.tokens);
-        let maintenance = tokio::spawn(maintenance(hub.clone()));
+        let maintenance = task::spawn(maintenance(hub.clone()));
         let relay_health = watch::Sender::new(RelayHealth {
             configured: cfg.relay.is_some(),
             ..RelayHealth::default()
@@ -136,7 +212,7 @@ impl Node {
             maintenance,
         }));
         node.attach(endpoint).await;
-        Ok(node)
+        node
     }
 
     pub fn id(&self) -> EndpointId {
@@ -160,11 +236,17 @@ impl Node {
         }
     }
 
-    /// UDP port the endpoint is bound to, for mDNS; `None` while suspended.
+    /// UDP port the endpoint is bound to, for mDNS; `None` while suspended
+    /// and always in the browser (no sockets).
     pub async fn bound_port(&self) -> Option<u16> {
-        let net = self.0.net.lock().await;
-        net.as_ref()
-            .and_then(|n| n.endpoint.bound_sockets().first().map(|a| a.port()))
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let net = self.0.net.lock().await;
+            net.as_ref()
+                .and_then(|n| n.endpoint.bound_sockets().first().map(|a| a.port()))
+        }
+        #[cfg(target_arch = "wasm32")]
+        None
     }
 
     pub fn relay(&self) -> Option<RelayTarget> {
@@ -294,11 +376,8 @@ impl Node {
         // The close runs as its own task: cancelling it half-way leaves
         // the endpoint to abort ungracefully when dropped.
         let endpoint = net.endpoint;
-        let mut close = tokio::spawn(async move { endpoint.close().await });
-        if tokio::time::timeout(CLOSE_TIMEOUT, &mut close)
-            .await
-            .is_err()
-        {
+        let mut close = task::spawn(async move { endpoint.close().await });
+        if time::timeout(CLOSE_TIMEOUT, &mut close).await.is_err() {
             tracing::warn!("endpoint close timed out; finishing in the background");
             *self.0.closing.lock().expect("closing poisoned") = Some(close);
         }
@@ -342,8 +421,8 @@ impl Node {
             return;
         }
         tracing::info!(id = %endpoint.id(), "node endpoint bound");
-        let accept = tokio::spawn(accept_loop(endpoint.clone(), self.0.hub.clone()));
-        let relay_watch = tokio::spawn(watch_relay(endpoint.clone(), self.0.relay_health.clone()));
+        let accept = task::spawn(accept_loop(endpoint.clone(), self.0.hub.clone()));
+        let relay_watch = task::spawn(watch_relay(endpoint.clone(), self.0.relay_health.clone()));
         let mut fresh = Net {
             endpoint,
             accept,
@@ -379,7 +458,7 @@ impl Node {
         self.suspend().await;
         self.0.maintenance.abort();
         let hub = self.0.hub.clone();
-        tokio::task::spawn_blocking(move || {
+        run_blocking(move || {
             hub.docs
                 .lock()
                 .expect("doc registry poisoned")
@@ -407,9 +486,16 @@ impl Node {
                 let _ = dial.cmd.send(OutCmd::Close);
             }
         }
+        // Peers paired without a relay share ours: every node on the
+        // default relay is reachable through it.
+        let fallback = self.relay().map(|r| r.url);
         for target in targets {
             if target.id == self.id() || net.dials.contains_key(&target.id) {
                 continue;
+            }
+            let mut target = target.clone();
+            if target.relay.is_none() {
+                target.relay.clone_from(&fallback);
             }
             self.0.hub.add_token(target.token.clone());
             let (tx, rx) = mpsc::unbounded_channel();
@@ -423,7 +509,7 @@ impl Node {
                     device: None,
                 },
             );
-            let task = tokio::spawn(dial_loop(
+            let task = task::spawn(dial_loop(
                 net.endpoint.clone(),
                 self.0.hub.clone(),
                 peer_id,
@@ -435,43 +521,84 @@ impl Node {
     }
 }
 
+/// The endpoint's relay setup: a token only goes to a relay that asked for
+/// one (self-hosted), never to the open default relay.
+fn relay_mode(relay: Option<RelayTarget>) -> Result<RelayMode> {
+    match relay {
+        Some(RelayTarget { url, token }) => {
+            let config = RelayConfig::new(url, None);
+            let config = match token {
+                Some(token) => config.with_auth_token(token),
+                None => config,
+            };
+            Ok(RelayMode::Custom(config.into()))
+        }
+        None if cfg!(target_arch = "wasm32") => Err(Error::Bind(
+            "a browser node needs a relay: it has no direct paths".into(),
+        )),
+        None => Ok(RelayMode::Disabled),
+    }
+}
+
 /// Bind an endpoint for `secret` on `bind_port` (or an ephemeral one).
 async fn bind_endpoint(
     secret: &SecretKey,
     relay: Option<RelayTarget>,
     bind_port: Option<u16>,
 ) -> Result<Endpoint> {
-    let mut builder = Endpoint::builder(presets::Minimal)
+    let builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret.clone())
-        .alpns(vec![ALPN.to_vec()]);
-    builder = match relay {
-        Some(relay) => builder.relay_mode(RelayMode::Custom(
-            RelayConfig::new(relay.url, None)
-                .with_auth_token(relay.token)
-                .into(),
-        )),
-        None => builder.relay_mode(RelayMode::Disabled),
-    };
-    if let Some(port) = bind_port {
-        builder = builder
-            .bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
-            .map_err(|err| Error::Bind(err.to_string()))?;
-    }
+        .alpns(vec![ALPN.to_vec()])
+        .relay_mode(relay_mode(relay)?);
+    #[cfg(not(target_arch = "wasm32"))]
+    let builder = bind_port_on(builder, bind_port)?;
+    #[cfg(target_arch = "wasm32")]
+    let _ = bind_port;
     builder
         .bind()
         .await
         .map_err(|err| Error::Bind(err.to_string()))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn bind_port_on(
+    mut builder: iroh::endpoint::Builder,
+    bind_port: Option<u16>,
+) -> Result<iroh::endpoint::Builder> {
+    if let Some(port) = bind_port {
+        builder = builder
+            .bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+            .map_err(|err| Error::Bind(err.to_string()))?;
+    }
+    Ok(builder)
+}
+
+/// Run a store-bound job off the async threads where there are any; the
+/// browser has one thread, so it runs inline there.
+async fn run_blocking<R: Send + 'static>(
+    job: impl FnOnce() -> R + Send + 'static,
+) -> Result<R, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        tokio::task::spawn_blocking(job)
+            .await
+            .map_err(|err| err.to_string())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Ok(job())
+    }
+}
+
 /// Periodic checkpoint + idle unload; runs until aborted. The checkpoint
 /// hits redb, so it runs on the blocking pool.
 async fn maintenance(hub: Arc<Hub>) {
-    let mut tick = tokio::time::interval(MAINTAIN_EVERY);
+    let mut tick = time::interval(MAINTAIN_EVERY);
     tick.tick().await; // immediate first tick: nothing to do yet
     loop {
         tick.tick().await;
         let hub = hub.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = run_blocking(move || {
             hub.docs
                 .lock()
                 .expect("doc registry poisoned")
@@ -502,5 +629,31 @@ async fn watch_relay(endpoint: Endpoint, health: watch::Sender<RelayHealth>) {
             h.connected = connected;
             h.error = error;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_relay_never_gets_the_token() {
+        let default = RelayTarget::for_workspace(RelayTarget::default_relay().url, "secret");
+        assert_eq!(default, RelayTarget::default_relay());
+        assert!(default.is_default());
+
+        let own =
+            RelayTarget::for_workspace("https://relay.example.org".parse().unwrap(), "secret");
+        assert_eq!(own.token.as_deref(), Some("secret"));
+        assert!(!own.is_default());
+    }
+
+    #[test]
+    fn no_relay_is_lan_only() {
+        assert!(matches!(relay_mode(None), Ok(RelayMode::Disabled)));
+        assert!(matches!(
+            relay_mode(Some(RelayTarget::default_relay())),
+            Ok(RelayMode::Custom(_))
+        ));
     }
 }

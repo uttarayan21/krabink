@@ -1,3 +1,9 @@
 [alias]
 # Repository tasks: `cargo xtask --help` (xtask/).
 xtask = "run -q -p xtask --"
+
+# `cargo test --target wasm32-unknown-unknown -p krabink-idb` runs in a
+# headless browser (needs wasm-bindgen-cli matching Cargo.lock, from the
+# dev shell, and a webdriver).
+[target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"

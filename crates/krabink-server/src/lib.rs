@@ -11,4 +11,4 @@ pub mod errors;
 pub mod relay;
 pub mod replica;
 
-pub use config::{Config, RelayOpts, ReplicaConfig, TlsOpts};
+pub use config::{Access, Config, RelayOpts, ReplicaConfig, TlsOpts};

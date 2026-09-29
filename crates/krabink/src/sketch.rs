@@ -35,7 +35,6 @@ use bevy::color::{Hsla, Srgba};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureUsages;
-use bevy::render::storage::ShaderBuffer;
 use bevy_egui::{EguiTextureHandle, EguiUserTextures, egui};
 use krabink_core::{
     Anchor, BrushSpec, DEFAULT_TOLERANCE, DeviceId, DocKey, Element, ElementId, Ink, InkMesh,
@@ -570,7 +569,6 @@ fn sync_page_scene(
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<InkMaterial>>,
-    mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut egui_textures: ResMut<EguiUserTextures>,
     ink_assets: Res<InkAssets>,
     theme: Res<Theme>,
@@ -617,7 +615,7 @@ fn sync_page_scene(
             theme.palette(),
         );
         let palette = InkPalette::new(
-            &mut buffers,
+            &mut images,
             &mut materials,
             // Canvas units per pixel: grain renders at full strength at
             // 1x and stays crisp on HiDPI.
@@ -878,10 +876,10 @@ fn drop_wet_preview(
 fn flush_palettes(
     mut scenes: ResMut<PageScenes>,
     mut materials: ResMut<Assets<InkMaterial>>,
-    mut buffers: ResMut<Assets<ShaderBuffer>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     if let Some(scene) = scenes.scene.as_mut() {
-        scene.palette.flush(&mut buffers, &mut materials);
+        scene.palette.flush(&mut images, &mut materials);
     }
 }
 

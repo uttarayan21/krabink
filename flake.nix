@@ -53,15 +53,18 @@
           "aarch64-apple-darwin"
           "x86_64-apple-darwin"
         ];
+        # The browser build (crates/krabink via trunk, crates/krabink-idb
+        # tests); every host.
+        extraTargets = iosTargets ++ ["wasm32-unknown-unknown"];
         toolchain = pkgs.rust-bin.nightly.latest.default.override {
-          targets = iosTargets;
+          targets = extraTargets;
         };
         toolchainWithLLvmTools = pkgs.rust-bin.nightly.latest.default.override {
-          targets = iosTargets;
+          targets = extraTargets;
           extensions = ["rust-src" "llvm-tools"];
         };
         toolchainWithRustAnalyzer = pkgs.rust-bin.nightly.latest.default.override {
-          targets = iosTargets;
+          targets = extraTargets;
           extensions = ["rust-src" "rust-analyzer"];
         };
         craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
@@ -73,7 +76,7 @@
           # embeds with include_bytes!, the desktop WGSL shader, the stroke
           # corpora / golden meshes / proptest regressions the tests read
           # from disk, and the desktop entry the Linux package installs.
-          sourceFilters = path: type: (craneLib.filterCargoSources path type) || filterBySuffix path [".c" ".h" ".hpp" ".cpp" ".cc" ".png" ".wgsl" ".txt" ".desktop"];
+          sourceFilters = path: type: (craneLib.filterCargoSources path type) || filterBySuffix path [".c" ".h" ".hpp" ".cpp" ".cc" ".png" ".wgsl" ".txt" ".desktop" ".html"];
         in
           lib.cleanSourceWith {
             filter = sourceFilters;
@@ -206,6 +209,10 @@
                     cargo-outdated
                     lld
                     taplo
+                    # Web build: must match the wasm-bindgen in Cargo.lock.
+                    trunk
+                    wasm-bindgen-cli_0_2_126
+                    binaryen
                   ]
                   ++ (lib.optionals pkgs.stdenv.isDarwin [
                     apple-sdk_26
@@ -213,6 +220,10 @@
                   ++ (lib.optionals pkgs.stdenv.isLinux [
                     mold
                   ]);
+                # The nix cc-wrapper cannot target wasm; C deps (ring) use
+                # the bare clang for the browser build.
+                CC_wasm32_unknown_unknown = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
+                AR_wasm32_unknown_unknown = "${pkgs.llvmPackages.bintools-unwrapped}/bin/llvm-ar";
               });
         };
       }

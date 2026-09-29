@@ -2,7 +2,9 @@
 //! redb [`Store`], implementing the sans-io [`DocProvider`] contract.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use n0_future::time::Instant;
 
 use krabink_core::{CatchUp, DocKey, DocProvider, Flush, Result, Store, SyncDoc};
 

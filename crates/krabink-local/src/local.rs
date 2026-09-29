@@ -43,7 +43,7 @@ pub(crate) fn spawn_local(hub: Arc<Hub>) -> LocalLink {
             device: None,
         },
     );
-    tokio::spawn(serve_peer(
+    n0_future::task::spawn(serve_peer(
         hub,
         peer_id,
         PeerIo {

@@ -15,6 +15,7 @@
 pub mod docs;
 pub mod framing;
 mod hub;
+#[cfg(not(target_arch = "wasm32"))]
 mod identity;
 mod inbound;
 mod local;
@@ -29,10 +30,13 @@ pub mod testing;
 
 pub use docs::{IdleDocs, ServerDocs};
 pub use hub::Unpaired;
+#[cfg(not(target_arch = "wasm32"))]
 pub use identity::load_or_create_secret_key;
 pub use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
 pub use local::LocalLink;
-pub use node::{Node, NodeConfig, RelayHealth, RelayTarget, Role};
+#[cfg(not(target_arch = "wasm32"))]
+pub use node::NodeConfig;
+pub use node::{Node, NodeOptions, RelayHealth, RelayTarget, Role};
 pub use peers::{PeerKind, PeerState, PeerStatus, PeerTarget, Route, direct_addrs, rank_ip};
 
 /// Application-level protocol id every krabink node accepts.

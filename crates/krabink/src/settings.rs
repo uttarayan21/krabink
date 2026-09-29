@@ -39,7 +39,7 @@ impl Plugin for SettingsPlugin {
 /// resulting catch-up.
 fn apply_adopted(
     mut adopted: MessageReader<PairAdopted>,
-    runtime: Res<crate::Runtime>,
+    runtime: Res<crate::runtime::Runtime>,
     sync: Res<SyncNode>,
     mut settings: ResMut<Settings>,
 ) {
@@ -61,16 +61,22 @@ fn apply_adopted(
     }
     match crate::config::persist_pair(info) {
         // Connect live either way; persistence only affects the next launch.
-        Ok(path) => tracing::info!(node = %info.node, path = %path.display(), "pair adopted"),
+        Ok(path) => tracing::info!(node = %info.node, %path, "pair adopted"),
         Err(err) => tracing::error!(%err, "persisting pairing failed"),
     }
     let node = sync.node.clone();
-    let relay = peers[0].relay.clone().map(|url| RelayTarget {
-        url,
-        token: info.token.clone(),
-    });
+    // A pair on the default relay must not hand it the workspace token.
+    let relay = Some(
+        peers[0]
+            .relay
+            .clone()
+            .map_or_else(RelayTarget::default_relay, |url| {
+                RelayTarget::for_workspace(url, &info.token)
+            }),
+    );
     node.add_token(info.token.clone());
-    runtime.0.block_on(async {
+    let own_relay = relay.as_ref().map(|r| r.url.to_string());
+    runtime.spawn(async move {
         if let Err(err) = node.set_relay(relay).await {
             tracing::error!(%err, "switching relay failed");
         }
@@ -81,7 +87,7 @@ fn apply_adopted(
     let own = PairInfo {
         node: settings.info.node.clone(),
         token: info.token.clone(),
-        relay: info.relay.clone(),
+        relay: own_relay,
         addrs: settings.info.addrs.clone(),
         replica: info.replica.clone(),
     };
@@ -138,6 +144,9 @@ pub struct Settings {
     /// This install's own token: what the QR carries when no workspace is
     /// adopted, and how we tell "paired" from "on our own".
     own_token: String,
+    /// The relay we home on when on our own (the default one unless
+    /// configured or switched off).
+    own_relay: Option<String>,
     texture: Option<egui::TextureHandle>,
     join_uri: String,
     join_error: bool,
@@ -153,11 +162,12 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn new(info: PairInfo, own_token: String) -> Self {
+    pub fn new(info: PairInfo, own_token: String, own_relay: Option<String>) -> Self {
         Self {
             info,
             open: false,
             own_token,
+            own_relay,
             texture: None,
             join_uri: String::new(),
             join_error: false,
@@ -173,19 +183,20 @@ impl Settings {
         self.info.token != self.own_token
     }
 
-    /// Back to our own token, no relay, no replica: what the QR shows
+    /// Back to our own token and relay, no replica: what the QR shows
     /// after leaving a workspace.
     pub fn unpaired_info(&self) -> PairInfo {
         PairInfo {
             node: self.info.node.clone(),
             token: self.own_token.clone(),
-            relay: None,
+            relay: self.own_relay.clone(),
             addrs: self.info.addrs.clone(),
             replica: None,
         }
     }
 
     /// The endpoint's direct addresses changed: refresh the QR.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn set_addrs(&mut self, addrs: Vec<String>) {
         if self.info.addrs != addrs {
             self.info.addrs = addrs;
@@ -438,11 +449,14 @@ impl Settings {
                 });
             ui.add_space(4.0);
             ui.weak(match (&self.info.relay, &view.relay) {
-                (Some(url), health) if health.connected => format!("relay {url}: connected"),
-                (Some(url), health) => match &health.error {
-                    Some(err) => format!("relay {url}: {err}"),
-                    None => format!("relay {url}: connecting…"),
-                },
+                (Some(url), health) => {
+                    let name = relay_name(url);
+                    match (&health.error, health.connected) {
+                        (_, true) => format!("{name}: connected"),
+                        (Some(err), false) => format!("{name}: {err}"),
+                        (None, false) => format!("{name}: connecting…"),
+                    }
+                }
                 (None, _) => "no relay: LAN only".to_string(),
             });
             ui.weak(match &view.mdns_name {
@@ -460,8 +474,9 @@ impl Settings {
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(
-                        "No relay: devices must reach this desktop on the LAN. \
-                         Add one with --relay or by joining a workspace to sync across networks.",
+                        "No relay: devices must reach this desktop on the LAN, and browsers \
+                         cannot reach it at all. Remove relay = \"off\" from the config or \
+                         join a workspace to sync across networks.",
                     )
                     .color(palette.warn),
                 );
@@ -627,6 +642,11 @@ impl Settings {
                 if ui.button("Copy URI").clicked() {
                     ui.ctx().copy_text(uri.clone());
                 }
+                // Browsers only reach us through a relay.
+                if self.info.relay.is_some() && ui.button("Copy web link").clicked() {
+                    ui.ctx()
+                        .copy_text(self.info.web_link(krabink_core::DEFAULT_RELAY));
+                }
                 ui.add(
                     egui::Label::new(egui::RichText::new(&uri).monospace().color(palette.muted))
                         .truncate(),
@@ -695,4 +715,17 @@ fn qr_image(uri: &str) -> Option<egui::ColorImage> {
         pixels,
         ..Default::default()
     })
+}
+
+/// How the settings window names a relay: the default one by role, others
+/// by URL.
+fn relay_name(url: &str) -> String {
+    if url.trim_end_matches('/') == krabink_core::DEFAULT_RELAY {
+        format!(
+            "default relay ({})",
+            url.trim_start_matches("https://").trim_end_matches('/')
+        )
+    } else {
+        format!("relay {url}")
+    }
 }

@@ -23,7 +23,10 @@ pub async fn start(cfg: &ReplicaConfig, relay: RelayUrl, tokens: Vec<String>) ->
         store_path: cfg.db.clone(),
         device,
         tokens,
-        relay: Some(RelayTarget { url: relay, token }),
+        relay: Some(RelayTarget {
+            url: relay,
+            token: Some(token),
+        }),
         bind_port: cfg.udp_port,
         role: Role::Replica,
     })

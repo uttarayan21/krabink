@@ -26,6 +26,9 @@ struct Cli {
     /// Accepted workspace token (repeatable).
     #[clap(long = "token")]
     tokens: Vec<String>,
+    /// Admit every relay client, token or not (a shared public relay).
+    #[clap(long)]
+    open: bool,
     /// Replica store file.
     #[clap(long)]
     replica_db: Option<PathBuf>,
@@ -51,13 +54,14 @@ async fn main() -> Result<()> {
             quic_listen: cli.quic_listen,
             public_url: cli.public_url,
             tokens: cli.tokens,
+            open: cli.open,
             replica_db: cli.replica_db,
             no_replica: cli.no_replica,
         },
     )?;
 
-    let server = relay::spawn(config.relay.clone(), config.tokens.clone()).await?;
-    tracing::info!(url = %config.public_url, http = ?server.http_addr(), https = ?server.https_addr(), quic = ?server.quic_addr(), "relay up");
+    let server = relay::spawn(config.relay.clone(), config.access, config.tokens.clone()).await?;
+    tracing::info!(url = %config.public_url, access = ?config.access, http = ?server.http_addr(), https = ?server.https_addr(), quic = ?server.quic_addr(), "relay up");
 
     let replica = match &config.replica {
         Some(cfg) => {

@@ -97,10 +97,14 @@ async fn replay(args: ReplayArgs) -> Result<()> {
         store_path: dir.join("node.redb"),
         device,
         tokens: vec![info.token.clone()],
-        relay: target.relay.clone().map(|url| RelayTarget {
-            url,
-            token: info.token.clone(),
-        }),
+        relay: Some(
+            target
+                .relay
+                .clone()
+                .map_or_else(RelayTarget::default_relay, |url| {
+                    RelayTarget::for_workspace(url, &info.token)
+                }),
+        ),
         bind_port: None,
         role: Role::Device,
     })

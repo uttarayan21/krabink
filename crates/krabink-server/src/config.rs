@@ -30,9 +30,24 @@ pub struct RelayFile {
     /// The URL devices put in their QR / config. Derived from TLS
     /// hostname or the dev listener when absent.
     pub public_url: Option<String>,
-    /// Workspace tokens: gate the relay and the replica's `Hello`.
+    /// Workspace tokens: gate the relay (in `tokens` access) and the
+    /// replica's `Hello`.
     pub tokens: Vec<String>,
+    pub access: Access,
     pub tls: Option<TlsFile>,
+}
+
+/// Who the relay admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Access {
+    /// Only clients presenting one of the workspace tokens.
+    #[default]
+    Tokens,
+    /// Everyone: a shared public relay (the default one devices and the
+    /// web build home on). It only forwards end-to-end encrypted traffic;
+    /// the peers check workspace tokens in `Hello`.
+    Open,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +140,7 @@ pub struct ReplicaConfig {
 pub struct Config {
     pub relay: RelayOpts,
     pub public_url: RelayUrl,
+    pub access: Access,
     pub tokens: Vec<String>,
     pub replica: Option<ReplicaConfig>,
 }
@@ -137,6 +153,7 @@ pub struct Overrides {
     pub quic_listen: Option<SocketAddr>,
     pub public_url: Option<String>,
     pub tokens: Vec<String>,
+    pub open: bool,
     pub replica_db: Option<PathBuf>,
     pub no_replica: bool,
 }
@@ -163,9 +180,15 @@ impl Config {
         } else {
             cli.tokens
         };
-        if tokens.is_empty() {
-            return Err(Report::new(Error)
-                .attach("no tokens configured; pass --token or set relay.tokens in the config"));
+        let access = if cli.open {
+            Access::Open
+        } else {
+            file.relay.access
+        };
+        if tokens.is_empty() && access == Access::Tokens {
+            return Err(Report::new(Error).attach(
+                "no tokens configured; pass --token, set relay.tokens, or run an open relay",
+            ));
         }
 
         let http_listen = cli
@@ -209,7 +232,8 @@ impl Config {
             .change_context(Error)
             .attach_with(|| format!("relay.public_url {public_url:?}"))?;
 
-        let replica = if cli.no_replica || file.replica.enable == Some(false) {
+        // The replica only serves workspaces whose token it knows.
+        let replica = if cli.no_replica || file.replica.enable == Some(false) || tokens.is_empty() {
             None
         } else {
             let db = cli
@@ -235,6 +259,7 @@ impl Config {
                 tls,
             },
             public_url,
+            access,
             tokens,
             replica,
         })

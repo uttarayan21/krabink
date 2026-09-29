@@ -306,7 +306,8 @@ impl Core {
                 store_path: dir.join("node.redb"),
                 device,
                 tokens: vec![token.clone()],
-                relay: None,
+                // Browsers reach this device only through a relay.
+                relay: Some(RelayTarget::default_relay()),
                 bind_port: None,
                 role: Role::Device,
             }))
@@ -441,13 +442,11 @@ impl Core {
             .as_deref()
             .map(|url| {
                 url.parse()
-                    .map(|url| RelayTarget {
-                        url,
-                        token: info.token.clone(),
-                    })
+                    .map(|url| RelayTarget::for_workspace(url, &info.token))
                     .map_err(|err| bad(format!("relay {url:?}: {err}")))
             })
-            .transpose()?;
+            .transpose()?
+            .or_else(|| Some(RelayTarget::default_relay()));
         self.node.add_token(info.token.clone());
         let previous = self.shared.lock_state().pairing.replace(info);
         self.shared.pairing_gen.fetch_add(1, Ordering::AcqRel);
@@ -503,8 +502,8 @@ impl Core {
                 return;
             }
             node.set_peers(Vec::new()).await;
-            if let Err(err) = node.set_relay(None).await {
-                tracing::warn!(%err, "dropping relay after unpair failed");
+            if let Err(err) = node.set_relay(Some(RelayTarget::default_relay())).await {
+                tracing::warn!(%err, "resetting relay after unpair failed");
             }
             shared.poke.notify_one();
         });

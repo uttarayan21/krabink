@@ -15,6 +15,7 @@ test-utils = ["dep:tempfile"]
 krabink-core.workspace = true
 iroh.workspace = true
 tokio.workspace = true
+n0-future.workspace = true
 postcard.workspace = true
 error-stack.workspace = true
 thiserror.workspace = true
@@ -25,7 +26,12 @@ mdns-sd = { workspace = true, optional = true }
 if-addrs = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# spawn_blocking for checkpoints; timers for the test harness.
+tokio = { workspace = true, features = ["rt", "time"] }
+
 [dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 tempfile.workspace = true
 krabink-local = { path = ".", features = ["test-utils"] }
 iroh = { workspace = true, features = ["test-utils"] }

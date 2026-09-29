@@ -1,12 +1,17 @@
 //! The ink material: one [`Material2d`] for every brush, the desktop twin
 //! of the Metal pipeline in `ios/Krabink/Sources/InkRenderer.swift`.
 //!
-//! Every stroke entity carries a [`MeshTag`] indexing a per-sketch
-//! [`StrokeStyle`] array on the GPU ([`InkPalette`]); `ink.wgsl` reads the
-//! stroke's colour, edge mask and grain from it. The only pipeline splits
-//! are the blend function (Normal/Multiply) and the depth compare that
-//! implements write-once ink (Overlap::Discard), keyed by [`InkCombo`], so
-//! a sketch needs four materials sharing one style buffer.
+//! Every stroke entity carries a [`MeshTag`] indexing a per-sketch table
+//! of [`StrokeStyle`]s on the GPU ([`InkPalette`]); `ink.wgsl` reads the
+//! stroke's colour, edge mask and grain from it. The table is a data
+//! texture rather than a storage buffer so the same pipeline runs on
+//! WebGL2: `Rgba32Uint`, [`STYLES_PER_ROW`] styles per row, four texels
+//! per style (colour, mask, grain, then depth/flags/mask_layer/
+//! grain_layer), floats stored as their bit patterns (see
+//! [`pack_styles`]). The only pipeline splits are the blend function
+//! (Normal/Multiply) and the depth compare that implements write-once ink
+//! (Overlap::Discard), keyed by [`InkCombo`], so a sketch needs four
+//! materials sharing one style texture.
 //!
 //! Depth: bevy's 2D pass uses reversed-Z cleared to 0, so a later stroke
 //! (higher z) passes `GreaterEqual` over an earlier one. A Discard stroke
@@ -17,14 +22,14 @@
 //! of [`crate::ink_assets::InkAssets`]; a style names its layer through
 //! `mask_layer` / `grain_layer`.
 
-use bevy::asset::{AssetPath, embedded_asset, embedded_path};
+use bevy::asset::{AssetPath, RenderAssetUsages, embedded_asset, embedded_path};
 use bevy::mesh::{MeshTag, MeshVertexAttribute, MeshVertexBufferLayoutRef, VertexFormat};
 use bevy::prelude::*;
 use bevy::render::render_resource::{
     AsBindGroup, BlendComponent, BlendFactor, BlendOperation, BlendState, CompareFunction,
-    RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
+    Extent3d, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError, TextureDimension,
+    TextureFormat,
 };
-use bevy::render::storage::ShaderBuffer;
 use bevy::shader::ShaderRef;
 use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dKey, Material2dPlugin};
 use krabink_core::{Blend, GrainMapping, InkStyle, MaskStyle, Overlap, Rgba};
@@ -50,7 +55,8 @@ impl Plugin for InkMaterialPlugin {
 }
 
 /// Mirrors `StrokeStyle` in ink.wgsl and Shaders.metal: 64 bytes, the
-/// same on both platforms.
+/// same on both platforms. On the desktop it reaches the GPU as the four
+/// texels of [`StrokeStyle::texels`].
 #[derive(ShaderType, Debug, Clone, Copy, PartialEq, Default)]
 pub struct StrokeStyle {
     /// Linear RGBA, straight alpha; the brush opacity is folded in.
@@ -92,6 +98,77 @@ impl StrokeStyle {
             discard: self.flags & Self::DISCARD != 0,
         }
     }
+
+    /// The style's four `Rgba32Uint` texels, in the order `style()` in
+    /// ink.wgsl loads them: colour, mask, grain, then depth, flags,
+    /// mask_layer, grain_layer. Floats travel as their bit patterns.
+    fn texels(&self) -> [[u32; 4]; TEXELS_PER_STYLE] {
+        [
+            self.color.to_array().map(f32::to_bits),
+            self.mask.to_array().map(f32::to_bits),
+            self.grain.to_array().map(f32::to_bits),
+            [
+                self.depth.to_bits(),
+                self.flags,
+                self.mask_layer,
+                self.grain_layer,
+            ],
+        ]
+    }
+}
+
+/// Styles per row of the style texture; `STYLES_PER_ROW` in ink.wgsl.
+pub const STYLES_PER_ROW: u32 = 256;
+/// Texels one style takes: colour, mask, grain, then the scalars.
+const TEXELS_PER_STYLE: usize = 4;
+/// Width of the style texture in texels.
+const STYLE_TEXTURE_WIDTH: u32 = STYLES_PER_ROW * 4;
+
+/// Rows of the style texture that hold `capacity` styles (at least one).
+fn style_rows(capacity: usize) -> u32 {
+    let per_row = usize::try_from(STYLES_PER_ROW).unwrap_or(usize::MAX);
+    u32::try_from(capacity.div_ceil(per_row))
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
+/// Lay `styles` out as `Rgba32Uint` texel data for a
+/// `STYLE_TEXTURE_WIDTH` x height texture that holds at least `capacity`
+/// styles; returns the height and the bytes. Style `i` starts at texel
+/// `((i % STYLES_PER_ROW) * 4, i / STYLES_PER_ROW)`, which row-major is
+/// simply texel `4 i`. Unused slots are zero ([`StrokeStyle::default`]).
+fn pack_styles(styles: &[StrokeStyle], capacity: usize) -> (u32, Vec<u8>) {
+    let height = style_rows(capacity.max(styles.len()));
+    let slots = usize::try_from(height)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(usize::try_from(STYLES_PER_ROW).unwrap_or(usize::MAX));
+    let data = styles
+        .iter()
+        .copied()
+        .chain(std::iter::repeat(StrokeStyle::default()))
+        .take(slots)
+        .flat_map(|style| style.texels())
+        .flatten()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    (height, data)
+}
+
+/// The style texture for `styles`, sized for `capacity` slots.
+fn style_image(styles: &[StrokeStyle], capacity: usize) -> Image {
+    let (height, data) = pack_styles(styles, capacity);
+    Image::new(
+        Extent3d {
+            width: STYLE_TEXTURE_WIDTH,
+            height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba32Uint,
+        // The main world keeps the data so a flush can rewrite it in place.
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    )
 }
 
 impl StrokeStyle {
@@ -294,9 +371,10 @@ impl InkParams {
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
 #[bind_group_data(InkKey)]
 pub struct InkMaterial {
-    /// `array<StrokeStyle>`, indexed by each entity's [`MeshTag`].
-    #[storage(0, read_only)]
-    pub styles: Handle<ShaderBuffer>,
+    /// The style texture (see [`pack_styles`]), indexed by each entity's
+    /// [`MeshTag`]. Read with `textureLoad`, so no sampler.
+    #[texture(0, sample_type = "u_int")]
+    pub styles: Handle<Image>,
     #[uniform(1)]
     pub params: InkParams,
     /// Tip masks (mask kind 2), clamped.
@@ -381,17 +459,17 @@ pub struct InkSlot {
     combo: InkCombo,
 }
 
-/// A sketch's stroke styles: the GPU array every ink entity indexes with
-/// its [`MeshTag`], and the four materials (one per [`InkCombo`]) sharing
-/// it. Slots are reused through a free list so an entity's tag stays put
-/// for its lifetime.
+/// A sketch's stroke styles: the GPU style texture every ink entity
+/// indexes with its [`MeshTag`], and the four materials (one per
+/// [`InkCombo`]) sharing it. Slots are reused through a free list so an
+/// entity's tag stays put for its lifetime.
 pub struct InkPalette {
-    buffer: Handle<ShaderBuffer>,
+    texture: Handle<Image>,
     materials: [Handle<InkMaterial>; 4],
     styles: Vec<StrokeStyle>,
     free: Vec<u32>,
-    /// Styles uploaded per flush; grows geometrically so the GPU buffer is
-    /// rewritten in place rather than reallocated on most edits.
+    /// Styles uploaded per flush; grows geometrically so the GPU texture
+    /// is rewritten in place rather than reallocated on most edits.
     capacity: usize,
     dirty: bool,
 }
@@ -401,19 +479,17 @@ impl InkPalette {
     const INITIAL_CAPACITY: usize = 64;
 
     pub fn new(
-        buffers: &mut Assets<ShaderBuffer>,
+        images: &mut Assets<Image>,
         materials: &mut Assets<InkMaterial>,
         params: InkParams,
         assets: &InkAssets,
         paper: PaperTone,
     ) -> Self {
         let capacity = Self::INITIAL_CAPACITY;
-        let mut buffer = ShaderBuffer::default();
-        buffer.set_data(vec![StrokeStyle::default(); capacity]);
-        let buffer = buffers.add(buffer);
+        let texture = images.add(style_image(&[], capacity));
         let materials = InkCombo::ALL.map(|combo| {
             materials.add(InkMaterial {
-                styles: buffer.clone(),
+                styles: texture.clone(),
                 params,
                 masks: assets.masks.clone(),
                 grains: assets.grains.clone(),
@@ -422,7 +498,7 @@ impl InkPalette {
             })
         });
         Self {
-            buffer,
+            texture,
             materials,
             styles: Vec::new(),
             free: Vec::new(),
@@ -487,35 +563,114 @@ impl InkPalette {
     }
 
     /// Upload pending style edits; call once per frame after the diff.
-    pub fn flush(
-        &mut self,
-        buffers: &mut Assets<ShaderBuffer>,
-        materials: &mut Assets<InkMaterial>,
-    ) {
+    pub fn flush(&mut self, images: &mut Assets<Image>, materials: &mut Assets<InkMaterial>) {
         if !self.dirty {
             return;
         }
         self.dirty = false;
         let needed = self.styles.len().max(1);
-        let mut padded = self.styles.clone();
         if needed > self.capacity {
-            // A resized buffer is a new GPU resource, and the materials'
+            self.capacity = needed.next_power_of_two();
+        }
+        let (height, data) = pack_styles(&self.styles, self.capacity);
+        let same_size = images
+            .get(&self.texture)
+            .is_some_and(|image| image.height() == height);
+        if same_size {
+            // Same size: bevy writes the existing GPU texture in place.
+            if let Some(mut image) = images.get_mut(&self.texture) {
+                image.data = Some(data);
+            }
+        } else {
+            // A taller texture is a new GPU resource, and the materials'
             // bind groups keep the old one: swap in a fresh asset so they
             // are rebuilt against it.
-            self.capacity = needed.next_power_of_two();
-            padded.resize(self.capacity, StrokeStyle::default());
-            let mut buffer = ShaderBuffer::default();
-            buffer.set_data(padded);
-            self.buffer = buffers.add(buffer);
+            self.texture = images.add(style_image(&self.styles, self.capacity));
             for handle in &self.materials {
                 if let Some(mut material) = materials.get_mut(handle) {
-                    material.styles = self.buffer.clone();
+                    material.styles = self.texture.clone();
                 }
             }
-        } else if let Some(mut buffer) = buffers.get_mut(&self.buffer) {
-            // Same size: bevy writes the existing GPU buffer in place.
-            padded.resize(self.capacity, StrokeStyle::default());
-            buffer.set_data(padded);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bytes per `Rgba32Uint` texel.
+    const TEXEL_BYTES: usize = 16;
+
+    /// The four `u32` channels of texel `(x, y)` in packed style data.
+    fn texel(data: &[u8], x: u32, y: u32) -> [u32; 4] {
+        let index = usize::try_from(y * STYLE_TEXTURE_WIDTH + x).unwrap_or(usize::MAX);
+        let start = index * TEXEL_BYTES;
+        let bytes = &data[start..start + TEXEL_BYTES];
+        std::array::from_fn(|c| {
+            u32::from_le_bytes([
+                bytes[c * 4],
+                bytes[c * 4 + 1],
+                bytes[c * 4 + 2],
+                bytes[c * 4 + 3],
+            ])
+        })
+    }
+
+    fn sample(i: u32) -> StrokeStyle {
+        let f = f32::from(u16::try_from(i).unwrap_or(u16::MAX));
+        StrokeStyle {
+            color: Vec4::new(f, 0.25, 0.5, 1.0),
+            mask: Vec4::new(1.0, 0.125, 0.75, 0.0),
+            grain: Vec4::new(3.5, 0.4, 0.0, 0.0),
+            depth: -0.5,
+            // Small integers are denormal as f32 bit patterns and all-ones
+            // is a NaN: both must survive untouched.
+            flags: StrokeStyle::MASK_EDGE | StrokeStyle::DISCARD | (i << 7),
+            mask_layer: i,
+            grain_layer: u32::MAX - i,
+        }
+    }
+
+    #[test]
+    fn style_texel_layout() {
+        let styles: Vec<StrokeStyle> = (0..300).map(sample).collect();
+        let (height, data) = pack_styles(&styles, 512);
+        assert_eq!(height, 2);
+        let width = usize::try_from(STYLE_TEXTURE_WIDTH).unwrap_or(usize::MAX);
+        assert_eq!(data.len(), width * 2 * TEXEL_BYTES);
+
+        for i in [0, 1, 255, 256, 257, 299] {
+            let s = sample(i);
+            let (x, y) = ((i % STYLES_PER_ROW) * 4, i / STYLES_PER_ROW);
+            assert_eq!(texel(&data, x, y), s.color.to_array().map(f32::to_bits));
+            assert_eq!(texel(&data, x + 1, y), s.mask.to_array().map(f32::to_bits));
+            assert_eq!(texel(&data, x + 2, y), s.grain.to_array().map(f32::to_bits));
+            let [depth, flags, mask_layer, grain_layer] = texel(&data, x + 3, y);
+            assert_eq!(f32::from_bits(depth), s.depth);
+            assert_eq!(flags, s.flags);
+            assert_eq!(mask_layer, s.mask_layer);
+            assert_eq!(grain_layer, s.grain_layer);
+        }
+        // Style 256 wraps to the start of row 1.
+        assert_eq!(texel(&data, 0, 1)[0], 256.0f32.to_bits());
+        // Past the last style everything is zero.
+        assert_eq!(texel(&data, 300 % 256 * 4, 1), [0; 4]);
+        assert_eq!(texel(&data, STYLE_TEXTURE_WIDTH - 1, 1), [0; 4]);
+    }
+
+    #[test]
+    fn style_texture_height() {
+        assert_eq!(pack_styles(&[], 0).0, 1);
+        assert_eq!(pack_styles(&[], 64).0, 1);
+        assert_eq!(pack_styles(&[], 256).0, 1);
+        assert_eq!(pack_styles(&[], 257).0, 2);
+        assert_eq!(pack_styles(&[], 1024).0, 4);
+        // More styles than capacity still fit.
+        let styles = vec![StrokeStyle::default(); 300];
+        assert_eq!(pack_styles(&styles, 64).0, 2);
+        let (height, data) = pack_styles(&[], 64);
+        assert_eq!(height, 1);
+        assert!(data.iter().all(|&b| b == 0));
     }
 }

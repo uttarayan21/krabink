@@ -8,8 +8,9 @@ pub struct Cli {
     #[clap(long)]
     pub data_dir: Option<std::path::PathBuf>,
     /// Home relay URL, e.g. `https://relay.example.org`: brokers the
-    /// handshake with peers and carries traffic when hole punching fails.
-    /// Overrides config.toml.
+    /// handshake with peers and carries traffic when hole punching fails
+    /// (and all of it for browsers). `off` for LAN only; the default relay
+    /// when unset. Overrides config.toml.
     #[clap(long)]
     pub relay: Option<String>,
     /// Workspace token (relay access + peer handshake). Overrides

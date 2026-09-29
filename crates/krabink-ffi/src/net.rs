@@ -245,8 +245,11 @@ pub(crate) async fn watch_unpaired(shared: Weak<Shared>, node: Node) {
             node.remove_token(&previous.token);
         }
         node.set_peers(Vec::new()).await;
-        if let Err(err) = node.set_relay(None).await {
-            tracing::warn!(%err, "dropping relay after eviction failed");
+        if let Err(err) = node
+            .set_relay(Some(krabink_local::RelayTarget::default_relay()))
+            .await
+        {
+            tracing::warn!(%err, "resetting relay after eviction failed");
         }
         // Push the trimmed device list and refreshed sync state.
         let (listener, devices) = {

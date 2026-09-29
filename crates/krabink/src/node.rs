@@ -1,24 +1,28 @@
-//! The desktop's sync node as a Bevy resource, plus LAN discovery: mDNS
-//! advertises the node and feeds found peers to it as dial hints, and the
-//! QR's direct addresses follow the endpoint's.
+//! The app's sync node as a Bevy resource, plus LAN discovery on native
+//! targets: mDNS advertises the node and feeds found peers to it as dial
+//! hints, and the QR's direct addresses follow the endpoint's. A browser
+//! has neither, so there the node only reaches peers through its relay.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 use bevy::prelude::*;
 use krabink_core::{DeviceId, DocKey};
+#[cfg(not(target_arch = "wasm32"))]
 use krabink_local::mdns::Mdns;
-use krabink_local::{Node, Unpaired, direct_addrs};
+use krabink_local::{Node, Unpaired};
 use tokio::sync::broadcast;
 
-use crate::sync::LocalCommit;
-
 use crate::docs::Docs;
-use crate::settings::Settings;
+use crate::runtime::Runtime;
+use crate::sync::LocalCommit;
 
 #[derive(Resource)]
 pub struct SyncNode {
     pub node: Node,
+    #[cfg(not(target_arch = "wasm32"))]
     mdns: Option<Mdns>,
+    #[cfg(not(target_arch = "wasm32"))]
     refresh: Timer,
     /// Peers that unpaired from us over the wire; drained into row removals.
     unpaired: broadcast::Receiver<Unpaired>,
@@ -26,7 +30,8 @@ pub struct SyncNode {
 
 impl SyncNode {
     /// Wrap a started node and begin advertising it on the LAN.
-    pub fn new(node: Node, runtime: &tokio::runtime::Runtime) -> Self {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new(node: Node, runtime: &Runtime) -> Self {
         let port = runtime.block_on(node.bound_port());
         let mdns = port.and_then(|port| {
             Mdns::start(node.id(), port, &crate::sync::local_device_name())
@@ -42,19 +47,30 @@ impl SyncNode {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub fn new(node: Node) -> Self {
+        let unpaired = node.watch_unpaired();
+        Self { node, unpaired }
+    }
+
     pub fn mdns_name(&self) -> Option<&str> {
-        self.mdns.as_ref().map(Mdns::name)
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.mdns.as_ref().map(Mdns::name);
+        #[cfg(target_arch = "wasm32")]
+        None
     }
 
     /// Unpair from `device`: tell it over the wire and stop dialling it.
-    /// The peer forgets this desktop in turn.
-    pub fn unpair(&self, runtime: &tokio::runtime::Runtime, device: DeviceId) {
-        runtime.block_on(self.node.unpair(device));
+    /// The peer forgets this device in turn.
+    pub fn unpair(&self, runtime: &Runtime, device: DeviceId) {
+        let node = self.node.clone();
+        runtime.spawn(async move { node.unpair(device).await });
     }
 
     /// Re-advertise under a new device name (drops the old registration
     /// first; the node itself is untouched).
-    pub fn readvertise(&mut self, runtime: &tokio::runtime::Runtime, name: &str) {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn readvertise(&mut self, runtime: &Runtime, name: &str) {
         self.mdns = None;
         let Some(port) = runtime.block_on(self.node.bound_port()) else {
             return;
@@ -63,18 +79,24 @@ impl SyncNode {
             .map_err(|err| tracing::warn!(%err, "mDNS re-advertise failed"))
             .ok();
     }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn readvertise(&mut self, _runtime: &Runtime, _name: &str) {}
 }
 
 pub struct NodePlugin;
 
 impl Plugin for NodePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (poll_discovery, poll_unpaired, refresh_addrs));
+        app.add_systems(Update, poll_unpaired);
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(Update, (poll_discovery, refresh_addrs));
     }
 }
 
 /// Every node mDNS resolved becomes a dial hint; the node only uses hints
 /// for peers it is dialling.
+#[cfg(not(target_arch = "wasm32"))]
 fn poll_discovery(sync: Res<SyncNode>) {
     let Some(mdns) = &sync.mdns else {
         return;
@@ -112,16 +134,17 @@ fn poll_unpaired(
 
 /// Keep the QR's direct addresses in step with the endpoint's (interfaces
 /// come and go; the port never changes while running).
+#[cfg(not(target_arch = "wasm32"))]
 fn refresh_addrs(
     time: Res<Time>,
-    runtime: Res<crate::Runtime>,
+    runtime: Res<Runtime>,
     mut sync: ResMut<SyncNode>,
-    mut settings: ResMut<Settings>,
+    mut settings: ResMut<crate::settings::Settings>,
 ) {
     if !sync.refresh.tick(time.delta()).just_finished() {
         return;
     }
-    let addrs: Vec<String> = direct_addrs(&runtime.0.block_on(sync.node.addr()))
+    let addrs: Vec<String> = krabink_local::direct_addrs(&runtime.block_on(sync.node.addr()))
         .into_iter()
         .map(|a| a.to_string())
         .collect();

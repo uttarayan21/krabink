@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- The node key and workspace token live in IndexedDB: only scripts
+         from this origin may run. Inline scripts are allowed for trunk's
+         loader (its content changes every build); nothing user-provided
+         reaches the DOM, egui draws everything on the canvas. Peers are
+         reached through relays over wss, ours (same origin) or a
+         workspace's own. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' https: wss: http://127.0.0.1:* ws://127.0.0.1:*; img-src 'self' data: blob:"
+    />
+    <title>krabink</title>
+    <link data-trunk rel="rust" data-bin="krabink" data-wasm-opt="z" />
+    <link data-trunk rel="icon" href="../../ios/Krabink/Assets.xcassets/AppIcon.appiconset/AppIcon.png" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #1e1e2e;
+        color: #cdd6f4;
+        font-family: system-ui, sans-serif;
+      }
+      #krabink {
+        display: block;
+        width: 100%;
+        height: 100%;
+        outline: none;
+      }
+      #status {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        padding: 2rem;
+        text-align: center;
+        white-space: pre-wrap;
+      }
+      #status[hidden] {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="krabink"></canvas>
+    <div id="status" hidden></div>
+    <script>
+      // Every browser with WebGL2 can run krabink; say so instead of a
+      // blank page when there is none.
+      if (!document.createElement("canvas").getContext("webgl2")) {
+        const status = document.getElementById("status");
+        status.textContent = "krabink needs WebGL2, which this browser does not offer.";
+        status.hidden = false;
+      }
+    </script>
+  </body>
+</html>

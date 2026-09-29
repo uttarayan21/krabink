@@ -52,6 +52,53 @@ description = "Audit dependency licenses and advisories"
 command = "cargo"
 args = ["deny", "check"]
 
+# --- Web ------------------------------------------------------------------
+
+[tasks.web-check]
+description = "Check the crates the browser build compiles, for wasm32"
+command = "cargo"
+args = [
+  "check",
+  "--target",
+  "wasm32-unknown-unknown",
+  "-p",
+  "krabink-core",
+  "-p",
+  "krabink-local",
+  "-p",
+  "krabink-idb",
+  "-p",
+  "krabink",
+  "${@}",
+]
+
+[tasks.web-build]
+description = "Build the web app into target/web-dist (serve it next to the relay)"
+cwd = "crates/krabink"
+command = "trunk"
+args = ["build", "--release", "--cargo-profile", "web", "${@}"]
+
+[tasks.web-serve]
+description = "Serve the web app with an open dev relay: open http://127.0.0.1:8080/?relay=http://127.0.0.1:3340"
+script = [
+  "cargo run -p krabink-server -- --dev --open --no-replica &",
+  "relay=$!",
+  "trap 'kill $relay' EXIT",
+  "cd crates/krabink && trunk serve",
+]
+
+[tasks.web-test]
+description = "IndexedDB store tests in a headless browser (needs a webdriver)"
+command = "cargo"
+args = [
+  "test",
+  "--target",
+  "wasm32-unknown-unknown",
+  "-p",
+  "krabink-idb",
+  "${@}",
+]
+
 [tasks.check]
 description = "fmt-check, clippy and test"
 dependencies = ["fmt-check", "clippy", "test"]

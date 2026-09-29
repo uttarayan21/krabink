@@ -49,6 +49,7 @@ impl Cloud {
                 .block_on(async move {
                     let server = krabink_server::relay::spawn(
                         krabink_server::RelayOpts::dev(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+                        krabink_server::Access::Tokens,
                         vec![TOKEN.into()],
                     )
                     .await

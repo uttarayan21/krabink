@@ -24,8 +24,9 @@ pub struct MetaRefresh {
 pub type Payloads = Vec<(DocKey, Vec<u8>)>;
 
 pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    // web-time: std's clock panics in the browser.
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }

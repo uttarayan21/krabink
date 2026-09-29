@@ -21,23 +21,51 @@ ism = ["krabink-core/ism"]
 
 [dependencies]
 krabink-core.workspace = true
-krabink-local = { workspace = true, features = ["mdns"] }
+krabink-local.workspace = true
 iroh.workspace = true
-clap.workspace = true
-clap_complete.workspace = true
 error-stack.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-bevy = { version = "0.19", features = ["wayland"] }
+# Default features cover every target: wayland/x11 natively, WebGL2 in the
+# browser (the ink shader avoids storage buffers so Firefox/Linux work).
+bevy = "0.19"
 bevy_egui.workspace = true
-directories.workspace = true
-gethostname = "0.5"
 qrcode = { version = "0.14", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde.workspace = true
 tokio.workspace = true
+n0-future.workspace = true
 toml.workspace = true
 ulid.workspace = true
+web-time = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+krabink-local = { workspace = true, features = ["mdns"] }
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+  "net",
+  "time",
+  "signal",
+] }
+clap.workspace = true
+clap_complete.workspace = true
+directories.workspace = true
+gethostname = "0.5"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+krabink-idb = { path = "../krabink-idb" }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+  "Document",
+  "History",
+  "Location",
+  "Navigator",
+  "StorageManager",
+  "Window",
+] }
+console_error_panic_hook = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true

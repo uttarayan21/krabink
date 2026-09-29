@@ -1,12 +1,20 @@
 // Ink pipeline: the desktop twin of ios/Krabink/Sources/Shaders.metal.
 // Vertices are the core's `InkMesh.vertices` (canvas position with y
 // flipped into bevy's y-up space, stroke-space uv, per-vertex opacity);
-// each mesh entity carries a `MeshTag` indexing the `StrokeStyle` array
-// that holds everything per stroke: linear colour, edge mask, grain and
+// each mesh entity carries a `MeshTag` indexing the style texture that
+// holds everything per stroke: linear colour, edge mask, grain and
 // blend/overlap flags. One shader serves every brush; the only pipeline
 // splits (blend, depth compare) live in `InkMaterial::specialize`.
-// Layouts must match ink_material.rs (`StrokeStyle`, `InkParams`, vertex
-// attributes) and Shaders.metal.
+// Layouts must match ink_material.rs (`StrokeStyle`, `pack_styles`,
+// `InkParams`, vertex attributes) and Shaders.metal.
+//
+// Style texture: a data texture rather than a storage buffer, so WebGL2
+// runs the same pipeline. Rgba32Uint, STYLES_PER_ROW styles per row and
+// four texels per style: style i starts at texel
+// ((i % STYLES_PER_ROW) * 4, i / STYLES_PER_ROW) and holds color, mask,
+// grain, then (depth, flags, mask_layer, grain_layer). Floats are stored
+// as their bit patterns; an integer texture keeps small flags and layer
+// indices exact where a float one could flush them as denormals.
 //
 // Colour: the render target is sRGB-encoded and blending happens in
 // linear light; output is premultiplied `(rgb·a, a)`.
@@ -17,7 +25,8 @@
 
 #import bevy_sprite::mesh2d_functions as mesh_functions
 
-// 64 bytes; identical layout in ink_material.rs and Shaders.metal.
+// 64 bytes; identical layout in ink_material.rs and Shaders.metal. Here
+// it is unpacked from four style texels by `style`.
 struct StrokeStyle {
     color: vec4<f32>,       // linear RGBA, straight alpha (opacity folded in)
     mask: vec4<f32>,        // aspect, corner, hardness, 0
@@ -45,12 +54,33 @@ const FLAG_DISCARD: u32 = 64u;
 const EDGE_CELL: f32 = 0.75;
 const EDGE_SEED: u32 = 0x9e37u;
 
-@group(#{MATERIAL_BIND_GROUP}) @binding(0) var<storage, read> styles: array<StrokeStyle>;
+const STYLES_PER_ROW: u32 = 256u;
+
+@group(#{MATERIAL_BIND_GROUP}) @binding(0) var styles: texture_2d<u32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var<uniform> params: InkParams;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var masks: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var mask_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(4) var grains: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(5) var grain_sampler: sampler;
+
+// Stroke `i`'s style from the style texture (layout at the top).
+fn style(i: u32) -> StrokeStyle {
+    let x = i32((i % STYLES_PER_ROW) * 4u);
+    let y = i32(i / STYLES_PER_ROW);
+    let t0 = textureLoad(styles, vec2<i32>(x, y), 0);
+    let t1 = textureLoad(styles, vec2<i32>(x + 1, y), 0);
+    let t2 = textureLoad(styles, vec2<i32>(x + 2, y), 0);
+    let t3 = textureLoad(styles, vec2<i32>(x + 3, y), 0);
+    return StrokeStyle(
+        bitcast<vec4<f32>>(t0),
+        bitcast<vec4<f32>>(t1),
+        bitcast<vec4<f32>>(t2),
+        bitcast<f32>(t3.x),
+        t3.y,
+        t3.z,
+        t3.w,
+    );
+}
 
 struct Vertex {
     @builtin(instance_index) instance_index: u32,
@@ -114,7 +144,7 @@ fn value_noise(p: vec2<f32>, s: u32) -> f32 {
 
 @fragment
 fn fragment(in: InkOutput) -> @location(0) vec4<f32> {
-    let s = styles[in.stroke];
+    let s = style(in.stroke);
     // Sampled in uniform control flow (derivatives for mip selection);
     // only the branches below use the results.
     let grain_anchor = select(in.canvas, in.uv, (s.flags & FLAG_GRAIN_STROKE) != 0u);

@@ -12,6 +12,7 @@ use iroh::{Endpoint, EndpointAddr, TransportAddr};
 use krabink_core::{
     ClientDocs, ClientEffect, ClientMsg, ClientSession, DeviceId, DocKey, DocProvider, ServerMsg,
 };
+use n0_future::{task, time};
 use tokio::sync::mpsc;
 
 use crate::ALPN;
@@ -65,16 +66,21 @@ async fn dial_until_closed(
             continue;
         }
 
-        let mut addrs: Vec<TransportAddr> = target
-            .addrs
-            .iter()
-            .chain(hub.hints_for(target.id).iter())
-            .map(|a| TransportAddr::Ip(*a))
-            .collect();
+        // A browser can only reach peers through the relay.
+        let mut addrs: Vec<TransportAddr> = if cfg!(target_arch = "wasm32") {
+            Vec::new()
+        } else {
+            target
+                .addrs
+                .iter()
+                .chain(hub.hints_for(target.id).iter())
+                .map(|a| TransportAddr::Ip(*a))
+                .collect()
+        };
         addrs.extend(target.relay.clone().map(TransportAddr::Relay));
         let addr = EndpointAddr::from_parts(target.id, addrs);
 
-        let attempt = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, ALPN));
+        let attempt = time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, ALPN));
         let conn = tokio::select! {
             result = attempt => match result {
                 Ok(Ok(conn)) => Some(conn),
@@ -126,7 +132,7 @@ async fn dial_until_closed(
 /// Sleep unless told to close first. Returns true when closing. A new
 /// address hint cuts the wait short: the next dial sees it.
 async fn pause(cmd: &mut mpsc::UnboundedReceiver<OutCmd>, wait: Duration) -> bool {
-    let deadline = tokio::time::sleep(wait);
+    let deadline = time::sleep(wait);
     tokio::pin!(deadline);
     loop {
         tokio::select! {
@@ -181,15 +187,15 @@ async fn connection(
             return End::Lost;
         }
         let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        pumps.push(tokio::spawn(pump_in(recv, in_tx.clone())));
-        pumps.push(tokio::spawn(pump_out(send, rx)));
+        pumps.push(task::spawn(pump_in(recv, in_tx.clone())));
+        pumps.push(task::spawn(pump_out(send, rx)));
         lanes.push(tx);
     }
     drop(in_tx);
     let eph = lanes.pop().expect("two lanes");
     let docs = lanes.pop().expect("two lanes");
     let lanes = Lanes { docs, eph };
-    let routes = tokio::spawn(watch_routes(conn.clone(), hub.clone(), peer_id));
+    let routes = task::spawn(watch_routes(conn.clone(), hub.clone(), peer_id));
 
     let end = session_loop(&conn, hub, peer_id, target, cmd, &lanes, &mut in_rx).await;
 
