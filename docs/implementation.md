@@ -628,7 +628,8 @@ KRABINK_TEST_PAIR='krabink://pair?…' xcodebuild test-without-building ... -onl
 `Makefile.toml` wraps the common ones for cargo-make (in the devShell):
 `cargo make` (fmt-check + clippy + test), `cargo make run`, `server`,
 `build-ios-core`, `swift-smoke`, `check-ipad`, `run-ipad`,
-`archive-ios` / `upload-ios`, `archive-macos` / `upload-macos`;
+`archive-ios` / `upload-ios`, `archive-macos` / `upload-macos`,
+`bump major|minor|patch` (Cargo.toml, Cargo.lock and both project.yml);
 `cargo make --list-all-steps` lists every task.
 
 The iOS scripts need Xcode. Run on Linux, each one hands itself to the Mac
