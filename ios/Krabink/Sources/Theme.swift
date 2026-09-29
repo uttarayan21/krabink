@@ -3,8 +3,9 @@
 // lavender as the accent, cards on a page, roomier padding. The chosen
 // flavour lives in `ThemeStore.shared` (persisted in UserDefaults); every
 // `Theme.*` colour reads it, so views observing the store restyle at once.
-// The sketch paper (`UIColor.paper`) is the flavour's card colour, the
-// same value the desktop clears its render targets to.
+// The note page is the exception: it looks like Apple Notes in every
+// flavour, black text on white paper (`Paper`, `UIColor.paper`), while the
+// chrome around it (note list, settings) follows the flavour.
 
 import SwiftUI
 import UIKit
@@ -45,7 +46,7 @@ struct Palette {
     let bg: Color
     /// Note list and toolbars [mantle].
     let sidebar: Color
-    /// Cards, editor, inputs and sketch paper [surface0].
+    /// Cards and inputs [surface0].
     let surface: Color
     /// Hovered or selected rows, code [surface1].
     let surfaceRaised: Color
@@ -126,7 +127,7 @@ enum Theme {
     static var bg: Color { palette.bg }
     /// Note list and toolbars.
     static var sidebar: Color { palette.sidebar }
-    /// Cards, editor, inputs. Equal to `UIColor.paper`.
+    /// Cards and inputs.
     static var surface: Color { palette.surface }
     /// Hovered or selected rows, code.
     static var surfaceRaised: Color { palette.surfaceRaised }
@@ -152,6 +153,27 @@ enum Theme {
     static let pagePadding: CGFloat = 16
 }
 
+/// The page every note is typed and drawn on, in every flavour: Apple
+/// Notes' light page, black text on a white sheet with the Notes yellow
+/// for the cursor and page toolbar. UIKit light-mode values in brackets,
+/// fixed rather than dynamic so the page stays light under dark chrome.
+enum Paper {
+    /// The sheet; the ink layer clears to it [systemBackground].
+    static let sheet = Color(hex: 0xFFFFFF)
+    /// Body text [label].
+    static let text = Color(hex: 0x000000)
+    /// Markers, quotes, captions [secondaryLabel over white].
+    static let muted = Color(hex: 0x8A8A8E)
+    /// Code spans and blocks [systemGray6].
+    static let raised = Color(hex: 0xF2F2F7)
+    /// Inline sketch frames [opaqueSeparator].
+    static let border = Color(hex: 0xC6C6C8)
+    /// Cursor, selection and page toolbar [systemYellow].
+    static let accent = Color(hex: 0xFFCC00)
+    /// Links: the yellow deepened to read as text on white.
+    static let link = Color(hex: 0xB88A00)
+}
+
 extension Color {
     init(hex: UInt32) {
         self.init(
@@ -165,19 +187,18 @@ extension Color {
 extension UIColor {
     static var themeBg: UIColor { UIColor(Theme.bg) }
     static var themeSurface: UIColor { UIColor(Theme.surface) }
-    /// Code spans and blocks in the editor.
-    static var themeSurfaceRaised: UIColor { UIColor(Theme.surfaceRaised) }
     static var themeText: UIColor { UIColor(Theme.text) }
-    static var themeMuted: UIColor { UIColor(Theme.muted) }
-    static var themeBorder: UIColor { UIColor(Theme.border) }
-    static var themeAccent: UIColor { UIColor(Theme.accent) }
 
-    /// Page paper: the flavour's card colour, the desktop's
-    /// `Palette::paper` in crates/krabink/src/theme.rs. Both platforms
-    /// clear the ink layer to this, under the text, so ink reads alike
-    /// everywhere; the renderer picks the highlighter blend from its
+    /// Page paper: white in every flavour. The ink layer clears to this,
+    /// under the text; the renderer picks the highlighter blend from its
     /// luminance.
-    static var paper: UIColor { UIColor(Theme.surface) }
+    static let paper = UIColor(Paper.sheet)
+    static let paperText = UIColor(Paper.text)
+    static let paperMuted = UIColor(Paper.muted)
+    static let paperRaised = UIColor(Paper.raised)
+    static let paperBorder = UIColor(Paper.border)
+    static let paperAccent = UIColor(Paper.accent)
+    static let paperLink = UIColor(Paper.link)
 }
 
 /// How the app reads a sync status line (`AppModel.syncState`).
@@ -232,14 +253,19 @@ struct StatusDot: View {
 /// Uppercase section label, as on the desktop.
 struct Caption: View {
     let text: String
+    /// `nil` is the flavour's muted colour.
+    var color: Color?
 
-    init(_ text: String) { self.text = text }
+    init(_ text: String, color: Color? = nil) {
+        self.text = text
+        self.color = color
+    }
 
     var body: some View {
         Text(text.uppercased())
             .font(.caption.weight(.semibold))
             .tracking(1)
-            .foregroundStyle(Theme.muted)
+            .foregroundStyle(color ?? Theme.muted)
     }
 }
 

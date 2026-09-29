@@ -41,7 +41,7 @@ struct KrabinkApp: App {
     private var mainView: some View {
         ContentView(model: model)
             // Light or dark follows the Catppuccin flavour; the page
-            // paper is the flavour's card colour on both platforms.
+            // paper stays white (`Paper`).
             .preferredColorScheme(theme.flavor.colorScheme)
             .tint(Theme.accent)
     }
@@ -387,29 +387,28 @@ private struct NoteRow: View {
 }
 
 /// The selected note's page (styled markdown source with ink drawn over
-/// it, or the same page as the reading view with markers hidden) on a
-/// card under a title header with the live-sync dot, matching the desktop
-/// layout.
+/// it, or the same page as the reading view with markers hidden) under a
+/// title header with the live-sync dot. The whole pane is the paper, as in
+/// Apple Notes: white in every flavour, with a light bar and yellow tools.
 private struct NoteDetail: View {
     let model: AppModel
     let note: NoteModel
-    @State private var theme = ThemeStore.shared
     @State private var showBrushes = false
     @State private var preview = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
-            NoteCanvas(model: note, flavor: theme.flavor, preview: preview)
-                .card()
+            NoteCanvas(model: note, preview: preview)
                 .padding(.horizontal, Theme.pagePadding)
                 .padding(.bottom, Theme.pagePadding)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Theme.bg)
+        .background(Paper.sheet)
         .ignoresSafeArea(.keyboard, edges: .bottom)
-        .toolbarBackground(Theme.bg, for: .navigationBar)
+        .toolbarBackground(Paper.sheet, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
+        .toolbarColorScheme(.light, for: .navigationBar)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -427,10 +426,10 @@ private struct NoteDetail: View {
                         if let active = note.ink.activeCustomBrush {
                             Text(BrushLibrary.shared.brush(id: active)?.name ?? active)
                                 .font(.caption)
-                                .foregroundStyle(Theme.text)
+                                .foregroundStyle(Paper.text)
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 3)
-                                .background(Capsule().fill(Theme.accentSoft))
+                                .background(Capsule().fill(Paper.accent.opacity(0.28)))
                                 .accessibilityIdentifier("activeBrush")
                         }
                         Button {
@@ -460,6 +459,7 @@ private struct NoteDetail: View {
                 .accessibilityIdentifier("eraseLast")
             }
         }
+        .tint(Paper.accent)
         .sheet(isPresented: $showBrushes) { BrushSheet(model: note.ink) }
         .onDisappear { note.ink.pointerGone() }
     }
@@ -470,25 +470,25 @@ private struct NoteDetail: View {
         return HStack(alignment: .firstTextBaseline, spacing: 12) {
             Text(title.isEmpty ? "untitled" : title)
                 .font(.title2.weight(.semibold))
-                .foregroundStyle(title.isEmpty ? Theme.muted : Theme.text)
+                .foregroundStyle(title.isEmpty ? Paper.muted : Paper.text)
                 .lineLimit(1)
             Spacer()
             HStack(spacing: 6) {
                 StatusDot(color: tone.color)
                 Text(tone.short)
                     .font(.caption)
-                    .foregroundStyle(Theme.muted)
+                    .foregroundStyle(Paper.muted)
             }
             // Live ink counters: what the UI tests and on-device checks read.
             // Dev tooling only: store (Release) builds ship without them.
             #if DEBUG
             Text(note.ink.status)
                 .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(Theme.muted)
+                .foregroundStyle(Paper.muted)
                 .lineLimit(1)
                 .accessibilityIdentifier("sketchStatus")
             #endif
-            Caption(preview ? "preview" : "markdown")
+            Caption(preview ? "preview" : "markdown", color: Paper.muted)
         }
         .padding(.horizontal, Theme.pagePadding + 4)
         .padding(.top, 8)

@@ -47,7 +47,7 @@ enum MarkdownStyler {
     static var baseAttributes: [NSAttributedString.Key: Any] {
         [
             .font: bodyFont,
-            .foregroundColor: UIColor.themeText,
+            .foregroundColor: UIColor.paperText,
             .paragraphStyle: baseParagraph,
         ]
     }
@@ -109,11 +109,11 @@ enum MarkdownStyler {
             storage.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: range)
         case .codeSpan:
             setFont(storage, range: range) { $0.monospaced() }
-            storage.addAttribute(.backgroundColor, value: UIColor.themeSurfaceRaised, range: range)
+            storage.addAttribute(.backgroundColor, value: UIColor.paperRaised, range: range)
         case .codeBlock:
             let paragraphs = (storage.string as NSString).paragraphRange(for: range)
             setFont(storage, range: paragraphs) { $0.monospaced() }
-            storage.addAttribute(.backgroundColor, value: UIColor.themeSurfaceRaised, range: paragraphs)
+            storage.addAttribute(.backgroundColor, value: UIColor.paperRaised, range: paragraphs)
             editParagraphs(storage, range: range) {
                 $0.firstLineHeadIndent = codeBlockIndent
                 $0.headIndent = codeBlockIndent
@@ -126,7 +126,7 @@ enum MarkdownStyler {
             }
         case .blockQuote:
             setFont(storage, range: range) { $0.adding(.traitItalic) }
-            storage.addAttribute(.foregroundColor, value: UIColor.themeMuted, range: range)
+            storage.addAttribute(.foregroundColor, value: UIColor.paperMuted, range: range)
             editParagraphs(storage, range: range) {
                 $0.firstLineHeadIndent += quoteIndent
                 $0.headIndent += quoteIndent
@@ -134,7 +134,7 @@ enum MarkdownStyler {
         case .link:
             storage.addAttributes(
                 [
-                    .foregroundColor: UIColor.themeAccent,
+                    .foregroundColor: UIColor.paperLink,
                     .underlineStyle: NSUnderlineStyle.single.rawValue,
                 ], range: range)
         case .sketchEmbed(let sketch):
@@ -142,7 +142,7 @@ enum MarkdownStyler {
                 // Editor: the embed line is source text like any other.
                 storage.addAttributes(
                     [
-                        .foregroundColor: UIColor.themeAccent,
+                        .foregroundColor: UIColor.paperLink,
                         .underlineStyle: NSUnderlineStyle.single.rawValue,
                     ], range: range)
                 return
@@ -161,7 +161,7 @@ enum MarkdownStyler {
                 $0.lineBreakMode = .byClipping
             }
         case .marker, .thematicBreak:
-            storage.addAttribute(.foregroundColor, value: UIColor.themeMuted, range: range)
+            storage.addAttribute(.foregroundColor, value: UIColor.paperMuted, range: range)
             storage.removeAttribute(.underlineStyle, range: range)
         }
     }
