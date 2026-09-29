@@ -5103,7 +5103,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "krabink"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bevy",
  "bevy_egui",
@@ -5128,7 +5128,7 @@ dependencies = [
 
 [[package]]
 name = "krabink-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ink-stroke-modeler-rs",
  "loro",
@@ -5146,7 +5146,7 @@ dependencies = [
 
 [[package]]
 name = "krabink-ffi"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "iroh",
  "krabink-core",
@@ -5162,7 +5162,7 @@ dependencies = [
 
 [[package]]
 name = "krabink-local"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "error-stack",
  "futures",
@@ -5181,7 +5181,7 @@ dependencies = [
 
 [[package]]
 name = "krabink-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "error-stack",

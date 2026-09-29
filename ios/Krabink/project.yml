@@ -90,7 +90,7 @@ targets:
         # Store version. Bump with the workspace version in Cargo.toml.
         # The build number (CFBundleVersion) is the commit count;
         # scripts/archive-ios.sh overrides CURRENT_PROJECT_VERSION.
-        MARKETING_VERSION: "0.1.1"
+        MARKETING_VERSION: "0.1.2"
         CURRENT_PROJECT_VERSION: 1
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # iPad-first, but runs on iPhone too for cheap simulator checks.

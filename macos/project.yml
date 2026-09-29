@@ -72,7 +72,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: dev.darksailor.krabink
         # Bump with the workspace version in Cargo.toml. The build number
         # is the commit count, set by scripts/archive-macos.sh.
-        MARKETING_VERSION: "0.1.1"
+        MARKETING_VERSION: "0.1.2"
         CURRENT_PROJECT_VERSION: 1
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ENABLE_HARDENED_RUNTIME: YES
