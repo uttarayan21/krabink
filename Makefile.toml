@@ -1,0 +1,159 @@
+# cargo-make entry points (`cargo make <task>`, or `makers <task>`).
+# cargo-make is in the flake devShell. The Apple tasks wrap scripts/*.sh,
+# which hand themselves to the Mac build machine (scripts/on-mac.sh) when
+# run on Linux; their KRABINK_* variables work the same way here.
+# Arguments after the task name are forwarded as-is, with no `--`
+# separator: `cargo make run --data-dir /tmp/b`.
+
+[config]
+default_to_workspace = false
+skip_core_tasks = true
+
+[tasks.default]
+alias = "check"
+
+# --- Rust -----------------------------------------------------------------
+
+[tasks.run]
+description = "Run the desktop app (release build)"
+command = "scripts/run-desktop.sh"
+args = ["${@}"]
+
+[tasks.server]
+description = "Run the relay + replica in dev mode"
+command = "cargo"
+args = ["run", "-p", "krabink-server", "--", "--dev", "${@}"]
+
+[tasks.build]
+description = "Build the workspace"
+command = "cargo"
+args = ["build", "--workspace", "${@}"]
+
+[tasks.test]
+description = "Run the workspace tests"
+command = "cargo"
+args = ["test", "--workspace", "${@}"]
+
+[tasks.clippy]
+description = "Clippy with warnings denied, as in CI"
+command = "cargo"
+args = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+
+[tasks.fmt]
+description = "Format Rust and TOML sources"
+script = ["cargo fmt --all", "taplo fmt"]
+
+[tasks.fmt-check]
+description = "Check Rust and TOML formatting"
+script = ["cargo fmt --all -- --check", "taplo fmt --check"]
+
+[tasks.deny]
+description = "Audit dependency licenses and advisories"
+command = "cargo"
+args = ["deny", "check"]
+
+[tasks.check]
+description = "fmt-check, clippy and test"
+dependencies = ["fmt-check", "clippy", "test"]
+
+[tasks.flake-check]
+description = "Every CI check through nix"
+command = "nix"
+args = ["flake", "check", "-L"]
+
+# --- Release --------------------------------------------------------------
+
+[tasks.bump]
+description = "Bump the app version: cargo make bump major|minor|patch"
+script = '''
+set -eu
+yml="ios/Krabink/project.yml macos/project.yml"
+
+current=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml)
+if ! echo "$current" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+  echo "error: can't read the workspace version in Cargo.toml" >&2
+  exit 1
+fi
+for f in $yml; do
+  if ! grep -q "MARKETING_VERSION: \"$current\"" "$f"; then
+    echo "error: $f MARKETING_VERSION is not $current" >&2
+    exit 1
+  fi
+done
+
+IFS=. read -r major minor patch <<EOF
+$current
+EOF
+case "${1:-}" in
+  major) next=$((major + 1)).0.0 ;;
+  minor) next=$major.$((minor + 1)).0 ;;
+  patch) next=$major.$minor.$((patch + 1)) ;;
+  *)
+    echo "usage: cargo make bump major|minor|patch" >&2
+    exit 2
+    ;;
+esac
+
+# sed -i differs between GNU and BSD, so go through a temp file.
+edit() { sed "$1" "$2" > "$2.tmp" && mv "$2.tmp" "$2"; }
+edit "s/^version = \"$current\"$/version = \"$next\"/" Cargo.toml
+for f in $yml; do
+  edit "s/MARKETING_VERSION: \"$current\"/MARKETING_VERSION: \"$next\"/" "$f"
+done
+cargo update --workspace --offline --quiet
+
+echo "$current -> $next"
+'''
+
+# --- iPad -----------------------------------------------------------------
+
+[tasks.build-ios-core]
+description = "Build the KrabinkCore XCFramework and Swift bindings"
+command = "scripts/build-ios-core.sh"
+
+[tasks.swift-smoke]
+description = "Compile and run the Swift bindings smoke test"
+command = "scripts/swift-smoke.sh"
+
+[tasks.gen-xcodeproj]
+description = "Regenerate Krabink.xcodeproj from project.yml"
+command = "scripts/gen-xcodeproj.sh"
+
+[tasks.check-ipad]
+description = "Compile the iPad app for the simulator"
+command = "scripts/check-ipad.sh"
+
+[tasks.run-ipad]
+description = "Build, install and launch on a connected iPad"
+command = "scripts/deploy-ipad.sh"
+
+[tasks.archive-ios]
+description = "Archive and export the iPad app for App Store Connect"
+command = "scripts/archive-ios.sh"
+
+[tasks.upload-ios]
+description = "Archive the iPad app and upload it to App Store Connect"
+env = { KRABINK_EXPORT_DESTINATION = "upload" }
+command = "scripts/archive-ios.sh"
+
+# --- macOS ----------------------------------------------------------------
+
+[tasks.archive-macos]
+description = "Archive and export the Mac App Store .pkg"
+command = "scripts/archive-macos.sh"
+
+[tasks.upload-macos]
+description = "Archive the Mac app and upload it to App Store Connect"
+env = { KRABINK_EXPORT_DESTINATION = "upload" }
+command = "scripts/archive-macos.sh"
+
+# --- Icons ----------------------------------------------------------------
+
+[tasks.gen-app-icon]
+description = "Render the 1024px App Store icon"
+command = "python3"
+args = ["scripts/gen-app-icon.py", "${@}"]
+
+[tasks.gen-mac-icon]
+description = "Render the Mac icon set from the iPad icon (macOS only)"
+command = "scripts/gen-mac-icon.sh"
