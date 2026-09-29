@@ -3,8 +3,9 @@
 // lavender as the accent, cards on a page, roomier padding. The chosen
 // flavour lives in `ThemeStore.shared` (persisted in UserDefaults); every
 // `Theme.*` colour reads it, so views observing the store restyle at once.
-// The sketch paper (`UIColor.paper`) is the flavour's card colour, the
-// same value the desktop clears its render targets to.
+// The sketch paper (`UIColor.paper`) is the flavour's card colour unless
+// the user picked another (`ThemeStore.paper`), the same value the desktop
+// clears its render targets to; text on it takes the paper's tone.
 
 import SwiftUI
 import UIKit
@@ -45,7 +46,7 @@ struct Palette {
     let bg: Color
     /// Note list and toolbars [mantle].
     let sidebar: Color
-    /// Cards, editor, inputs and sketch paper [surface0].
+    /// Cards, editor, inputs and, by default, sketch paper [surface0].
     let surface: Color
     /// Hovered or selected rows, code [surface1].
     let surfaceRaised: Color
@@ -99,10 +100,10 @@ struct Palette {
         warn: Color(hex: 0xF9E2AF), danger: Color(hex: 0xF38BA8))
 }
 
-/// The chosen flavour, persisted as `theme` in UserDefaults. Views that
-/// read any `Theme.*` colour in their body observe it and restyle when it
-/// changes; UIKit-backed views take the flavour as an input so their
-/// `updateUIView` runs too.
+/// The chosen flavour and paper, persisted as `theme` and `paper` in
+/// UserDefaults. Views that read any `Theme.*` colour in their body
+/// observe it and restyle when it changes; UIKit-backed views take the
+/// flavour and paper as inputs so their `updateUIView` runs too.
 @Observable
 final class ThemeStore {
     static let shared = ThemeStore()
@@ -111,11 +112,52 @@ final class ThemeStore {
         didSet { UserDefaults.standard.set(flavor.rawValue, forKey: "theme") }
     }
 
+    /// Picked paper as `0xRRGGBB`, kept across flavour switches; `nil`
+    /// follows the flavour's card colour.
+    var paper: UInt32? {
+        didSet {
+            if let paper {
+                UserDefaults.standard.set(Int(paper), forKey: "paper")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "paper")
+            }
+        }
+    }
+
     var palette: Palette { flavor.palette }
 
+    /// The page's colour: the picked paper, else the flavour's card.
+    var paperColor: Color { paper.map { Color(hex: $0) } ?? palette.surface }
+
+    /// `paperColor` as `0xRRGGBB`.
+    var paperHex: UInt32 { paper ?? UIColor(palette.surface).rgbHex }
+
+    /// Colours for what sits on the paper (editor text, inline frames):
+    /// the flavour's while the paper keeps its tone, else Latte's (light
+    /// paper) or Mocha's (dark paper). Mirrors `Palette::on_paper` in
+    /// crates/krabink/src/theme.rs.
+    var paperPalette: Palette {
+        let flavorDark = flavor.colorScheme == .dark
+        let paperDark = paper.map(Self.isDark) ?? flavorDark
+        if paperDark == flavorDark { return palette }
+        return paperDark ? .mocha : .latte
+    }
+
+    /// Linear luminance under 0.5: the cut-off `InkRenderer.isDark` and
+    /// the desktop use.
+    static func isDark(_ hex: UInt32) -> Bool {
+        func linear(_ byte: UInt32) -> Double {
+            let c = Double(byte & 0xFF) / 255
+            return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * linear(hex >> 16) + 0.7152 * linear(hex >> 8) + 0.0722 * linear(hex) < 0.5
+    }
+
     private init() {
-        let stored = UserDefaults.standard.string(forKey: "theme") ?? ""
+        let defaults = UserDefaults.standard
+        let stored = defaults.string(forKey: "theme") ?? ""
         flavor = ThemeFlavor(rawValue: stored) ?? .mocha
+        paper = (defaults.object(forKey: "paper") as? Int).map { UInt32(truncatingIfNeeded: $0) & 0xFF_FFFF }
     }
 }
 
@@ -126,8 +168,10 @@ enum Theme {
     static var bg: Color { palette.bg }
     /// Note list and toolbars.
     static var sidebar: Color { palette.sidebar }
-    /// Cards, editor, inputs. Equal to `UIColor.paper`.
+    /// Cards, inputs; the paper too unless another was picked.
     static var surface: Color { palette.surface }
+    /// The page under notes: `UIColor.paper`.
+    static var paper: Color { ThemeStore.shared.paperColor }
     /// Hovered or selected rows, code.
     static var surfaceRaised: Color { palette.surfaceRaised }
     /// Hairlines around cards.
@@ -165,19 +209,34 @@ extension Color {
 extension UIColor {
     static var themeBg: UIColor { UIColor(Theme.bg) }
     static var themeSurface: UIColor { UIColor(Theme.surface) }
-    /// Code spans and blocks in the editor.
-    static var themeSurfaceRaised: UIColor { UIColor(Theme.surfaceRaised) }
     static var themeText: UIColor { UIColor(Theme.text) }
-    static var themeMuted: UIColor { UIColor(Theme.muted) }
-    static var themeBorder: UIColor { UIColor(Theme.border) }
-    static var themeAccent: UIColor { UIColor(Theme.accent) }
 
-    /// Page paper: the flavour's card colour, the desktop's
-    /// `Palette::paper` in crates/krabink/src/theme.rs. Both platforms
-    /// clear the ink layer to this, under the text, so ink reads alike
-    /// everywhere; the renderer picks the highlighter blend from its
-    /// luminance.
-    static var paper: UIColor { UIColor(Theme.surface) }
+    /// Page paper: the picked colour or the flavour's card colour, the
+    /// desktop's `Palette::paper` in crates/krabink/src/theme.rs. Both
+    /// platforms clear the ink layer to this, under the text, so ink
+    /// reads alike everywhere; the renderer picks the highlighter blend
+    /// from its luminance.
+    static var paper: UIColor { UIColor(Theme.paper) }
+
+    // What sits on the paper, in its tone (`ThemeStore.paperPalette`).
+    private static var onPaper: Palette { ThemeStore.shared.paperPalette }
+    static var paperText: UIColor { UIColor(onPaper.text) }
+    static var paperMuted: UIColor { UIColor(onPaper.muted) }
+    static var paperAccent: UIColor { UIColor(onPaper.accent) }
+    static var paperBorder: UIColor { UIColor(onPaper.border) }
+    /// Code spans and blocks in the editor.
+    static var paperSurfaceRaised: UIColor { UIColor(onPaper.surfaceRaised) }
+
+    /// The sRGB components as `0xRRGGBB`, the inverse of `Color(hex:)`.
+    var rgbHex: UInt32 {
+        var r: CGFloat = 0
+        var g: CGFloat = 0
+        var b: CGFloat = 0
+        var a: CGFloat = 0
+        getRed(&r, green: &g, blue: &b, alpha: &a)
+        func byte(_ c: CGFloat) -> UInt32 { UInt32(min(max((c * 255).rounded(), 0), 255)) }
+        return byte(r) << 16 | byte(g) << 8 | byte(b)
+    }
 }
 
 /// How the app reads a sync status line (`AppModel.syncState`).

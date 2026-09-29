@@ -457,6 +457,7 @@ fn editor_ui(
         now_ms: crate::docs::now_ms(),
         flavor: theme.flavor(),
         palette,
+        custom_paper: theme.paper().is_some(),
     };
     match settings.window(ctx, &view) {
         Some(crate::settings::SettingsAction::Join(info)) => {
@@ -529,6 +530,12 @@ fn editor_ui(
             theme.set_flavor(flavor);
             if let Err(err) = crate::config::persist_theme(flavor) {
                 tracing::error!(%err, "persisting theme failed");
+            }
+        }
+        Some(crate::settings::SettingsAction::Paper { color, persist }) => {
+            theme.set_paper(color);
+            if persist && let Err(err) = crate::config::persist_paper(color) {
+                tracing::error!(%err, "persisting paper failed");
             }
         }
         None => {}
@@ -740,6 +747,9 @@ fn editor_ui(
             if let Some(note) = docs.note(id) {
                 editor.boxes.refresh(note);
             }
+            // Text and frames on the page take the paper's tone, which a
+            // picked paper colour can flip from the flavour's.
+            let ink = palette.on_paper();
             let (output, boxes, inner_rect) = pane(ui, &palette, editor_height, |ui| {
                 let scroll = egui::ScrollArea::vertical()
                     .id_salt("editor")
@@ -777,7 +787,7 @@ fn editor_ui(
                         let mut layouter =
                             |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
                                 let job =
-                                    layout_job(text.as_str(), runs, heights, &palette, wrap_width);
+                                    layout_job(text.as_str(), runs, heights, &ink, wrap_width);
                                 ui.painter().layout_job(job)
                             };
                         let output = egui::TextEdit::multiline(text)
@@ -786,14 +796,14 @@ fn editor_ui(
                             .frame(egui::Frame::NONE)
                             .desired_width(f32::INFINITY)
                             .min_size(available)
-                            .hint_text("Start writing…")
+                            .hint_text(egui::RichText::new("Start writing…").color(ink.muted))
                             .show(ui);
                         let boxes = heights
                             .map(|heights| {
                                 inline_boxes(&output.galley, &embeds, heights, available.x)
                             })
                             .unwrap_or_default();
-                        paint_inline_frames(ui.painter(), &palette, &boxes, output.galley_pos);
+                        paint_inline_frames(ui.painter(), &ink, &boxes, output.galley_pos);
                         ui.add_space(available.y * TAIL_FRACTION);
                         if let Some(target) = &page_texture.0 {
                             // Painted in galley space, so a one-frame-old
@@ -1374,7 +1384,7 @@ mod tests {
     use super::*;
 
     fn palette() -> Palette {
-        *Theme::new(theme::Flavor::Latte).palette()
+        theme::Flavor::Latte.palette()
     }
 
     fn job(text: &str) -> LayoutJob {
