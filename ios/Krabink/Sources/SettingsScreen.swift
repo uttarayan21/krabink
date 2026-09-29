@@ -38,7 +38,7 @@ struct SettingsScreen: View {
                 } header: {
                     Caption("Appearance")
                 } footer: {
-                    Text("Catppuccin flavours, lightest to darkest. Sketch paper follows the card colour on every device.")
+                    Text("Catppuccin flavours, lightest to darkest. Notes stay on white paper in every flavour.")
                         .foregroundStyle(Theme.muted)
                 }
 

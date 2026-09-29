@@ -541,8 +541,7 @@ final class InkRenderer: NSObject, MTKViewDelegate {
     /// Metal takes clear values in linear light, premultiplied, so
     /// `.clear` clears to transparent (tool icons) rather than black.
     ///
-    /// Pass [`UIColor.paper`] for the page so both devices draw on the
-    /// same colour.
+    /// Pass [`UIColor.paper`] for the page.
     static func clearColor(for color: UIColor, trait: UITraitCollection) -> MTLClearColor {
         var r: CGFloat = 0
         var g: CGFloat = 0

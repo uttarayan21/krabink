@@ -112,6 +112,10 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
         textView = UITextView(usingTextLayoutManager: false)
         super.init(frame: .zero)
 
+        // White paper in every flavour, styled as a light-mode page like
+        // Apple Notes (keyboard, selection handles, menus) whatever the
+        // chrome around it.
+        overrideUserInterfaceStyle = .light
         backgroundColor = .paper
 
         metal.delegate = renderer
@@ -150,7 +154,8 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
         textView.addInteraction(UIScribbleInteraction(delegate: self))
         textView.addSubview(boxOverlay)
         addSubview(textView)
-        applyTheme()
+        textView.tintColor = .paperAccent
+        textView.keyboardAppearance = .light
 
         pen.canvasSpace = textView
         textView.addGestureRecognizer(pen)
@@ -248,37 +253,14 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
         MainActor.assumeIsolated { scheduleLayoutNotify() }
     }
 
-    // MARK: theme
+    // MARK: paper
 
-    /// The flavour the paper was last cleared for.
-    private var paperFlavor: ThemeFlavor?
-
-    /// Colours for the current flavour: the paper the ink layer clears to
-    /// (and the highlighter blend for it), the text's palette.
-    func applyTheme() {
-        textView.tintColor = .themeAccent
-        textView.keyboardAppearance = ThemeStore.shared.flavor.colorScheme == .dark ? .dark : .light
-        let flavor = ThemeStore.shared.flavor
-        guard flavor != paperFlavor else { return }
-        paperFlavor = flavor
-        backgroundColor = .paper
-        applyBackground()
-        boxOverlay.recolor()
-        restyle()
-    }
-
+    /// Clear the ink layer to the paper (and pick the highlighter blend
+    /// for it).
     private func applyBackground() {
         metal.clearColor = InkRenderer.clearColor(for: .paper, trait: traitCollection)
         renderer.darkPaper = InkRenderer.isDark(metal.clearColor)
         renderer.needsDisplay()
-    }
-
-    override func traitCollectionDidChange(_ previous: UITraitCollection?) {
-        super.traitCollectionDidChange(previous)
-        if traitCollection.hasDifferentColorAppearance(comparedTo: previous) {
-            paperFlavor = nil
-            applyTheme()
-        }
     }
 
     // MARK: text
@@ -534,9 +516,9 @@ final class InlineBoxOverlay: UIView {
 
     func recolor() {
         let scale = traitCollection.displayScale
-        for frame in frames { frame.strokeColor = UIColor.themeBorder.cgColor }
+        for frame in frames { frame.strokeColor = UIColor.paperBorder.cgColor }
         for caption in captions {
-            caption.foregroundColor = UIColor.themeMuted.cgColor
+            caption.foregroundColor = UIColor.paperMuted.cgColor
             caption.contentsScale = scale
         }
     }
@@ -544,9 +526,6 @@ final class InlineBoxOverlay: UIView {
 
 struct NoteCanvas: UIViewRepresentable {
     let model: NoteModel
-    /// Passed in (not read from the store) so a switch re-runs
-    /// `updateUIView` and the paper and text colours follow.
-    let flavor: ThemeFlavor
     /// Reading view instead of the editor.
     let preview: Bool
 
@@ -600,7 +579,6 @@ struct NoteCanvas: UIViewRepresentable {
     func updateUIView(_ view: UIView, context: Context) {
         guard let canvas = view as? NoteCanvasView else { return }
         canvas.preview = preview
-        canvas.applyTheme()
         canvas.syncFromModel()
     }
 
@@ -630,6 +608,9 @@ struct NoteCanvas: UIViewRepresentable {
             picker = PKToolPicker()
         }
         picker.stateAutosaveName = "sketch"
+        // The paper is white in every flavour: offer colours as they draw
+        // on a light page, not inverted for the dark chrome.
+        picker.colorUserInterfaceStyle = .light
         return picker
     }
 
