@@ -7,7 +7,7 @@ pub struct Cli {
     /// several instances run side by side.
     #[clap(long)]
     pub data_dir: Option<std::path::PathBuf>,
-    /// Home relay URL, e.g. https://relay.example.org: brokers the
+    /// Home relay URL, e.g. `https://relay.example.org`: brokers the
     /// handshake with peers and carries traffic when hole punching fails.
     /// Overrides config.toml.
     #[clap(long)]

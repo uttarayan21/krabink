@@ -207,7 +207,7 @@ pub struct BrushRef {
     /// Full ink width in canvas units.
     pub base_width: f32,
     /// Per-stroke randomness seed, the stroke id's low bits
-    /// ([`stroke_seed`]); only stroke-mapped grain and stamps read it, so
+    /// (`stroke_seed`); only stroke-mapped grain and stamps read it, so
     /// 0 is fine for ink that has no element yet.
     #[uniffi(default = 0)]
     pub seed: u32,
@@ -217,7 +217,7 @@ pub struct BrushRef {
     pub custom: Option<CustomBrush>,
 }
 
-/// A custom brush by id with its encoded spec ([`BrushSpec::encode`] in
+/// A custom brush by id with its encoded spec ([`krabink_core::BrushSpec::encode`] in
 /// the core); strokes carry both so they render without the library.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct CustomBrush {
@@ -489,7 +489,7 @@ impl From<StrokeEnd> for pcore::StrokeEnd {
 
 /// One live stroke's input pipeline: streamline smoothing into the points
 /// the stroke stores. Create at pen-down, `push` every coalesced touch,
-/// draw `points` plus a `predict` tail each frame through [`points_mesh`],
+/// draw `points` plus a `predict` tail each frame through `points_mesh`,
 /// commit `finish` at pen-up. Thread-safe; the touch handler and the
 /// render loop may share it.
 #[derive(uniffi::Object)]
@@ -597,7 +597,7 @@ impl BrushModeler {
 
     /// The live stroke's ink: every point so far plus the tail `predict`
     /// would add, meshed here so no point crosses the boundary per touch
-    /// event. Same geometry as [`points_mesh`] with `StrokeEnd::Live`.
+    /// event. Same geometry as `points_mesh` with `StrokeEnd::Live`.
     pub fn live_mesh(
         &self,
         predict: Vec<RawSample>,

@@ -186,28 +186,28 @@ pub fn parse_hex(raw: &str) -> Option<Color32> {
 /// Every colour the app uses, by role. Catppuccin roles in brackets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
-    /// Window background, also the bevy clear colour behind egui [base].
+    /// Window background, also the bevy clear colour behind egui \[base\].
     pub bg: Color32,
-    /// Library sidebar [mantle].
+    /// Library sidebar \[mantle\].
     pub sidebar: Color32,
-    /// Cards, windows and input backgrounds [surface0].
+    /// Cards, windows and input backgrounds \[surface0\].
     pub surface: Color32,
-    /// Sketch paper under the editor's text and ink: [surface0] unless
+    /// Sketch paper under the editor's text and ink: \[surface0\] unless
     /// the user picked another colour (see [`Theme::new`]).
     pub paper: Color32,
-    /// Hovered rows, striped table rows, code blocks [surface1].
+    /// Hovered rows, striped table rows, code blocks \[surface1\].
     pub surface_raised: Color32,
-    /// Pressed widgets [surface2].
+    /// Pressed widgets \[surface2\].
     pub surface_pressed: Color32,
-    /// Hairlines around cards and panels [surface1].
+    /// Hairlines around cards and panels \[surface1\].
     pub border: Color32,
-    /// Primary text [text].
+    /// Primary text \[text\].
     pub text: Color32,
-    /// Secondary text, captions, hints [subtext0].
+    /// Secondary text, captions, hints \[subtext0\].
     pub muted: Color32,
-    /// Brand accent: buttons, selection, links [lavender].
+    /// Brand accent: buttons, selection, links \[lavender\].
     pub accent: Color32,
-    /// Text on an accent-filled button [base].
+    /// Text on an accent-filled button \[base\].
     pub on_accent: Color32,
     pub success: Color32,
     pub warn: Color32,
