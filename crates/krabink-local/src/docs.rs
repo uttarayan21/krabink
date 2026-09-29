@@ -18,7 +18,7 @@ struct OpenDoc {
 }
 
 /// What [`ServerDocs::maintain`] does with docs nobody touched for
-/// [`IDLE_UNLOAD`].
+/// `IDLE_UNLOAD`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdleDocs {
     /// Drop them from memory; the store keeps their state.

@@ -87,7 +87,7 @@ impl Shape {
     /// line, shaft plus two wings for an arrow (the head retraces through
     /// `b`, which the round join covers), five for a rectangle and a
     /// perimeter-scaled ring for an ellipse. Points carry full force and
-    /// no stored size, so [`crate::stroke_mesh`] draws them `base_width`
+    /// no stored size, so [`crate::Ink::mesh`] draws them `base_width`
     /// wide.
     pub fn outline(&self) -> Vec<StrokePoint> {
         let pts: Vec<P> = match *self {
