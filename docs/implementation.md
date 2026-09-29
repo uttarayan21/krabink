@@ -625,6 +625,12 @@ xcodebuild -project Krabink.xcodeproj -scheme Krabink -destination 'platform=iOS
 KRABINK_TEST_PAIR='krabink://pair?…' xcodebuild test-without-building ... -only-testing:KrabinkUITests/SketchUITests
 ```
 
+`Makefile.toml` wraps the common ones for cargo-make (in the devShell):
+`cargo make` (fmt-check + clippy + test), `cargo make run`, `server`,
+`build-ios-core`, `swift-smoke`, `check-ipad`, `run-ipad`,
+`archive-ios` / `upload-ios`, `archive-macos` / `upload-macos`;
+`cargo make --list-all-steps` lists every task.
+
 The iOS scripts need Xcode. Run on Linux, each one hands itself to the Mac
 build machine through `scripts/on-mac.sh`: the worktree is mirrored with
 rsync to `~/Porject/krabink-<worktree>` on `shiro` (one folder per
