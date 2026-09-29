@@ -10,8 +10,8 @@ use krabink_core as pcore;
 use crate::engine::Result;
 
 use crate::types::{
-    Element, Point2, Recognition, Shape, Stroke, StrokePoint, Tilt, Tool, rgba_from_u32,
-    rgba_to_u32,
+    Element, ElementOrigin, PageElement, Point2, Recognition, Shape, Stroke, StrokePoint, Tilt,
+    Tool, origin_lookup, rgba_from_u32, rgba_to_u32,
 };
 
 /// One raw touch sample, before smoothing.
@@ -872,6 +872,30 @@ pub fn resize_shape(shape: Shape, from: Point2, to: Point2) -> Shape {
     pcore::Shape::from(shape)
         .resized(from.into(), to.into())
         .into()
+}
+
+/// The page layer with every bound line and arrow end re-derived from
+/// where its targets are drawn now. `origins` gives each element's line
+/// origin in page space (elements without one sit at the origin). Call
+/// after layout and on every frame of a drag, before meshing.
+#[uniffi::export]
+pub fn resolve_page_bindings(
+    elements: Vec<PageElement>,
+    origins: Vec<ElementOrigin>,
+) -> Vec<PageElement> {
+    let mut core: Vec<pcore::Element> = elements
+        .iter()
+        .map(|p| pcore::Element::from(p.element.clone()))
+        .collect();
+    pcore::resolve_bindings(&mut core, origin_lookup(&origins));
+    elements
+        .into_iter()
+        .zip(core)
+        .map(|(p, element)| PageElement {
+            element: element.into(),
+            ..p
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -96,35 +96,37 @@ enum DeleteConfirm {
 
 /// `sketch_box_height` of every sketch container, refreshed when the doc
 /// changes. Keyed on the doc version (not the text): a peer's stroke
-/// changes the height without touching the text. Only sketches whose
-/// element count moved are re-measured, so a keystroke costs a few list
-/// lengths.
+/// changes the height without touching the text. Only sketches the
+/// change touched are re-measured, so a keystroke re-measures nothing.
 #[derive(Default)]
 struct BoxHeights {
+    /// `NoteDoc::frontiers` the heights were measured at.
     for_version: Vec<u8>,
-    /// Sketch → (element count measured, box height).
-    measured: HashMap<SketchId, (usize, f32)>,
     heights: HashMap<SketchId, f32>,
 }
 
 impl BoxHeights {
     fn refresh(&mut self, note: &NoteDoc) {
-        let version = note.version();
+        let version = note.frontiers();
         if self.for_version == version {
             return;
         }
+        // Elements move and reshape in place, so ask which sketches
+        // changed rather than comparing element counts.
+        let changed = if self.for_version.is_empty() {
+            note.sketch_ids()
+        } else {
+            note.ink_changes_since(&self.for_version).sketches
+        };
         self.for_version = version;
-        let mut measured = HashMap::new();
-        for sketch in note.sketch_ids() {
-            let len = note.sketch_len(sketch);
-            let height = match self.measured.get(&sketch) {
-                Some((n, h)) if *n == len => *h,
-                _ => sketch_box_height(&note.elements(sketch).unwrap_or_default()),
-            };
-            measured.insert(sketch, (len, height));
+        let ids = note.sketch_ids();
+        self.heights.retain(|s, _| ids.contains(s));
+        for sketch in ids {
+            if changed.contains(&sketch) || !self.heights.contains_key(&sketch) {
+                let height = sketch_box_height(&note.elements(sketch).unwrap_or_default());
+                self.heights.insert(sketch, height);
+            }
         }
-        self.heights = measured.iter().map(|(s, (_, h))| (*s, *h)).collect();
-        self.measured = measured;
     }
 
     fn reset(&mut self) {

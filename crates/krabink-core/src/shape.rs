@@ -31,7 +31,7 @@ use core::f32::consts::{FRAC_PI_2, PI, TAU};
 use crate::geom::{dedupe, segment_distance2};
 use crate::stroke::StrokePoint;
 
-type P = [f32; 2];
+pub(crate) type P = [f32; 2];
 
 /// A recognised primitive in canvas space (x right, y down).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -57,6 +57,14 @@ pub enum Shape {
     Ellipse {
         center: P,
         radii: P,
+        angle: f32,
+    },
+    /// A rhombus inscribed in the rotated box of full `size`: its corners
+    /// are the box's edge midpoints. Drawn with the shape tool; the
+    /// recognizer never yields one.
+    Diamond {
+        center: P,
+        size: P,
         angle: f32,
     },
 }
@@ -104,6 +112,14 @@ impl Shape {
                 let c = rect_corners(center, size, angle);
                 vec![c[0], c[1], c[2], c[3], c[0]]
             }
+            Self::Diamond {
+                center,
+                size,
+                angle,
+            } => {
+                let c = diamond_corners(center, size, angle);
+                vec![c[0], c[1], c[2], c[3], c[0]]
+            }
             Self::Ellipse {
                 center,
                 radii,
@@ -147,6 +163,11 @@ impl Shape {
                 size,
                 angle,
             } => bbox(&rect_corners(center, size, angle)).unwrap_or((center, center)),
+            Self::Diamond {
+                center,
+                size,
+                angle,
+            } => bbox(&diamond_corners(center, size, angle)).unwrap_or((center, center)),
             Self::Ellipse {
                 center,
                 radii,
@@ -163,11 +184,66 @@ impl Shape {
         }
     }
 
+    /// The shape moved by `d`.
+    #[must_use]
+    pub fn translated(self, d: P) -> Self {
+        match self {
+            Self::Line { a, b } => Self::Line {
+                a: add(a, d),
+                b: add(b, d),
+            },
+            Self::Arrow { a, b } => Self::Arrow {
+                a: add(a, d),
+                b: add(b, d),
+            },
+            Self::Rect {
+                center,
+                size,
+                angle,
+            } => Self::Rect {
+                center: add(center, d),
+                size,
+                angle,
+            },
+            Self::Diamond {
+                center,
+                size,
+                angle,
+            } => Self::Diamond {
+                center: add(center, d),
+                size,
+                angle,
+            },
+            Self::Ellipse {
+                center,
+                radii,
+                angle,
+            } => Self::Ellipse {
+                center: add(center, d),
+                radii,
+                angle,
+            },
+        }
+    }
+
+    /// Whether the shape encloses an area an arrow can bind to.
+    pub fn is_closed(&self) -> bool {
+        matches!(
+            self,
+            Self::Rect { .. } | Self::Diamond { .. } | Self::Ellipse { .. }
+        )
+    }
+
     fn is_finite(&self) -> bool {
         let all = |vs: &[f32]| vs.iter().all(|v| v.is_finite());
         match *self {
             Self::Line { a, b } | Self::Arrow { a, b } => all(&[a[0], a[1], b[0], b[1]]),
             Self::Rect {
+                center,
+                size,
+                angle,
+            }
+            | Self::Diamond {
                 center,
                 size,
                 angle,
@@ -237,6 +313,7 @@ impl Shape {
                 angle,
             } => anchor_ellipse(center, radii, angle, &pen_points(pen_down, pen_now, radii))
                 .unwrap_or(self),
+            Self::Diamond { .. } => self,
         }
     }
 }
@@ -269,34 +346,22 @@ impl Shape {
                 size,
                 angle,
             } => {
-                let (mut lo, mut hi) = (
-                    [-size[0] / 2.0, -size[1] / 2.0],
-                    [size[0] / 2.0, size[1] / 2.0],
-                );
-                let handle = rotate(sub(from, center), -angle);
-                let target = rotate(sub(to, center), -angle);
-                let reach = CORNER_REACH * size[0].min(size[1]);
-                let to_x = [(handle[0] - lo[0]).abs(), (hi[0] - handle[0]).abs()];
-                let to_y = [(handle[1] - lo[1]).abs(), (hi[1] - handle[1]).abs()];
-                let (nearest_x, nearest_y) = (to_x[0].min(to_x[1]), to_y[0].min(to_y[1]));
-                let corner = nearest_x <= reach && nearest_y <= reach;
-                if corner || nearest_x <= nearest_y {
-                    if to_x[0] <= to_x[1] {
-                        lo[0] = target[0].min(hi[0] - 1.0);
-                    } else {
-                        hi[0] = target[0].max(lo[0] + 1.0);
-                    }
-                }
-                if corner || nearest_y < nearest_x {
-                    if to_y[0] <= to_y[1] {
-                        lo[1] = target[1].min(hi[1] - 1.0);
-                    } else {
-                        hi[1] = target[1].max(lo[1] + 1.0);
-                    }
-                }
+                let (center, size) = resize_box(center, size, angle, from, to);
                 Self::Rect {
-                    center: add(center, rotate(mid(lo, hi), angle)),
-                    size: sub(hi, lo),
+                    center,
+                    size,
+                    angle,
+                }
+            }
+            Self::Diamond {
+                center,
+                size,
+                angle,
+            } => {
+                let (center, size) = resize_box(center, size, angle, from, to);
+                Self::Diamond {
+                    center,
+                    size,
                     angle,
                 }
             }
@@ -338,6 +403,38 @@ impl Shape {
             }
         }
     }
+}
+
+/// A rotated box (rect or diamond) with the side under `from` dragged to
+/// `to`, both sides at a corner; the opposite side stays put. Returns the
+/// new center and size.
+fn resize_box(center: P, size: P, angle: f32, from: P, to: P) -> (P, P) {
+    let (mut lo, mut hi) = (
+        [-size[0] / 2.0, -size[1] / 2.0],
+        [size[0] / 2.0, size[1] / 2.0],
+    );
+    let handle = rotate(sub(from, center), -angle);
+    let target = rotate(sub(to, center), -angle);
+    let reach = CORNER_REACH * size[0].min(size[1]);
+    let to_x = [(handle[0] - lo[0]).abs(), (hi[0] - handle[0]).abs()];
+    let to_y = [(handle[1] - lo[1]).abs(), (hi[1] - handle[1]).abs()];
+    let (nearest_x, nearest_y) = (to_x[0].min(to_x[1]), to_y[0].min(to_y[1]));
+    let corner = nearest_x <= reach && nearest_y <= reach;
+    if corner || nearest_x <= nearest_y {
+        if to_x[0] <= to_x[1] {
+            lo[0] = target[0].min(hi[0] - 1.0);
+        } else {
+            hi[0] = target[0].max(lo[0] + 1.0);
+        }
+    }
+    if corner || nearest_y < nearest_x {
+        if to_y[0] <= to_y[1] {
+            lo[1] = target[1].min(hi[1] - 1.0);
+        } else {
+            hi[1] = target[1].max(lo[1] + 1.0);
+        }
+    }
+    (add(center, rotate(mid(lo, hi), angle)), sub(hi, lo))
 }
 
 /// Both pen points, or their midpoint alone when they are close.
@@ -436,9 +533,15 @@ fn anchor_ellipse(center: P, radii: P, angle: f32, pens: &[P]) -> Option<Shape> 
     })
 }
 
-fn rect_corners(center: P, size: P, angle: f32) -> [P; 4] {
+pub(crate) fn rect_corners(center: P, size: P, angle: f32) -> [P; 4] {
     let (hw, hh) = (size[0] / 2.0, size[1] / 2.0);
     [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(|p| add(center, rotate(p, angle)))
+}
+
+/// Top, right, bottom and left corners: the box's edge midpoints.
+pub(crate) fn diamond_corners(center: P, size: P, angle: f32) -> [P; 4] {
+    let (hw, hh) = (size[0] / 2.0, size[1] / 2.0);
+    [[0.0, -hh], [hw, 0.0], [0.0, hh], [-hw, 0.0]].map(|p| add(center, rotate(p, angle)))
 }
 
 /// Ramanujan's approximation.
@@ -1417,11 +1520,11 @@ fn longest_straight_run(ring: &[P]) -> f32 {
 
 // ---- vector helpers ----
 
-fn add(a: P, b: P) -> P {
+pub(crate) fn add(a: P, b: P) -> P {
     [a[0] + b[0], a[1] + b[1]]
 }
 
-fn sub(a: P, b: P) -> P {
+pub(crate) fn sub(a: P, b: P) -> P {
     [a[0] - b[0], a[1] - b[1]]
 }
 
@@ -1429,23 +1532,23 @@ fn neg(a: P) -> P {
     [-a[0], -a[1]]
 }
 
-fn scale(a: P, s: f32) -> P {
+pub(crate) fn scale(a: P, s: f32) -> P {
     [a[0] * s, a[1] * s]
 }
 
-fn dot(a: P, b: P) -> f32 {
+pub(crate) fn dot(a: P, b: P) -> f32 {
     a[0] * b[0] + a[1] * b[1]
 }
 
-fn cross(a: P, b: P) -> f32 {
+pub(crate) fn cross(a: P, b: P) -> f32 {
     a[0] * b[1] - a[1] * b[0]
 }
 
-fn norm(a: P) -> f32 {
+pub(crate) fn norm(a: P) -> f32 {
     a[0].hypot(a[1])
 }
 
-fn dist(a: P, b: P) -> f32 {
+pub(crate) fn dist(a: P, b: P) -> f32 {
     norm(sub(a, b))
 }
 
@@ -1457,7 +1560,7 @@ fn mid(a: P, b: P) -> P {
     lerp(a, b, 0.5)
 }
 
-fn rotate(p: P, angle: f32) -> P {
+pub(crate) fn rotate(p: P, angle: f32) -> P {
     let (s, c) = angle.sin_cos();
     [p[0] * c - p[1] * s, p[0] * s + p[1] * c]
 }
@@ -1952,6 +2055,57 @@ mod tests {
     }
 
     #[test]
+    fn diamonds_outline_bound_resize_and_translate() {
+        let diamond = Shape::Diamond {
+            center: [10.0, 20.0],
+            size: [40.0, 20.0],
+            angle: 0.0,
+        };
+        let out: Vec<P> = diamond.outline().iter().map(|p| [p.x, p.y]).collect();
+        assert_eq!(
+            out,
+            vec![
+                [10.0, 10.0],
+                [30.0, 20.0],
+                [10.0, 30.0],
+                [-10.0, 20.0],
+                [10.0, 10.0]
+            ]
+        );
+        assert_eq!(diamond.bounds(), ([-10.0, 10.0], [30.0, 30.0]));
+        assert!(diamond.is_closed() && diamond.is_finite());
+        // Dragging the right side out keeps the left put, like a rect.
+        assert_eq!(
+            diamond.resized([30.0, 20.0], [50.0, 20.0]),
+            Shape::Diamond {
+                center: [20.0, 20.0],
+                size: [60.0, 20.0],
+                angle: 0.0,
+            }
+        );
+        assert_eq!(
+            diamond.translated([1.0, -2.0]),
+            Shape::Diamond {
+                center: [11.0, 18.0],
+                size: [40.0, 20.0],
+                angle: 0.0,
+            }
+        );
+        let line = Shape::Line {
+            a: [0.0, 0.0],
+            b: [1.0, 1.0],
+        };
+        assert!(!line.is_closed());
+        assert_eq!(
+            line.translated([1.0, 1.0]),
+            Shape::Line {
+                a: [1.0, 1.0],
+                b: [2.0, 2.0],
+            }
+        );
+    }
+
+    #[test]
     fn dragging_after_a_snap_resizes() {
         let line = Shape::Line {
             a: [0.0, 0.0],
@@ -2299,6 +2453,7 @@ mod tests {
                 Some(Shape::Ellipse { .. }) => "ellipse",
                 Some(Shape::Line { .. }) => "line",
                 Some(Shape::Arrow { .. }) => "arrow",
+                Some(Shape::Diamond { .. }) => "diamond",
                 None => "none",
             };
             let want = if name.starts_with("rect") {
@@ -2405,7 +2560,7 @@ mod tests {
                 let expected = match rec.shape {
                     Shape::Line { .. } => 2,
                     Shape::Arrow { .. } => 5,
-                    Shape::Rect { .. } => 5,
+                    Shape::Rect { .. } | Shape::Diamond { .. } => 5,
                     Shape::Ellipse { .. } => out.len(),
                 };
                 prop_assert_eq!(out.len(), expected);

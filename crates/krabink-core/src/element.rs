@@ -57,6 +57,15 @@ pub struct PageElement {
     pub anchor: Anchor,
 }
 
+/// One element's move: `delta` in the space it ends up in, and for page
+/// ink the line it is re-anchored to (`None` keeps its anchor).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ElementMove {
+    pub id: ElementId,
+    pub delta: [f32; 2],
+    pub anchor: Option<Anchor>,
+}
+
 /// One entry of a sketch's z-ordered element list.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Element {

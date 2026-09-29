@@ -278,7 +278,8 @@ wet ink carries the stage-1 points so receivers run the same fold. See
 A note's ink is one z-ordered list of `Element`s (the `page` list, each
 element anchored to the source line it was drawn on by a Loro stable
 cursor): freehand `Stroke`s and `ShapeElement`s (line, arrow, rectangle,
-ellipse, with reserved Excalidraw-style end bindings). Ink and text share
+diamond, ellipse; line and arrow ends bind to closed shapes Excalidraw
+style and follow them when they move). Ink and text share
 one surface: the styled markdown source on the iPad and the desktop, with
 a reading-view toggle that hides the markers and keeps the ink on its
 lines. Holding the Pencil still mid-stroke runs

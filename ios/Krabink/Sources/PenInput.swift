@@ -93,6 +93,9 @@ extension RawSample {
             expectsUpdate: expectsUpdate)
     }
 
+    /// Where the sample is, in content space.
+    var point: CGPoint { CGPoint(x: CGFloat(x), y: CGFloat(y)) }
+
     /// The same sample moved by `-origin`: content space to anchor space.
     func translated(by origin: CGPoint) -> RawSample {
         var out = self

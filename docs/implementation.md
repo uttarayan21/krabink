@@ -398,11 +398,12 @@ UniFFI proc macros (`uniffi::setup_scaffolding!("krabink")`), no UDL.
   `devices_changed`, `sync_state`) and `NoteListener` (`synced`,
   `text_changed`, `page_changed`, `strokes_changed(sketch)`, `wet_begin`
   (inline) / `wet_begin_anchored` (overlay) / `wet_points` / `wet_end` /
-  `wet_cancel`). `page_changed` fires when an import changes the page
-  list's length, `strokes_changed` when a sketch's element-list length
-  moves (`sketch_len` diffed per sketch around the import; a container
-  arriving fires once at length 0, before its first stroke lands).
-  Elements are only ever added or removed whole. `Core` also owns the shared
+  `wet_cancel`). `page_changed` fires when an import touches the page
+  list, `strokes_changed` for each sketch it touches (`NoteDoc::ink_changes_since`
+  diffs the versions around the import and maps each changed container to
+  its root; a container arriving fires once, before its first stroke
+  lands). Elements are moved, reshaped and re-anchored in place, so a
+  length probe would miss changes. `Core` also owns the shared
   brush library (`list_brushes` / `upsert_brush` / `remove_brush`) and
   asset library (`list_assets` / `put_asset` / `remove_asset`) next to
   `builtin_brushes()`, `builtin_assets()` and the `brush_knobs` /

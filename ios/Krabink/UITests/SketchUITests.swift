@@ -102,6 +102,35 @@ final class SketchUITests: XCTestCase {
         XCTAssertTrue(text.contains("ISM points="), text)
     }
 
+    /// Toolbar tools, local only: drag out two rectangles and an arrow
+    /// from one to the other (both ends bind), then select the second
+    /// rectangle and drag it away; the arrow stays bound through the move.
+    func testShapeToolsDrawBindSelectAndMove() {
+        let app = launch()
+        let editor = newNote(app, heading: "Shapes")
+        func pick(_ title: String) {
+            app.buttons["canvasTool"].tap()
+            let item = app.buttons[title]
+            XCTAssertTrue(item.waitForExistence(timeout: 3), "no \(title) in the tool menu")
+            item.tap()
+        }
+        pick("Rectangle")
+        draw(on: editor, from: CGVector(dx: 0.15, dy: 0.35), to: CGVector(dx: 0.3, dy: 0.45))
+        draw(on: editor, from: CGVector(dx: 0.6, dy: 0.35), to: CGVector(dx: 0.75, dy: 0.45))
+        waitStatus(app, contains: "shapes=2", timeout: 5)
+
+        pick("Arrow")
+        draw(on: editor, from: CGVector(dx: 0.22, dy: 0.4), to: CGVector(dx: 0.68, dy: 0.4))
+        waitStatus(app, contains: "shapes=3", timeout: 5)
+        waitStatus(app, contains: "bound=1", timeout: 2)
+
+        pick("Select")
+        draw(on: editor, from: CGVector(dx: 0.7, dy: 0.42), to: CGVector(dx: 0.7, dy: 0.7))
+        waitStatus(app, contains: "sel=1", timeout: 5)
+        waitStatus(app, contains: "shapes=3", timeout: 2)
+        waitStatus(app, contains: "bound=1", timeout: 2)
+    }
+
     func testPhase1CreateNoteAndDraw() {
         let app = launch()
         waitConnected(app)
