@@ -1,0 +1,33 @@
+name: linux
+
+# Release tags only (v0.1.2, …); pushes and PRs don't build.
+on:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # tako, the Linux runner with nix on the host (label `nix`).
+    runs-on: nix
+    steps:
+      - uses: actions/checkout@v4
+
+      # Both packages share the flake's cargoArtifacts, so one `nix build`
+      # compiles the dependencies once. The desktop package's postInstall
+      # runs the binary (shell completions), which doubles as a smoke test.
+      - name: Build
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          nix build -L \
+            '.#packages.x86_64-linux.krabink' \
+            '.#packages.x86_64-linux.krabink-server'
+
+      - name: Check the desktop package
+        run: |
+          ls -l result/bin result-1/bin
+          test -f result/share/applications/krabink.desktop
+          result-1/bin/krabink-server --help > /dev/null
