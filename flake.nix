@@ -205,6 +205,7 @@
                     cargo-hack
                     cargo-outdated
                     lld
+                    taplo
                   ]
                   ++ (lib.optionals pkgs.stdenv.isDarwin [
                     apple-sdk_26
