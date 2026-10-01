@@ -44,12 +44,20 @@ the app actually does.
 
 ## Per release
 
-1. Bump `MARKETING_VERSION` in `ios/Krabink/project.yml` (and
-   `Cargo.toml`), commit.
-2. `KRABINK_EXPORT_DESTINATION=upload scripts/archive-ios.sh`
-   (from Linux; runs on the Mac through `scripts/on-mac.sh`). About 10
-   minutes with a warm cargo cache, 25 cold. Without the env var it exports
-   `ios/Krabink/build-archive/export/Krabink.ipa` instead.
+1. `cargo make bump patch` (or `minor`/`major`): bumps `Cargo.toml` and
+   `MARKETING_VERSION` in both `project.yml` files. Commit, merge.
+2. `cargo make release --tag` (`scripts/release-appstore.sh`): checks the
+   tree is clean and the versions agree, tags `v<version>` at HEAD and
+   pushes it (which also starts the Gitea Linux package build), then
+   archives and uploads the iPad and Mac apps with one shared build
+   number (the commit count). From Linux the builds run on the Mac
+   through `scripts/on-mac.sh`. `--ios`/`--macos` does one platform,
+   `--export` only exports (`ios/Krabink/build-archive/export/Krabink.ipa`),
+   `--clean` runs `cargo clean` afterwards. About 10 minutes per platform
+   with a warm cargo cache, 25+ cold. Per-platform logs land in
+   `$TMPDIR/krabink-release-<version>/`.
+   The underlying scripts still work on their own:
+   `KRABINK_EXPORT_DESTINATION=upload scripts/archive-ios.sh`.
 3. In ASC: attach the build to the version, fill "What's New", submit.
    TestFlight is the same build; add internal testers on the build page.
 

@@ -17,6 +17,9 @@
     },
     "archive-macos": {
       "command": "scripts/archive-macos.sh"
+    },
+    "release-appstore": {
+      "command": "scripts/release-appstore.sh"
     }
   }
 }

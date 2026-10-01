@@ -105,6 +105,11 @@ cargo update --workspace --offline --quiet
 echo "$current -> $next"
 '''
 
+[tasks.release]
+description = "Upload the tagged version to App Store Connect: cargo make release [--ios|--macos] [--tag] [--export] [--clean]"
+command = "scripts/release-appstore.sh"
+args = ["${@}"]
+
 # --- iPad -----------------------------------------------------------------
 
 [tasks.build-ios-core]

@@ -39,10 +39,12 @@ automatic signing, no hand-made certificates or profiles).
 
 ## Per release
 
-1. Bump `MARKETING_VERSION` in `macos/project.yml` (with `Cargo.toml` and
-   the iPad spec), commit.
-2. `scripts/archive-macos.sh` exports
-   `macos/build-archive/export/Krabink.pkg`;
+1. `cargo make bump patch` bumps `macos/project.yml` together with
+   `Cargo.toml` and the iPad spec. Commit, merge.
+2. `cargo make release --tag` uploads both platforms (see
+   `docs/release-ios.md`); `cargo make release --macos` just this one.
+   On its own, `scripts/archive-macos.sh` exports
+   `macos/build-archive/export/Krabink.pkg` and
    `KRABINK_EXPORT_DESTINATION=upload scripts/archive-macos.sh` uploads.
    Cold, both archs, expect 30+ minutes; warm, a few.
 3. The build lands under TestFlight → macOS. Answer export compliance the
