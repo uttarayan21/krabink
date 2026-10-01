@@ -635,7 +635,8 @@ KRABINK_TEST_PAIR='krabink://pair?…' xcodebuild test-without-building ... -onl
 icon ones are `cargo xtask` subcommands (`xtask/`, `cargo xtask --help`).
 
 The iOS tasks need Xcode. Run on Linux, each one hands itself to the Mac
-build machine (`xtask/src/mac.rs`): the worktree is mirrored with
+build machine (`xtask/src/mac.rs`; xtask itself compiles first, so run
+from the devShell: direnv or `nix develop`): the worktree is mirrored with
 rsync to `~/Porject/krabink-<worktree>` on `shiro` (one folder per
 worktree, `KRABINK_MAC_HOST` / `KRABINK_MAC_DIR` override) and the script
 runs there over ssh. Build artefacts stay on the Mac between runs. Device
