@@ -187,7 +187,7 @@ fn xcodebuild_archive(
     args: &ArchiveArgs,
     build: u64,
 ) -> Result<()> {
-    Cmd::new("xcodebuild")
+    Cmd::xcodebuild()
         .arg("-project")
         .arg(project)
         .args(["-scheme", "Krabink", "-configuration", "Release"])

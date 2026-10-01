@@ -209,7 +209,7 @@ impl ExportOptions<'_> {
 /// `xcodebuild -exportArchive` into a fresh `export_dir`.
 pub fn export(archive: &Path, options: &Path, export_dir: &Path, auth: &AscAuth) -> Result<()> {
     remove_dir(export_dir)?;
-    Cmd::new("xcodebuild")
+    Cmd::xcodebuild()
         .arg("-exportArchive")
         .arg("-archivePath")
         .arg(archive)

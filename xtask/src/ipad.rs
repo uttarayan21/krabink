@@ -42,7 +42,7 @@ pub fn check(repo: &Repo, args: &CheckArgs) -> Result<()> {
     tracing::info!("==> building for simulator");
     // ARCHS=arm64: the generic simulator destination also wants x86_64, and
     // the KrabinkCore xcframework only carries an arm64 simulator slice.
-    let mut child = Cmd::new("xcodebuild")
+    let mut child = Cmd::xcodebuild()
         .arg("-project")
         .arg(repo.path(IOS_APP_DIR).join("Krabink.xcodeproj"))
         .args(["-scheme", "Krabink", "-configuration", &args.configuration])
@@ -110,7 +110,7 @@ pub fn deploy(repo: &Repo, args: &DeployArgs) -> Result<()> {
     unlock_keychains()?;
 
     tracing::info!("==> building for device");
-    Cmd::new("xcodebuild")
+    Cmd::xcodebuild()
         .arg("-project")
         .arg(app_dir.join("Krabink.xcodeproj"))
         .args(["-scheme", "Krabink", "-configuration", "Debug"])
@@ -129,7 +129,7 @@ pub fn deploy(repo: &Repo, args: &DeployArgs) -> Result<()> {
     }
 
     tracing::info!("==> installing");
-    retry(|| {
+    retry("install", || {
         Cmd::xcrun()
             .args(["devicectl", "device", "install", "app", "--device", &device])
             .arg(&app)
@@ -137,7 +137,7 @@ pub fn deploy(repo: &Repo, args: &DeployArgs) -> Result<()> {
     })?;
 
     tracing::info!("==> launching {BUNDLE_ID}");
-    retry(|| {
+    retry("launch", || {
         Cmd::xcrun()
             .args([
                 "devicectl",
@@ -156,7 +156,7 @@ pub fn deploy(repo: &Repo, args: &DeployArgs) -> Result<()> {
 
 /// devicectl is flaky right after a reconnect (NWError 60, launch
 /// 10002/4000); a short wait and retry succeeds.
-fn retry(mut attempt: impl FnMut() -> Result<bool>) -> Result<()> {
+fn retry(what: &'static str, mut attempt: impl FnMut() -> Result<bool>) -> Result<()> {
     for n in 1..=3 {
         if attempt()? {
             return Ok(());
@@ -167,7 +167,7 @@ fn retry(mut attempt: impl FnMut() -> Result<bool>) -> Result<()> {
     if attempt()? {
         Ok(())
     } else {
-        Err(Error::Device.into())
+        Err(Error::DeviceCtl(what).into())
     }
 }
 

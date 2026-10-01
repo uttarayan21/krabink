@@ -25,8 +25,8 @@ pub enum Error {
     Check,
     #[error("{0} not found")]
     Missing(PathBuf),
-    #[error("no iPad found")]
-    Device,
+    #[error("`devicectl` {0} failed after retries")]
+    DeviceCtl(&'static str),
     #[error("icon rendering failed")]
     Icon,
     #[error("no display: log in graphically first")]

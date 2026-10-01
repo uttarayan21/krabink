@@ -8,6 +8,28 @@ use std::process::{Command, Stdio};
 
 use crate::error::{Error, Report, Result, ResultExt};
 
+/// What a nix devShell exports for its cc-wrapper, as build settings
+/// xcodebuild would pick up (each also as `<NAME>_FOR_BUILD`).
+const NIX_TOOLCHAIN_VARS: [&str; 17] = [
+    "AR",
+    "AS",
+    "CC",
+    "CXX",
+    "LD",
+    "NM",
+    "OBJCOPY",
+    "OBJDUMP",
+    "RANLIB",
+    "SIZE",
+    "STRINGS",
+    "STRIP",
+    "SDKROOT",
+    "DEVELOPER_DIR",
+    "MACOSX_DEPLOYMENT_TARGET",
+    "LD_DYLD_PATH",
+    "CONFIG_SHELL",
+];
+
 pub struct Cmd {
     inner: Command,
     display: Vec<String>,
@@ -31,8 +53,34 @@ impl Cmd {
         Self::new("git")
     }
 
+    /// Apple's `xcrun`, with the nix devShell's toolchain overrides
+    /// scrubbed. By absolute path: a nix devShell puts its own `xcrun`
+    /// shim first on PATH, which knows nothing of devicectl or the iOS SDKs.
     pub fn xcrun() -> Self {
-        Self::new("xcrun")
+        Self::new("/usr/bin/xcrun").without_nix_toolchain()
+    }
+
+    /// Apple's `xcodebuild`, with the nix devShell's toolchain overrides
+    /// scrubbed.
+    pub fn xcodebuild() -> Self {
+        Self::new("/usr/bin/xcodebuild").without_nix_toolchain()
+    }
+
+    /// Drop the toolchain variables a nix devShell (direnv, `nix develop`)
+    /// exports. xcodebuild turns environment variables into build settings,
+    /// so nix's `LD`, `CC`, `SDKROOT`, `DEVELOPER_DIR`, … would make Xcode
+    /// drive nix's wrappers with Apple flags ("ld: unknown options:
+    /// -Xlinker -isysroot …"), and xcrun would resolve into the nix SDK.
+    pub fn without_nix_toolchain(mut self) -> Self {
+        let scrubbed = std::env::vars_os().filter(|(key, _)| {
+            let key = key.to_string_lossy();
+            let base = key.strip_suffix("_FOR_BUILD").unwrap_or(&key);
+            key.starts_with("NIX_") || NIX_TOOLCHAIN_VARS.contains(&base)
+        });
+        for (key, _) in scrubbed {
+            self.inner.env_remove(key);
+        }
+        self
     }
 
     pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
@@ -165,10 +213,12 @@ impl Cmd {
     /// Replace this process with the command (the last step of a task that
     /// just launches something, so signals go straight to it).
     #[cfg(unix)]
-    pub fn exec(mut self) -> Result<std::convert::Infallible> {
+    pub fn exec(mut self) -> Result<()> {
         use std::os::unix::process::CommandExt;
         tracing::debug!("$ {}", self.describe());
-        Err(Report::new(self.inner.exec()).change_context(Error::Spawn(self.program())))
+        // `exec` only returns when it failed to replace the process.
+        let err = self.inner.exec();
+        Err(Report::new(err).change_context(Error::Spawn(self.program())))
     }
 
     pub fn into_inner(self) -> Command {

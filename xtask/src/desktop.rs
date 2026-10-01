@@ -51,8 +51,7 @@ pub fn run(repo: &Repo, args: &RunArgs) -> Result<()> {
     let cmd = cmd.args(&args.args).envs(env).current_dir(repo.root());
     #[cfg(unix)]
     {
-        cmd.exec()?;
-        Ok(())
+        cmd.exec()
     }
     #[cfg(not(unix))]
     {

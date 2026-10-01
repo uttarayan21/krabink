@@ -121,7 +121,7 @@ pub fn build_local(repo: &Repo) -> Result<()> {
 
     let xcframework = out.join("KrabinkCoreFFI.xcframework");
     remove_dir(&xcframework)?;
-    Cmd::new("xcodebuild")
+    Cmd::xcodebuild()
         .arg("-create-xcframework")
         .args(TARGETS.iter().flat_map(|target| {
             [
