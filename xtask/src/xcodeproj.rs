@@ -1,4 +1,4 @@
-//! `gen-xcodeproj`: (re)generate ios/Krabink/Krabink.xcodeproj from
+//! `gen xcodeproj`: (re)generate ios/Krabink/Krabink.xcodeproj from
 //! project.yml when it is missing, older than the spec, or the set of source
 //! files changed (xcodegen lists every file explicitly, so a new .swift file
 //! needs a regenerate). macOS only; the iPad tasks call this.
@@ -11,7 +11,7 @@ use crate::repo::{IOS_APP_DIR, Repo};
 
 pub fn generate(repo: &Repo) -> Result<()> {
     if !cfg!(target_os = "macos") {
-        return Err(Error::MacOnly("gen-xcodeproj").into());
+        return Err(Error::MacOnly("gen xcodeproj").into());
     }
     let app_dir = repo.path(IOS_APP_DIR);
     let project = app_dir.join("Krabink.xcodeproj/project.pbxproj");

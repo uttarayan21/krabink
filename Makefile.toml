@@ -17,7 +17,7 @@ alias = "check"
 [tasks.run]
 description = "Run the desktop app (release build)"
 command = "cargo"
-args = ["xtask", "run", "${@}"]
+args = ["xtask", "run", "desktop", "${@}"]
 
 [tasks.server]
 description = "Run the relay + replica in dev mode"
@@ -69,7 +69,7 @@ command = "cargo"
 args = ["xtask", "bump", "${@}"]
 
 [tasks.release]
-description = "Upload the tagged version to App Store Connect: cargo make release [--ios|--macos] [--tag] [--export] [--clean]"
+description = "Upload the tagged version to App Store Connect: cargo make release [--ios|--mac] [--tag] [--export] [--clean]"
 command = "cargo"
 args = ["xtask", "release", "${@}"]
 
@@ -78,58 +78,58 @@ args = ["xtask", "release", "${@}"]
 [tasks.build-ios-core]
 description = "Build the KrabinkCore XCFramework and Swift bindings"
 command = "cargo"
-args = ["xtask", "build-ios-core"]
+args = ["xtask", "build", "core"]
 
 [tasks.swift-smoke]
 description = "Compile and run the Swift bindings smoke test"
 command = "cargo"
-args = ["xtask", "swift-smoke"]
+args = ["xtask", "test", "swift"]
 
 [tasks.gen-xcodeproj]
 description = "Regenerate Krabink.xcodeproj from project.yml"
 command = "cargo"
-args = ["xtask", "gen-xcodeproj"]
+args = ["xtask", "gen", "xcodeproj"]
 
 [tasks.check-ipad]
 description = "Compile the iPad app for the simulator"
 command = "cargo"
-args = ["xtask", "check-ipad", "${@}"]
+args = ["xtask", "check", "ios", "${@}"]
 
 [tasks.run-ipad]
 description = "Build, install and launch on a connected iPad"
 command = "cargo"
-args = ["xtask", "run-ipad", "${@}"]
+args = ["xtask", "run", "ios", "${@}"]
 
 [tasks.archive-ios]
 description = "Archive and export the iPad app for App Store Connect"
 command = "cargo"
-args = ["xtask", "archive-ios", "${@}"]
+args = ["xtask", "archive", "ios", "${@}"]
 
 [tasks.upload-ios]
 description = "Archive the iPad app and upload it to App Store Connect"
 command = "cargo"
-args = ["xtask", "archive-ios", "--destination", "upload", "${@}"]
+args = ["xtask", "archive", "ios", "--destination", "upload", "${@}"]
 
 # --- macOS ----------------------------------------------------------------
 
 [tasks.archive-macos]
 description = "Archive and export the Mac App Store .pkg"
 command = "cargo"
-args = ["xtask", "archive-macos", "${@}"]
+args = ["xtask", "archive", "mac", "${@}"]
 
 [tasks.upload-macos]
 description = "Archive the Mac app and upload it to App Store Connect"
 command = "cargo"
-args = ["xtask", "archive-macos", "--destination", "upload", "${@}"]
+args = ["xtask", "archive", "mac", "--destination", "upload", "${@}"]
 
 # --- Icons ----------------------------------------------------------------
 
 [tasks.gen-app-icon]
 description = "Render the 1024px App Store icon"
 command = "cargo"
-args = ["xtask", "gen-app-icon", "${@}"]
+args = ["xtask", "gen", "icon", "ios", "${@}"]
 
 [tasks.gen-mac-icon]
 description = "Render the Mac icon set from the iPad icon"
 command = "cargo"
-args = ["xtask", "gen-mac-icon"]
+args = ["xtask", "gen", "icon", "mac"]

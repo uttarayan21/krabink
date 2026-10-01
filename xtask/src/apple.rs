@@ -113,7 +113,7 @@ impl AscAuth {
     }
 }
 
-/// Options shared by `archive-ios` and `archive-macos`.
+/// Options shared by `archive ios` and `archive mac`.
 #[derive(Debug, Clone, clap::Args)]
 pub struct ArchiveArgs {
     /// DEVELOPMENT_TEAM for automatic signing (needs a paid Apple Developer

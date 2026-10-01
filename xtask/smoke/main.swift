@@ -1,4 +1,4 @@
-// Swift smoke test for the krabink-ffi bindings (run via `cargo xtask swift-smoke`).
+// Swift smoke test for the krabink-ffi bindings (run via `cargo xtask test swift`).
 // Exercises the full local surface: create note, edit text, commit a stroke,
 // then reopen the store in a fresh Core and verify everything persisted.
 

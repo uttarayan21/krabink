@@ -1,7 +1,7 @@
 // swift-tools-version:5.9
 // Local SPM package wrapping the Rust core. `KrabinkCoreFFI.xcframework` and
 // `Sources/KrabinkCore/Krabink.swift` are generated — run
-// `cargo xtask build-ios-core` (macOS) before building the app.
+// `cargo xtask build core` (macOS) before building the app.
 import PackageDescription
 
 let package = Package(

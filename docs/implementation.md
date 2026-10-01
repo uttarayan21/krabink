@@ -34,10 +34,10 @@ crates/krabink-local    sync node library (iroh endpoint, hub, lanes, mDNS); com
 crates/krabink-server   `krabink-server` binary: iroh relay + replica node
 crates/krabink          desktop binary (Bevy) running a node, `pair` and `replay` subcommands
 crates/krabink-ffi      UniFFI surface for Swift, `uniffi-bindgen` bin behind the `bindgen` feature
-ios/KrabinkCore         SPM package: generated XCFramework + Krabink.swift (outputs of `cargo xtask build-ios-core`)
+ios/KrabinkCore         SPM package: generated XCFramework + Krabink.swift (outputs of `cargo xtask build core`)
 ios/Krabink             XcodeGen spec (project.yml), Sources/, UITests/
-xtask/                  cargo xtask: build-ios-core (cargo rustc for aarch64-apple-ios{,-sim} → bindgen →
-                        xcodebuild -create-xcframework), swift-smoke (host cdylib + bindgen +
+xtask/                  cargo xtask: build core (cargo rustc for aarch64-apple-ios{,-sim} → bindgen →
+                        xcodebuild -create-xcframework), test swift (host cdylib + bindgen +
                         xtask/smoke/main.swift, run on macOS), iPad/Mac archives, release, icons, bump
 docs/architecture.md    sync topology, wire, pairing, fan-out, cloud deployment, failure modes
 docs/plans/             ink-renderer (done), shape-recognizer (done), brush-engine (P0–P2 done, P3–P4 planned)
@@ -434,10 +434,10 @@ UniFFI proc macros (`uniffi::setup_scaffolding!("krabink")`), no UDL.
   `--expect-page-elements N`, `--add-sketch-stroke EMBED` (nth embed in
   text order), `--expect-sketch-elements N`, `--wet-watch`, `--devices`.
 
-Build: `cargo xtask build-ios-core` builds `staticlib` for
+Build: `cargo xtask build core` builds `staticlib` for
 `aarch64-apple-ios` and `aarch64-apple-ios-sim`, runs library-mode bindgen
 off the device archive, assembles `ios/KrabinkCore/KrabinkCoreFFI.xcframework`
-and copies `Krabink.swift`. `cargo xtask swift-smoke` compiles
+and copies `Krabink.swift`. `cargo xtask test swift` compiles
 `xtask/smoke/main.swift` against the host cdylib as a fast bindings check.
 
 ## 7. iPad app (`ios/Krabink`)
@@ -617,11 +617,11 @@ cargo run -p krabink                         # desktop node (LAN only without --
 cargo run -p krabink-server -- --dev         # relay + replica on 127.0.0.1:3340, prints a pair URI
 cargo run -p krabink -- --data-dir /tmp/b pair '<uri>'   # second desktop joins
 
-cargo xtask build-ios-core                   # xcframework + Krabink.swift
-cargo xtask swift-smoke                      # bindings smoke
-cargo xtask check-ipad                       # simulator compile, no signing
-cargo xtask run-ipad                         # device build + install + launch (paseo: run-ipad)
-cargo xtask gen-xcodeproj                    # regenerate Krabink.xcodeproj from project.yml
+cargo xtask build core                   # xcframework + Krabink.swift
+cargo xtask test swift                      # bindings smoke
+cargo xtask check ios                       # simulator compile, no signing
+cargo xtask run ios                         # device build + install + launch (paseo: run-ipad)
+cargo xtask gen xcodeproj                    # regenerate Krabink.xcodeproj from project.yml
 xcodebuild -project Krabink.xcodeproj -scheme Krabink -destination 'platform=iOS Simulator,id=<udid>' build-for-testing
 KRABINK_TEST_PAIR='krabink://pair?…' xcodebuild test-without-building ... -only-testing:KrabinkUITests/SketchUITests
 ```

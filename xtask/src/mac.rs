@@ -8,7 +8,7 @@
 //!                     Porject/krabink when the checkout is named krabink)
 //!
 //! The KRABINK_* task variables are forwarded, so `KRABINK_TEAM=… cargo
-//! xtask archive-ios` behaves the same from either side.
+//! xtask archive ios` behaves the same from either side.
 
 use std::io::IsTerminal;
 

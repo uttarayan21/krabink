@@ -1,4 +1,4 @@
-//! `swift-smoke`: build the host cdylib, generate Swift bindings, compile
+//! `test swift`: build the host cdylib, generate Swift bindings, compile
 //! xtask/smoke/main.swift against them and run it. Needs swiftc, so on
 //! Linux it runs on the Mac.
 

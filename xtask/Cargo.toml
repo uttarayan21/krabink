@@ -12,7 +12,7 @@ error-stack.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-# App icon rendering (gen-app-icon) and the Mac icon set (gen-mac-icon).
+# App icon rendering (gen icon ios) and the Mac icon set (gen icon mac).
 png = "0.18"
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde_json = "1"

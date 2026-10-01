@@ -1,4 +1,4 @@
-//! `check-ipad` (simulator compile, no signing) and `run-ipad` (device
+//! `check ios` (simulator compile, no signing) and `run ios` (device
 //! build + install + launch). Both need Xcode, so from Linux they run on
 //! the Mac.
 

@@ -1,4 +1,4 @@
-//! `archive-ios` and `archive-macos`: Release archives for App Store
+//! `archive ios` and `archive mac`: Release archives for App Store
 //! Connect / TestFlight, exported to disk or uploaded straight away. On
 //! Linux the builds run on the Mac; the build number is taken from git here
 //! first, because the Mac mirror only has a throwaway repo.
@@ -96,7 +96,7 @@ pub fn macos_local(repo: &Repo, args: &ArchiveArgs, build: u64) -> Result<()> {
     let options = derived.join("ExportOptions.plist");
     let universal = repo.path("target/universal-apple-darwin/release");
 
-    // Apple's clang for both mac targets, like build-ios-core does for iOS:
+    // Apple's clang for both mac targets, like `build core` does for iOS:
     // the nix devshell's cc-wrapper only links for the host arch.
     let sdk = crate::apple::sdk_path("macosx")?;
     let clang = crate::apple::find(Some("macosx"), "clang")?;

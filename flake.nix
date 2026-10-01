@@ -46,7 +46,7 @@
 
         # Mac only: iOS cross targets for krabink-ffi staticlib builds, and
         # both mac archs for the universal Mac App Store binary
-        # (cargo xtask archive-macos).
+        # (cargo xtask archive mac).
         iosTargets = lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
           "aarch64-apple-ios"
           "aarch64-apple-ios-sim"

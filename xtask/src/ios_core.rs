@@ -1,4 +1,4 @@
-//! `build-ios-core`: the KrabinkCore XCFramework + generated Swift bindings
+//! `build core`: the KrabinkCore XCFramework + generated Swift bindings
 //! for the iOS app. Needs xcodebuild, so on Linux it runs on the Mac. The
 //! rust toolchain there needs the aarch64-apple-ios{,-sim} targets (rustup
 //! or `nix develop`).

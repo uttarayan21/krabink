@@ -1,22 +1,22 @@
 {
   "scripts": {
     "run-ipad": {
-      "command": "cargo xtask run-ipad"
+      "command": "cargo xtask run ios"
     },
     "check-ipad": {
-      "command": "cargo xtask check-ipad"
+      "command": "cargo xtask check ios"
     },
     "build-ios-core": {
-      "command": "cargo xtask build-ios-core"
+      "command": "cargo xtask build core"
     },
     "archive-ios": {
-      "command": "cargo xtask archive-ios"
+      "command": "cargo xtask archive ios"
     },
     "run-desktop": {
-      "command": "cargo xtask run"
+      "command": "cargo xtask run desktop"
     },
     "archive-macos": {
-      "command": "cargo xtask archive-macos"
+      "command": "cargo xtask archive mac"
     },
     "release-appstore": {
       "command": "cargo xtask release"

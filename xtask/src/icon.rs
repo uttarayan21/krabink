@@ -1,4 +1,4 @@
-//! `gen-app-icon`: the App Store icon (1024×1024, opaque RGB PNG) for the
+//! `gen icon ios`: the App Store icon (1024×1024, opaque RGB PNG) for the
 //! iPad app, mirroring `LogoMark` in ios/Krabink/Sources/Theme.swift: the
 //! indigo accent gradient with a white pencil tip. Committed at
 //! ios/Krabink/Assets.xcassets/AppIcon.appiconset/AppIcon.png; only needs
@@ -6,7 +6,7 @@
 //! Store Connect rejects icons with an alpha channel, so the gradient runs
 //! edge to edge with no transparency.
 //!
-//! `gen-mac-icon`: every Mac size scaled from that PNG into
+//! `gen icon mac`: every Mac size scaled from that PNG into
 //! macos/Assets.xcassets/AppIcon.appiconset, with the asset catalog JSON.
 
 use std::io::BufWriter;

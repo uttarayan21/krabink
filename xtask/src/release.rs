@@ -11,11 +11,11 @@ use crate::{archive, mac};
 #[derive(Debug, Clone, clap::Args)]
 pub struct ReleaseArgs {
     /// iPad only.
-    #[arg(long, conflicts_with = "macos")]
+    #[arg(long, conflicts_with = "mac")]
     pub ios: bool,
     /// Mac only.
     #[arg(long)]
-    pub macos: bool,
+    pub mac: bool,
     /// Archive and export, no upload.
     #[arg(long)]
     pub export: bool,
@@ -47,7 +47,7 @@ impl ReleaseArgs {
     }
 
     fn platforms(&self) -> (bool, bool) {
-        match (self.ios, self.macos) {
+        match (self.ios, self.mac) {
             (true, false) => (true, false),
             (false, true) => (false, true),
             _ => (true, true),
