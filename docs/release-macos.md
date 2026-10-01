@@ -17,10 +17,10 @@ automatic signing, no hand-made certificates or profiles).
 
 | Piece | Where | Notes |
 |---|---|---|
-| Universal binary | `scripts/archive-macos.sh` | `cargo build --release` for `aarch64-apple-darwin` and `x86_64-apple-darwin`, `lipo`'d into `target/universal-apple-darwin/release/krabink`. The store rejects arm64-only native Mac apps. Linked with Apple's clang, `MACOSX_DEPLOYMENT_TARGET=12.0`. |
+| Universal binary | `cargo xtask archive-macos` | `cargo build --release` for `aarch64-apple-darwin` and `x86_64-apple-darwin`, `lipo`'d into `target/universal-apple-darwin/release/krabink`. The store rejects arm64-only native Mac apps. Linked with Apple's clang, `MACOSX_DEPLOYMENT_TARGET=12.0`. |
 | App target | `macos/project.yml` | Info.plist (category, min macOS 12, local-network string + `_krabink._udp` Bonjour type), hardened runtime. `Krabink.xcodeproj`, `Info.plist` and `Krabink.entitlements` are generated and ignored. |
 | Sandbox | `macos/project.yml` → `entitlements` | `app-sandbox`, `network.client`, `network.server`. Nothing else: no file dialogs, no camera, no subprocesses. |
-| Icon | `macos/Assets.xcassets` | Every mac size scaled from the iPad icon by `scripts/gen-mac-icon.sh`. |
+| Icon | `macos/Assets.xcassets` | Every mac size scaled from the iPad icon by `cargo xtask gen-mac-icon`. |
 | Privacy manifest | `ios/Krabink/PrivacyInfo.xcprivacy` | Shared with the iPad app. |
 | Launch args | `crates/krabink/src/main.rs` | `-psn_…` from LaunchServices is dropped before clap parses. |
 
@@ -39,13 +39,13 @@ automatic signing, no hand-made certificates or profiles).
 
 ## Per release
 
-1. `cargo make bump patch` bumps `macos/project.yml` together with
+1. `cargo xtask bump patch` bumps `macos/project.yml` together with
    `Cargo.toml` and the iPad spec. Commit, merge.
-2. `cargo make release --tag` uploads both platforms (see
-   `docs/release-ios.md`); `cargo make release --macos` just this one.
-   On its own, `scripts/archive-macos.sh` exports
+2. `cargo xtask release --tag` uploads both platforms (see
+   `docs/release-ios.md`); `cargo xtask release --macos` just this one.
+   On its own, `cargo xtask archive-macos` exports
    `macos/build-archive/export/Krabink.pkg` and
-   `KRABINK_EXPORT_DESTINATION=upload scripts/archive-macos.sh` uploads.
+   `cargo xtask archive-macos --destination upload` uploads.
    Cold, both archs, expect 30+ minutes; warm, a few.
 3. The build lands under TestFlight → macOS. Answer export compliance the
    same way as for iPad.

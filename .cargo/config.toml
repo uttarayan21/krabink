@@ -1,0 +1,3 @@
+[alias]
+# Repository tasks: `cargo xtask --help` (xtask/).
+xtask = "run -q -p xtask --"

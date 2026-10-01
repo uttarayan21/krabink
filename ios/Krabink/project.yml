@@ -1,6 +1,6 @@
 # XcodeGen spec for the iPad app. Generate the project with:
 #   nix run nixpkgs#xcodegen   (in this directory)
-# Requires ios/KrabinkCore to be built first (scripts/build-ios-core.sh).
+# Requires ios/KrabinkCore to be built first (cargo xtask build-ios-core).
 name: Krabink
 options:
   bundleIdPrefix: dev.darksailor
@@ -15,7 +15,7 @@ targets:
     platform: iOS
     sources:
       - Sources
-      # App icon (1024 PNG, rendered by scripts/gen-app-icon.py).
+      # App icon (1024 PNG, rendered by cargo xtask gen-app-icon).
       - Assets.xcassets
       # Privacy manifest: required-reason APIs, no tracking, no collection.
       - path: PrivacyInfo.xcprivacy
@@ -89,7 +89,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: dev.darksailor.krabink
         # Store version. Bump with the workspace version in Cargo.toml.
         # The build number (CFBundleVersion) is the commit count;
-        # scripts/archive-ios.sh overrides CURRENT_PROJECT_VERSION.
+        # `cargo xtask archive-ios` overrides CURRENT_PROJECT_VERSION.
         MARKETING_VERSION: "0.1.2"
         CURRENT_PROJECT_VERSION: 1
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
