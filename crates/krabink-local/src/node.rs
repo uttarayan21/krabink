@@ -91,6 +91,8 @@ struct Inner {
     relay: Mutex<Option<RelayTarget>>,
     targets: Mutex<Vec<PeerTarget>>,
     net: tokio::sync::Mutex<Option<Net>>,
+    /// A close that outlived [`CLOSE_TIMEOUT`], still finishing.
+    closing: Mutex<Option<JoinHandle<()>>>,
     relay_health: watch::Sender<RelayHealth>,
     maintenance: JoinHandle<()>,
 }
@@ -107,7 +109,14 @@ impl Node {
     pub async fn start(cfg: NodeConfig) -> Result<Self> {
         let secret = crate::identity::load_or_create_secret_key(&cfg.key_path)?;
         let endpoint = bind_endpoint(&secret, cfg.relay.clone(), cfg.bind_port).await?;
-        let store = Store::open(&cfg.store_path)?;
+        let store = match Store::open(&cfg.store_path) {
+            Ok(store) => store,
+            Err(err) => {
+                // Dropping an open endpoint aborts it ungracefully.
+                endpoint.close().await;
+                return Err(err.into());
+            }
+        };
         let hub = Hub::new(cfg.device, ServerDocs::new(store), cfg.tokens);
         let maintenance = tokio::spawn(maintenance(hub.clone()));
         let relay_health = watch::Sender::new(RelayHealth {
@@ -122,6 +131,7 @@ impl Node {
             relay: Mutex::new(cfg.relay),
             targets: Mutex::new(Vec::new()),
             net: tokio::sync::Mutex::new(None),
+            closing: Mutex::new(None),
             relay_health,
             maintenance,
         }));
@@ -281,11 +291,16 @@ impl Node {
         }
         net.accept.abort();
         net.relay_watch.abort();
-        if tokio::time::timeout(CLOSE_TIMEOUT, net.endpoint.close())
+        // The close runs as its own task: cancelling it half-way leaves
+        // the endpoint to abort ungracefully when dropped.
+        let endpoint = net.endpoint;
+        let mut close = tokio::spawn(async move { endpoint.close().await });
+        if tokio::time::timeout(CLOSE_TIMEOUT, &mut close)
             .await
             .is_err()
         {
-            tracing::warn!("endpoint close timed out");
+            tracing::warn!("endpoint close timed out; finishing in the background");
+            *self.0.closing.lock().expect("closing poisoned") = Some(close);
         }
         // Dial loops are aborted: drop their registry rows ourselves.
         let stale: Vec<u64> = {
@@ -309,6 +324,11 @@ impl Node {
     pub async fn resume(&self) -> Result<()> {
         if self.0.net.lock().await.is_some() {
             return Ok(());
+        }
+        // A close still in flight holds the old socket (and a pinned port).
+        let closing = self.0.closing.lock().expect("closing poisoned").take();
+        if let Some(close) = closing {
+            let _ = close.await;
         }
         let endpoint = bind_endpoint(&self.0.secret, self.relay(), self.0.bind_port).await?;
         self.attach(endpoint).await;
