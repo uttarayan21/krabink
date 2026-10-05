@@ -32,9 +32,10 @@ use crate::sync::{SyncPlugin, SyncTransport};
 use crate::ui::EditorUiPlugin;
 
 /// The tokio runtime behind the sync node. Lives as a resource so systems
-/// can drive the node's async calls.
+/// can drive the node's async calls; shared so `main` can still shut the
+/// node down once the app (and its world) is gone.
 #[derive(Resource)]
-pub struct Runtime(pub tokio::runtime::Runtime);
+pub struct Runtime(pub std::sync::Arc<tokio::runtime::Runtime>);
 
 fn main() -> Result<()> {
     // Finder/LaunchServices can still pass a `-psn_<n>_<n>` process serial
@@ -99,6 +100,7 @@ fn run_app(args: cli::Cli) -> Result<()> {
         .build()
         .change_context(Error)
         .attach("tokio runtime")?;
+    let runtime = std::sync::Arc::new(runtime);
 
     // The node accepts our own token plus the adopted workspace's, so one
     // QR opens every path. The UDP port is the one from the last run when
@@ -154,7 +156,7 @@ fn run_app(args: cli::Cli) -> Result<()> {
         addrs,
         replica: config.replica.map(|id| id.to_string()),
     };
-    let sync_node = SyncNode::new(node, &runtime);
+    let sync_node = SyncNode::new(node.clone(), &runtime);
     let theme = theme::Theme::new(config.theme, config.paper);
 
     let mut app = App::new();
@@ -185,7 +187,7 @@ fn run_app(args: cli::Cli) -> Result<()> {
     .insert_resource(theme.clear_color())
     .insert_resource(theme)
     .insert_resource(theme::ThemeSync::new(config.sync_theme))
-    .insert_resource(Runtime(runtime))
+    .insert_resource(Runtime(runtime.clone()))
     .insert_resource(sync_node)
     .insert_resource(transport)
     .insert_resource(settings::Settings::new(
@@ -195,6 +197,11 @@ fn run_app(args: cli::Cli) -> Result<()> {
     .insert_resource(crate::ui::FollowLatest(args.follow_latest))
     .add_systems(Startup, setup)
     .run();
+    // Final checkpoint and endpoint close; the endpoint must not be
+    // dropped open.
+    if let Err(err) = runtime.block_on(node.shutdown()) {
+        tracing::warn!(%err, "node shutdown failed");
+    }
     Ok(())
 }
 

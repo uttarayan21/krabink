@@ -109,6 +109,22 @@ async fn replay(args: ReplayArgs) -> Result<()> {
     .attach("starting node")?;
     node.set_peers(peers).await;
 
+    // Shut the node down on failure too: dropping its endpoint open aborts
+    // it ungracefully.
+    let result = drive(&node, &args, &info, &target, device).await;
+    let shutdown = node.shutdown().await.change_context(Error);
+    let _ = std::fs::remove_dir_all(&dir);
+    result.and(shutdown)
+}
+
+/// The replay proper, against a started node.
+async fn drive(
+    node: &Node,
+    args: &ReplayArgs,
+    info: &PairInfo,
+    target: &PeerTarget,
+    device: DeviceId,
+) -> Result<()> {
     let mut link = node.local_link();
     let mut docs = MemDocs {
         workspace: WorkspaceDoc::new(),
@@ -200,8 +216,6 @@ async fn replay(args: ReplayArgs) -> Result<()> {
     writeln!(std::io::stdout(), "replayed {} strokes", args.strokes).change_context(Error)?;
     // Give the last commit a moment to leave before tearing down.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    node.shutdown().await.change_context(Error)?;
-    let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
 
