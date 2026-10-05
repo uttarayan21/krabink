@@ -188,8 +188,9 @@ final class SketchUITests: XCTestCase {
     }
 
     /// Where only the Pencil draws (`-anyInput 0`, the device's policy)
-    /// a finger that lands on ink switches to the select tool: a tap
-    /// selects at once and a drag moves the shape instead of scrolling.
+    /// a finger that lands on ink selects under any tool, which stays the
+    /// Pencil's: a tap selects at once and a drag moves the shape instead
+    /// of scrolling.
     func testFingerSelectsAndDragsWhenOnlyThePencilDraws() {
         func pick(_ app: XCUIApplication, _ title: String) {
             app.buttons["canvasTool"].tap()
@@ -225,12 +226,12 @@ final class SketchUITests: XCTestCase {
         waitStatus(app, contains: "sel=1", timeout: 5)
 
         // Dragged away, the shape is under the finger's new place: after
-        // the tool is re-picked (which deselects) a tap there finds it.
+        // another tool is picked (which deselects) a tap there finds it,
+        // still without the select tool.
         at(0.7, 0.42).press(
             forDuration: 0.1, thenDragTo: at(0.4, 0.6), withVelocity: .slow,
             thenHoldForDuration: 0.1)
         pick(app, "Rectangle")
-        pick(app, "Select")
         waitStatus(app, contains: "sel=0", timeout: 5)
         at(0.4, 0.6).tap()
         waitStatus(app, contains: "sel=1", timeout: 5)

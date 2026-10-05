@@ -15,9 +15,9 @@
 // Under either policy a finger the canvas claims (`claimsFinger`: over an
 // element or a handle of the selection, for the select tool) is pen input
 // the moment it lands, so a tap selects and a drag moves. Under
-// `.pencilOnly` that holds whatever the tool is (the canvas switches to
-// the select tool); any other finger is ignored here and scrolls or lands
-// the caret.
+// `.pencilOnly` that holds whatever the tool is (fingers always select,
+// the Pencil keeps the toolbar's tool); any other finger is ignored here
+// and scrolls or lands the caret.
 
 import KrabinkCore
 import UIKit

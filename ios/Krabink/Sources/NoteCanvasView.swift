@@ -593,11 +593,12 @@ struct NoteCanvas: UIViewRepresentable {
             }
         }
         // Where fingers ink they keep inking over ink; where only the
-        // Pencil draws, a finger on ink switches to the select tool.
-        let switching = InputPolicy.launch == .pencilOnly
-        canvas.pen.claimsFinger = { ink.claimsFinger(at: $0, switching: switching) }
+        // Pencil draws, a finger on ink selects under any tool.
+        let anyTool = InputPolicy.launch == .pencilOnly
+        canvas.pen.claimsFinger = { ink.claimsFinger(at: $0, anyTool: anyTool) }
         // The scroll already tracks the finger: cancel it for this touch.
         canvas.pen.onFingerClaimed = { [weak canvas] in
+            ink.fingerClaimed()
             guard let pan = canvas?.textView.panGestureRecognizer else { return }
             pan.isEnabled = false
             pan.isEnabled = true
