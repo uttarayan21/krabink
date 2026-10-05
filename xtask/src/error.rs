@@ -27,6 +27,8 @@ pub enum Error {
     Missing(PathBuf),
     #[error("`devicectl` {0} failed after retries")]
     DeviceCtl(&'static str),
+    #[error("no reachable device matches `{0}`")]
+    NoDevice(String),
     #[error("icon rendering failed")]
     Icon,
     #[error("no display: log in graphically first")]
