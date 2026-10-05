@@ -281,6 +281,9 @@ final class NoteModel: Identifiable {
     /// Mirrors the core's `SKETCH_URI_PREFIX` (the embed rule lives there).
     static let sketchUriPrefix = "krabink://sketch/"
     var onTitleChanged: (() -> Void)?
+    /// Show the keyboard for the note's editor, or put it away when it
+    /// is up; set by the canvas showing the note.
+    @ObservationIgnored var toggleKeyboard: (() -> Void)?
     private var titleTask: Task<Void, Never>?
 
     init(session: NoteSession) {

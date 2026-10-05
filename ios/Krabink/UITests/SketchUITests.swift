@@ -153,10 +153,8 @@ final class SketchUITests: XCTestCase {
         waitStatus(app, contains: "bound=1", timeout: 2)
 
         pick("Select")
-        // A still finger is the editor's tap until it has been down for
-        // the pen recognizer's tap delay; held longer it is pen input, and
-        // pen-down then up without moving selects.
-        editor.coordinate(withNormalizedOffset: CGVector(dx: 0.7, dy: 0.42)).press(forDuration: 0.6)
+        // A finger on ink is the select tool's at once: a tap selects.
+        editor.coordinate(withNormalizedOffset: CGVector(dx: 0.7, dy: 0.42)).tap()
         waitStatus(app, contains: "sel=1", timeout: 5)
         waitStatus(app, contains: "angle=0 ", timeout: 2)
         guard let (w, h) = size(app) else { return XCTFail("no size in the status") }
@@ -187,6 +185,66 @@ final class SketchUITests: XCTestCase {
         waitStatus(app, contains: "angle=90 ", timeout: 5)
         waitStatus(app, contains: "bound=1", timeout: 2)
         waitStatus(app, contains: "shapes=2", timeout: 2)
+    }
+
+    /// The select tool takes a finger that lands on ink even where only
+    /// the Pencil draws (`-anyInput 0`, the device's policy): a tap
+    /// selects at once and a drag moves the shape instead of scrolling.
+    func testFingerSelectsAndDragsWhenOnlyThePencilDraws() {
+        func pick(_ app: XCUIApplication, _ title: String) {
+            app.buttons["canvasTool"].tap()
+            let item = app.buttons[title]
+            XCTAssertTrue(item.waitForExistence(timeout: 3), "no \(title) in the tool menu")
+            item.tap()
+        }
+        var app = launch()
+        var editor = newNote(app, heading: "Finger")
+        pick(app, "Rectangle")
+        draw(on: editor, from: CGVector(dx: 0.6, dy: 0.35), to: CGVector(dx: 0.75, dy: 0.45))
+        waitStatus(app, contains: "shapes=1", timeout: 5)
+        // The relaunched editor has no keyboard under it and is taller:
+        // keep the places in points from its top-left corner.
+        let size = editor.frame.size
+        func at(_ x: CGFloat, _ y: CGFloat) -> XCUICoordinate {
+            editor.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: x * size.width, dy: y * size.height))
+        }
+        app.terminate()
+
+        app = launch(extra: ["-anyInput", "0"])
+        app.collectionViews.firstMatch.staticTexts["Finger"].firstMatch.tap()
+        waitStatus(app, contains: "shapes=1", timeout: 10)
+        editor = page(app)
+        pick(app, "Select")
+        at(0.7, 0.42).tap()
+        waitStatus(app, contains: "sel=1", timeout: 5)
+
+        // Dragged away, the shape is under the finger's new place: after
+        // the tool is re-picked (which deselects) a tap there finds it.
+        at(0.7, 0.42).press(
+            forDuration: 0.1, thenDragTo: at(0.4, 0.6), withVelocity: .slow,
+            thenHoldForDuration: 0.1)
+        pick(app, "Rectangle")
+        pick(app, "Select")
+        waitStatus(app, contains: "sel=0", timeout: 5)
+        at(0.4, 0.6).tap()
+        waitStatus(app, contains: "sel=1", timeout: 5)
+        waitStatus(app, contains: "shapes=1", timeout: 2)
+    }
+
+    /// The toolbar's keyboard button brings the keyboard up without a
+    /// tap in the text, and puts it away again.
+    func testKeyboardButtonTogglesTheKeyboard() {
+        let app = launch()
+        app.buttons["newNote"].tap()
+        _ = page(app)
+        let keyboard = app.keyboards.firstMatch
+        if keyboard.exists { app.buttons["keyboard"].tap() }
+        XCTAssertTrue(keyboard.waitForNonExistence(timeout: 3))
+        app.buttons["keyboard"].tap()
+        XCTAssertTrue(keyboard.waitForExistence(timeout: 3), "the button did not show the keyboard")
+        app.buttons["keyboard"].tap()
+        XCTAssertTrue(keyboard.waitForNonExistence(timeout: 3), "the button did not hide the keyboard")
     }
 
     /// The selected shape's frame size from the status line.

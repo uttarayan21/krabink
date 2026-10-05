@@ -420,6 +420,16 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
         }
     }
 
+    /// The toolbar's keyboard button: bring the keyboard up at the caret,
+    /// or put it away.
+    func toggleKeyboard() {
+        if textView.isFirstResponder {
+            textView.resignFirstResponder()
+        } else if !preview {
+            textView.becomeFirstResponder()
+        }
+    }
+
     /// The keyboard went away: keep the tool picker by taking the
     /// responder chain back.
     nonisolated func textViewDidEndEditing(_ textView: UITextView) {
@@ -582,10 +592,18 @@ struct NoteCanvas: UIViewRepresentable {
             case .cancelled: ink.penEnded(cancelled: true)
             }
         }
+        canvas.pen.claimsFinger = { ink.claimsFinger(at: $0) }
+        // The scroll already tracks the finger: cancel it for this touch.
+        canvas.pen.onFingerClaimed = { [weak canvas] in
+            guard let pan = canvas?.textView.panGestureRecognizer else { return }
+            pan.isEnabled = false
+            pan.isEnabled = true
+        }
         canvas.onHover = { ink.hover($0) }
         canvas.onLayoutChanged = { ink.layoutChanged() }
         ink.onSketchChanged = { [weak canvas] sketch in canvas?.sketchChanged(sketch) }
         ink.hapticView = canvas
+        model.toggleKeyboard = { [weak canvas] in canvas?.toggleKeyboard() }
 
         // PencilKit's picker works with any first responder; it hands us
         // the selected tool through the observer. `-tool` pins the tool

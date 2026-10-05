@@ -283,6 +283,11 @@ primitives, triangles and polygons.
   corners, band. Both transforms keep bindings: a bound end is re-derived
   from its target afterwards, so a line bound at both ends offers only its
   end handles. Freehand strokes only move.
+- The selection's own ink is redrawn in the selection colour while it is
+  selected (display only), so overlapping elements are told apart.
+- With the select tool a finger that lands on an element or a handle is
+  pen input at once, also where only the Pencil draws: a tap selects, a
+  drag moves. A finger anywhere else still scrolls or places the caret.
 
 ## Order and effort
 

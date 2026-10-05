@@ -470,6 +470,15 @@ private struct NoteDetail: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
+                    note.toggleKeyboard?()
+                } label: {
+                    Label("keyboard", systemImage: "keyboard")
+                }
+                .accessibilityIdentifier("keyboard")
+                .disabled(preview)
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
                     note.insertSketch()
                 } label: {
                     Label("insert sketch", systemImage: "rectangle.and.pencil.and.ellipsis")
