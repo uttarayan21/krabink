@@ -34,10 +34,11 @@ crates/krabink-local    sync node library (iroh endpoint, hub, lanes, mDNS); com
 crates/krabink-server   `krabink-server` binary: iroh relay + replica node
 crates/krabink          desktop binary (Bevy) running a node, `pair` and `replay` subcommands
 crates/krabink-ffi      UniFFI surface for Swift, `uniffi-bindgen` bin behind the `bindgen` feature
-ios/KrabinkCore         SPM package: generated XCFramework + Krabink.swift (outputs of scripts/build-ios-core.sh)
+ios/KrabinkCore         SPM package: generated XCFramework + Krabink.swift (outputs of `cargo xtask build core`)
 ios/Krabink             XcodeGen spec (project.yml), Sources/, UITests/
-scripts/build-ios-core.sh   cargo rustc for aarch64-apple-ios{,-sim} → bindgen → xcodebuild -create-xcframework
-scripts/swift-smoke.sh      host cdylib + bindgen + scripts/smoke/main.swift, run on macOS
+xtask/                  cargo xtask: build core (cargo rustc for aarch64-apple-ios{,-sim} → bindgen →
+                        xcodebuild -create-xcframework), test swift (host cdylib + bindgen +
+                        xtask/smoke/main.swift, run on macOS), iPad/Mac archives, release, icons, bump
 docs/architecture.md    sync topology, wire, pairing, fan-out, cloud deployment, failure modes
 docs/plans/             ink-renderer (done), shape-recognizer (done), brush-engine (P0–P2 done, P3–P4 planned)
 .github/workflows       build.yaml (nix check matrix + llvm-cov → codecov), docs.yaml (cargo doc check)
@@ -433,11 +434,11 @@ UniFFI proc macros (`uniffi::setup_scaffolding!("krabink")`), no UDL.
   `--expect-page-elements N`, `--add-sketch-stroke EMBED` (nth embed in
   text order), `--expect-sketch-elements N`, `--wet-watch`, `--devices`.
 
-Build: `scripts/build-ios-core.sh` builds `staticlib` for
+Build: `cargo xtask build core` builds `staticlib` for
 `aarch64-apple-ios` and `aarch64-apple-ios-sim`, runs library-mode bindgen
 off the device archive, assembles `ios/KrabinkCore/KrabinkCoreFFI.xcframework`
-and copies `Krabink.swift`. `scripts/swift-smoke.sh` compiles
-`scripts/smoke/main.swift` against the host cdylib as a fast bindings check.
+and copies `Krabink.swift`. `cargo xtask test swift` compiles
+`xtask/smoke/main.swift` against the host cdylib as a fast bindings check.
 
 ## 7. iPad app (`ios/Krabink`)
 
@@ -616,11 +617,11 @@ cargo run -p krabink                         # desktop node (LAN only without --
 cargo run -p krabink-server -- --dev         # relay + replica on 127.0.0.1:3340, prints a pair URI
 cargo run -p krabink -- --data-dir /tmp/b pair '<uri>'   # second desktop joins
 
-scripts/build-ios-core.sh                    # xcframework + Krabink.swift
-scripts/swift-smoke.sh                       # bindings smoke
-scripts/check-ipad.sh                        # simulator compile, no signing
-scripts/deploy-ipad.sh                       # device build + install + launch (paseo: run-ipad)
-scripts/gen-xcodeproj.sh                     # regenerate Krabink.xcodeproj from project.yml
+cargo xtask build core                   # xcframework + Krabink.swift
+cargo xtask test swift                      # bindings smoke
+cargo xtask check ios                       # simulator compile, no signing
+cargo xtask run ios                         # device build + install + launch (paseo: run-ipad)
+cargo xtask gen xcodeproj                    # regenerate Krabink.xcodeproj from project.yml
 xcodebuild -project Krabink.xcodeproj -scheme Krabink -destination 'platform=iOS Simulator,id=<udid>' build-for-testing
 KRABINK_TEST_PAIR='krabink://pair?…' xcodebuild test-without-building ... -only-testing:KrabinkUITests/SketchUITests
 ```
@@ -630,10 +631,12 @@ KRABINK_TEST_PAIR='krabink://pair?…' xcodebuild test-without-building ... -onl
 `build-ios-core`, `swift-smoke`, `check-ipad`, `run-ipad`,
 `archive-ios` / `upload-ios`, `archive-macos` / `upload-macos`,
 `bump major|minor|patch` (Cargo.toml, Cargo.lock and both project.yml);
-`cargo make --list-all-steps` lists every task.
+`cargo make --list-all-steps` lists every task; the Apple, release and
+icon ones are `cargo xtask` subcommands (`xtask/`, `cargo xtask --help`).
 
-The iOS scripts need Xcode. Run on Linux, each one hands itself to the Mac
-build machine through `scripts/on-mac.sh`: the worktree is mirrored with
+The iOS tasks need Xcode. Run on Linux, each one hands itself to the Mac
+build machine (`xtask/src/mac.rs`; xtask itself compiles first, so run
+from the devShell: direnv or `nix develop`): the worktree is mirrored with
 rsync to `~/Porject/krabink-<worktree>` on `shiro` (one folder per
 worktree, `KRABINK_MAC_HOST` / `KRABINK_MAC_DIR` override) and the script
 runs there over ssh. Build artefacts stay on the Mac between runs. Device

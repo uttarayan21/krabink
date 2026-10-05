@@ -8,13 +8,13 @@ the app actually does.
 
 | Piece | Where | Notes |
 |---|---|---|
-| App icon | `ios/Krabink/Assets.xcassets/AppIcon.appiconset/AppIcon.png` | 1024×1024 opaque RGB, rendered by `scripts/gen-app-icon.py` (pure Python, no deps). Regenerate after changing `LogoMark`/`Theme.accent`. |
+| App icon | `ios/Krabink/Assets.xcassets/AppIcon.appiconset/AppIcon.png` | 1024×1024 opaque RGB, rendered by `cargo xtask gen icon ios` (pure Rust, `xtask/src/icon.rs`n, no deps). Regenerate after changing `LogoMark`/`Theme.accent`. |
 | Privacy manifest | `ios/Krabink/PrivacyInfo.xcprivacy` | No tracking, no collected data; required-reason APIs: UserDefaults (CA92.1), file timestamps (C617.1), system boot time (35F9.1). |
-| Version / build | `project.yml` → `MARKETING_VERSION`, `CURRENT_PROJECT_VERSION` | Marketing version is hand-bumped with `Cargo.toml`. Build number = `git rev-list --count HEAD`, set by `scripts/archive-ios.sh`. |
+| Version / build | `project.yml` → `MARKETING_VERSION`, `CURRENT_PROJECT_VERSION` | Marketing version is hand-bumped with `Cargo.toml`. Build number = `git rev-list --count HEAD`, set by `cargo xtask archive ios`. |
 | Store metadata in Info.plist | `project.yml` → `info.properties` | Display name, productivity category, launch screen, orientations, usage strings (camera, local network, Bonjour), `krabink://` URL scheme. No encryption key until ASC issues a compliance code (see below). |
 | Release config | `project.yml` → `settings.configs.Release` | iPad-only (`TARGETED_DEVICE_FAMILY: 2`), dSYMs. Debug stays universal for iPhone simulator checks. |
 | Dev screens | `KrabinkApp.swift` | Spike and brush-lab screens are `#if DEBUG`; store builds cannot reach them. |
-| Archive + export | `scripts/archive-ios.sh` (`paseo run archive-ios`) | Rebuilds the Rust core, archives Release, exports an `.ipa` or uploads to App Store Connect. |
+| Archive + export | `cargo xtask archive ios` (`paseo run archive-ios`) | Rebuilds the Rust core, archives Release, exports an `.ipa` or uploads to App Store Connect. |
 
 ## Outside the repo (one-time, in this order)
 
@@ -26,8 +26,9 @@ the app actually does.
    developer portal first if ASC does not offer it.
 3. **App Store Connect API key** (Users and Access → Integrations → App
    Store Connect API, role App Manager). Put the `.p8` on the Mac at
-   `~/.private_keys/AuthKey_<KEYID>.p8`; the archive script takes
-   `KRABINK_ASC_KEY_PATH`, `KRABINK_ASC_KEY_ID`, `KRABINK_ASC_ISSUER_ID`.
+   `~/.private_keys/AuthKey_<KEYID>.p8`; the archive tasks take
+   `KRABINK_ASC_KEY_PATH`, `KRABINK_ASC_KEY_ID`, `KRABINK_ASC_ISSUER_ID`
+   (or `--asc-key-path` etc.).
    Without it, upload uses the Xcode account session on the Mac.
 4. **Privacy policy URL** (mandatory for every app). One paragraph is
    enough: notes and sketches stay on your devices and your own relay; no
@@ -44,12 +45,19 @@ the app actually does.
 
 ## Per release
 
-1. Bump `MARKETING_VERSION` in `ios/Krabink/project.yml` (and
-   `Cargo.toml`), commit.
-2. `KRABINK_EXPORT_DESTINATION=upload scripts/archive-ios.sh`
-   (from Linux; runs on the Mac through `scripts/on-mac.sh`). About 10
-   minutes with a warm cargo cache, 25 cold. Without the env var it exports
-   `ios/Krabink/build-archive/export/Krabink.ipa` instead.
+1. `cargo xtask bump patch` (or `minor`/`major`): bumps `Cargo.toml` and
+   `MARKETING_VERSION` in both `project.yml` files. Commit, merge.
+2. `cargo xtask release --tag` (`xtask/src/release.rs`): checks the
+   tree is clean and the versions agree, tags `v<version>` at HEAD and
+   pushes it (which also starts the Gitea Linux package build), then
+   archives and uploads the iPad and Mac apps with one shared build
+   number (the commit count). From Linux the builds run on the Mac
+   (see `xtask/src/mac.rs`). `--ios`/`--mac` does one platform,
+   `--export` only exports (`ios/Krabink/build-archive/export/Krabink.ipa`),
+   `--clean` runs `cargo clean` afterwards. About 10 minutes per platform
+   with a warm cargo cache, 25+ cold.
+   The underlying tasks still work on their own:
+   `cargo xtask archive ios --destination upload`.
 3. In ASC: attach the build to the version, fill "What's New", submit.
    TestFlight is the same build; add internal testers on the build page.
 
@@ -110,9 +118,9 @@ processing finishes.
 
 ## Checks before uploading
 
-- `KRABINK_CONFIGURATION=Release scripts/check-ipad.sh` compiles the store
+- `cargo xtask check ios --configuration Release` compiles the store
   configuration for the simulator (iPad-only, dev screens compiled out).
-- `scripts/deploy-ipad.sh` still installs the Debug build on the iPad;
+- `cargo xtask run ios` still installs the Debug build on the iPad;
   the store build is the same code with `-Osize`/whole-module Swift and
   the release Rust core.
 - Local network prompt: first sync on a new iPad shows the iOS "local

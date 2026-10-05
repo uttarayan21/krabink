@@ -46,7 +46,7 @@
 
         # Mac only: iOS cross targets for krabink-ffi staticlib builds, and
         # both mac archs for the universal Mac App Store binary
-        # (scripts/archive-macos.sh).
+        # (cargo xtask archive mac).
         iosTargets = lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
           "aarch64-apple-ios"
           "aarch64-apple-ios-sim"
@@ -153,23 +153,24 @@
             // {inherit cargoArtifacts;}
             // {
               cargoExtraArgs = "-p ${name}";
-              postInstall = ''
-                mkdir -p $out/bin
-                mkdir -p $out/share/bash-completions
-                mkdir -p $out/share/fish/vendor_completions.d
-                mkdir -p $out/share/zsh/site-functions
-                $out/bin/${name} completions bash > $out/share/bash-completions/${name}.bash
-                $out/bin/${name} completions fish > $out/share/fish/vendor_completions.d/${name}.fish
-                $out/bin/${name} completions zsh > $out/share/zsh/site-functions/_${name}
-              ''
-              # Linux desktop entry: lists krabink under "Open With" for
-              # markdown files (it does not become the default handler) and
-              # hands them over as `krabink FILE…`, which imports each one
-              # as a note.
-              + lib.optionalString pkgs.stdenv.isLinux ''
-                install -Dm644 crates/krabink/assets/krabink.desktop $out/share/applications/${name}.desktop
-                install -Dm644 ios/Krabink/Assets.xcassets/AppIcon.appiconset/AppIcon.png $out/share/pixmaps/${name}.png
-              '';
+              postInstall =
+                ''
+                  mkdir -p $out/bin
+                  mkdir -p $out/share/bash-completions
+                  mkdir -p $out/share/fish/vendor_completions.d
+                  mkdir -p $out/share/zsh/site-functions
+                  $out/bin/${name} completions bash > $out/share/bash-completions/${name}.bash
+                  $out/bin/${name} completions fish > $out/share/fish/vendor_completions.d/${name}.fish
+                  $out/bin/${name} completions zsh > $out/share/zsh/site-functions/_${name}
+                ''
+                # Linux desktop entry: lists krabink under "Open With" for
+                # markdown files (it does not become the default handler) and
+                # hands them over as `krabink FILE…`, which imports each one
+                # as a note.
+                + lib.optionalString pkgs.stdenv.isLinux ''
+                  install -Dm644 crates/krabink/assets/krabink.desktop $out/share/applications/${name}.desktop
+                  install -Dm644 ios/Krabink/Assets.xcassets/AppIcon.appiconset/AppIcon.png $out/share/pixmaps/${name}.png
+                '';
             });
           server = craneLib.buildPackage (commonArgs
             // {inherit cargoArtifacts;}

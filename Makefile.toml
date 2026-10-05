@@ -1,9 +1,9 @@
 # cargo-make entry points (`cargo make <task>`, or `makers <task>`).
-# cargo-make is in the flake devShell. The Apple tasks wrap scripts/*.sh,
-# which hand themselves to the Mac build machine (scripts/on-mac.sh) when
-# run on Linux; their KRABINK_* variables work the same way here.
-# Arguments after the task name are forwarded as-is, with no `--`
-# separator: `cargo make run --data-dir /tmp/b`.
+# cargo-make is in the flake devShell. The Apple, release and icon tasks
+# are `cargo xtask` subcommands (xtask/); `cargo xtask --help` lists them
+# with their options, and started on Linux they hand themselves to the Mac
+# build machine. Arguments after the task name are forwarded as-is, with
+# no `--` separator: `cargo make run --data-dir /tmp/b`.
 
 [config]
 default_to_workspace = false
@@ -16,8 +16,8 @@ alias = "check"
 
 [tasks.run]
 description = "Run the desktop app (release build)"
-command = "scripts/run-desktop.sh"
-args = ["${@}"]
+command = "cargo"
+args = ["xtask", "run", "desktop", "${@}"]
 
 [tasks.server]
 description = "Run the relay + replica in dev mode"
@@ -65,95 +65,71 @@ args = ["flake", "check", "-L"]
 
 [tasks.bump]
 description = "Bump the app version: cargo make bump major|minor|patch"
-script = '''
-set -eu
-yml="ios/Krabink/project.yml macos/project.yml"
+command = "cargo"
+args = ["xtask", "bump", "${@}"]
 
-current=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml)
-if ! echo "$current" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-  echo "error: can't read the workspace version in Cargo.toml" >&2
-  exit 1
-fi
-for f in $yml; do
-  if ! grep -q "MARKETING_VERSION: \"$current\"" "$f"; then
-    echo "error: $f MARKETING_VERSION is not $current" >&2
-    exit 1
-  fi
-done
-
-IFS=. read -r major minor patch <<EOF
-$current
-EOF
-case "${1:-}" in
-  major) next=$((major + 1)).0.0 ;;
-  minor) next=$major.$((minor + 1)).0 ;;
-  patch) next=$major.$minor.$((patch + 1)) ;;
-  *)
-    echo "usage: cargo make bump major|minor|patch" >&2
-    exit 2
-    ;;
-esac
-
-# sed -i differs between GNU and BSD, so go through a temp file.
-edit() { sed "$1" "$2" > "$2.tmp" && mv "$2.tmp" "$2"; }
-edit "s/^version = \"$current\"$/version = \"$next\"/" Cargo.toml
-for f in $yml; do
-  edit "s/MARKETING_VERSION: \"$current\"/MARKETING_VERSION: \"$next\"/" "$f"
-done
-cargo update --workspace --offline --quiet
-
-echo "$current -> $next"
-'''
+[tasks.release]
+description = "Upload the tagged version to App Store Connect: cargo make release [--ios|--mac] [--tag] [--export] [--clean]"
+command = "cargo"
+args = ["xtask", "release", "${@}"]
 
 # --- iPad -----------------------------------------------------------------
 
 [tasks.build-ios-core]
 description = "Build the KrabinkCore XCFramework and Swift bindings"
-command = "scripts/build-ios-core.sh"
+command = "cargo"
+args = ["xtask", "build", "core"]
 
 [tasks.swift-smoke]
 description = "Compile and run the Swift bindings smoke test"
-command = "scripts/swift-smoke.sh"
+command = "cargo"
+args = ["xtask", "test", "swift"]
 
 [tasks.gen-xcodeproj]
 description = "Regenerate Krabink.xcodeproj from project.yml"
-command = "scripts/gen-xcodeproj.sh"
+command = "cargo"
+args = ["xtask", "gen", "xcodeproj"]
 
 [tasks.check-ipad]
 description = "Compile the iPad app for the simulator"
-command = "scripts/check-ipad.sh"
+command = "cargo"
+args = ["xtask", "check", "ios", "${@}"]
 
 [tasks.run-ipad]
 description = "Build, install and launch on a connected iPad"
-command = "scripts/deploy-ipad.sh"
+command = "cargo"
+args = ["xtask", "run", "ios", "${@}"]
 
 [tasks.archive-ios]
 description = "Archive and export the iPad app for App Store Connect"
-command = "scripts/archive-ios.sh"
+command = "cargo"
+args = ["xtask", "archive", "ios", "${@}"]
 
 [tasks.upload-ios]
 description = "Archive the iPad app and upload it to App Store Connect"
-env = { KRABINK_EXPORT_DESTINATION = "upload" }
-command = "scripts/archive-ios.sh"
+command = "cargo"
+args = ["xtask", "archive", "ios", "--destination", "upload", "${@}"]
 
 # --- macOS ----------------------------------------------------------------
 
 [tasks.archive-macos]
 description = "Archive and export the Mac App Store .pkg"
-command = "scripts/archive-macos.sh"
+command = "cargo"
+args = ["xtask", "archive", "mac", "${@}"]
 
 [tasks.upload-macos]
 description = "Archive the Mac app and upload it to App Store Connect"
-env = { KRABINK_EXPORT_DESTINATION = "upload" }
-command = "scripts/archive-macos.sh"
+command = "cargo"
+args = ["xtask", "archive", "mac", "--destination", "upload", "${@}"]
 
 # --- Icons ----------------------------------------------------------------
 
 [tasks.gen-app-icon]
 description = "Render the 1024px App Store icon"
-command = "python3"
-args = ["scripts/gen-app-icon.py", "${@}"]
+command = "cargo"
+args = ["xtask", "gen", "icon", "ios", "${@}"]
 
 [tasks.gen-mac-icon]
-description = "Render the Mac icon set from the iPad icon (macOS only)"
-command = "scripts/gen-mac-icon.sh"
+description = "Render the Mac icon set from the iPad icon"
+command = "cargo"
+args = ["xtask", "gen", "icon", "mac"]

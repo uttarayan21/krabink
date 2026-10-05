@@ -1,4 +1,4 @@
-// Swift smoke test for the krabink-ffi bindings (run via swift-smoke.sh).
+// Swift smoke test for the krabink-ffi bindings (run via `cargo xtask test swift`).
 // Exercises the full local surface: create note, edit text, commit a stroke,
 // then reopen the store in a fresh Core and verify everything persisted.
 
@@ -111,13 +111,21 @@ func createAndEdit(dir: String) throws -> (note: String, sketch: String, stroke:
     try note.finishStroke(sketch: sketch, stroke: crayonStroke, tail: crayonPoints)
 
     guard try note.text() == "# hello from swift" else { fatalError("text mismatch") }
-    guard try note.strokes(sketch: sketch).count == 2 else { fatalError("stroke missing") }
     let elements = try note.elements(sketch: sketch)
+    guard strokes(in: elements).count == 2 else { fatalError("stroke missing") }
     guard elements.count == 3, case .shape(let stored) = elements[1], stored.id == shapeId else {
         fatalError("shape missing from elements")
     }
     guard core.listNotes().first?.title == "smoke" else { fatalError("registry mismatch") }
     return (note.id(), sketch, strokeId)
+}
+
+/// The stroke elements of a sketch, in order (shapes skipped).
+func strokes(in elements: [Element]) -> [Stroke] {
+    elements.compactMap { element in
+        if case .stroke(let stroke) = element { return stroke }
+        return nil
+    }
 }
 
 func verifyPersisted(dir: String, ids: (note: String, sketch: String, stroke: String)) throws {
@@ -127,7 +135,7 @@ func verifyPersisted(dir: String, ids: (note: String, sketch: String, stroke: St
 
     let note = try core.openNote(id: ids.note)
     guard try note.text() == "# hello from swift" else { fatalError("persisted text mismatch") }
-    let strokes = try note.strokes(sketch: ids.sketch)
+    let strokes = strokes(in: try note.elements(sketch: ids.sketch))
     guard strokes.count == 2, strokes[0].id == ids.stroke, strokes[0].points.count > 1 else {
         fatalError("persisted stroke mismatch")
     }
