@@ -87,6 +87,10 @@ pub struct DeployArgs {
     /// the known iPad Pro 11 M4).
     #[arg(long, env = "KRABINK_IPAD_ID")]
     pub device: Option<String>,
+    /// Pick the device by a case-insensitive part of its name or model
+    /// instead ("iphone", "ipad", "pro max").
+    #[arg(long, conflicts_with = "device")]
+    pub name: Option<String>,
     /// DEVELOPMENT_TEAM for automatic signing.
     #[arg(long, env = "KRABINK_TEAM", default_value = TEAM)]
     pub team: String,
@@ -99,9 +103,17 @@ pub fn deploy(repo: &Repo, args: &DeployArgs) -> Result<()> {
     let app_dir = repo.path(IOS_APP_DIR);
     let derived = app_dir.join("build-device");
 
-    let device = match &args.device {
-        Some(device) => device.clone(),
-        None => connected_ipad()?.unwrap_or_else(|| DEFAULT_IPAD.to_owned()),
+    let device = match (&args.device, &args.name) {
+        (Some(device), _) => device.clone(),
+        (None, Some(name)) => {
+            let listing = device_listing()?;
+            device_named(&listing, name).ok_or_else(|| {
+                Report::new(Error::NoDevice(name.clone())).attach(listing)
+            })?
+        }
+        (None, None) => {
+            first_connected_ipad(&device_listing()?).unwrap_or_else(|| DEFAULT_IPAD.to_owned())
+        }
     };
     tracing::info!("==> target device {device}");
 
@@ -171,37 +183,58 @@ fn retry(what: &'static str, mut attempt: impl FnMut() -> Result<bool>) -> Resul
     }
 }
 
-/// The first connected iPad or iPhone in `xcrun devicectl list devices`,
-/// if any.
-fn connected_ipad() -> Result<Option<String>> {
-    let listing = Cmd::xcrun()
+fn device_listing() -> Result<String> {
+    Ok(Cmd::xcrun()
         .args(["devicectl", "list", "devices"])
         .output_opt()?
-        .unwrap_or_default();
-    Ok(first_connected_ipad(&listing))
+        .unwrap_or_default())
 }
 
+/// The first connected iPad or iPhone in `xcrun devicectl list devices`,
+/// if any.
 fn first_connected_ipad(listing: &str) -> Option<String> {
+    physical(listing)
+        .filter(|line| line.contains("iPad") || line.contains("iPhone"))
+        .filter(|line| line.contains("connected"))
+        .find_map(identifier)
+}
+
+/// The device whose listing row (name and model) contains `name`, ignoring
+/// case. A connected one wins over one that is only paired.
+fn device_named(listing: &str, name: &str) -> Option<String> {
+    let name = name.to_lowercase();
+    let matches = || physical(listing).filter(|line| line.to_lowercase().contains(&name));
+    matches()
+        .filter(|line| line.contains("connected"))
+        .chain(matches())
+        .find_map(identifier)
+}
+
+/// Rows of real devices that can be reached: no simulators, nothing
+/// `unavailable`.
+fn physical(listing: &str) -> impl Iterator<Item = &str> {
     listing
         .lines()
-        .filter(|line| {
-            (line.contains("iPad") || line.contains("iPhone")) && line.contains("connected")
+        .filter(|line| !line.contains("simulated") && !line.contains("unavailable"))
+}
+
+/// The identifier column of a row: a CoreDevice UUID (36 characters) or,
+/// from Xcode 26 on, the hardware UDID (25).
+fn identifier(line: &str) -> Option<String> {
+    line.split_whitespace()
+        .find(|field| {
+            field.len() >= 24
+                && field.contains('-')
+                && field
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b) || b == b'-')
         })
-        .find_map(|line| {
-            line.split_whitespace()
-                .find(|field| {
-                    field.len() == 36
-                        && field
-                            .bytes()
-                            .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b) || b == b'-')
-                })
-                .map(str::to_owned)
-        })
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::first_connected_ipad;
+    use super::{device_named, first_connected_ipad};
 
     #[test]
     fn picks_the_connected_ipad_udid() {
@@ -223,5 +256,31 @@ iPhone   ip.local   AAAAAAAA-0000-0000-0000-000000000000   connected            
             Some("AAAAAAAA-0000-0000-0000-000000000000")
         );
         assert_eq!(first_connected_ipad(""), None);
+    }
+
+    #[test]
+    fn picks_a_device_by_friendly_name() {
+        let listing = "\
+Name                 Hostname   Identifier                                    State                Model                              Reality
+------------------   --------   -------------------------------------------   ------------------   --------------------------------   ---------
+Krabink Screenshots             1F0CA55C-7081-4542-9CC2-36A6C6277FEF (UDID)   shutdown             iPad Pro 13-inch (M5) (iPad17,4)   simulated
+Old iPad                        00008132-AAAAAAAAAAAAAAAA (UDID)              unavailable          iPad Pro 11-inch (M4) (iPad16,3)   physical
+Someone’s iPad                  00008132-001C10440E99001C (UDID)              available (paired)   iPad Pro 11-inch (M4) (iPad16,3)   physical
+Someone’s iPhone                00008140-001104C01498801C (UDID)              connected            iPhone 16 Pro Max (iPhone17,2)     physical
+";
+        assert_eq!(
+            device_named(listing, "iphone").as_deref(),
+            Some("00008140-001104C01498801C")
+        );
+        assert_eq!(
+            device_named(listing, "IPAD").as_deref(),
+            Some("00008132-001C10440E99001C")
+        );
+        // Connected wins over merely paired.
+        assert_eq!(
+            device_named(listing, "someone").as_deref(),
+            Some("00008140-001104C01498801C")
+        );
+        assert_eq!(device_named(listing, "watch"), None);
     }
 }

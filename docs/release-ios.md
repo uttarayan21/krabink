@@ -126,7 +126,8 @@ processing finishes.
 - `cargo xtask check ios --configuration Release` compiles the store
   configuration for the simulator (dev screens compiled out).
 - `cargo xtask run ios` still installs the Debug build on the iPad
-  (or a connected iPhone, `--device <udid>` to pick one);
+  (or a connected iPhone: `--name iphone` / `--name ipad` picks by
+  name, `--device <udid>` exactly);
   the store build is the same code with `-Osize`/whole-module Swift and
   the release Rust core.
 - Local network prompt: first sync on a new iPad shows the iOS "local
