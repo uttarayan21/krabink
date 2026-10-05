@@ -21,8 +21,8 @@ pub struct CheckArgs {
     /// booted device).
     #[arg(long, env = "KRABINK_SIM_ID")]
     pub sim_id: Option<String>,
-    /// Debug, or Release to check the store build (iPad-only, dev screens
-    /// compiled out).
+    /// Debug, or Release to check the store build (dev screens compiled
+    /// out).
     #[arg(long, env = "KRABINK_CONFIGURATION", default_value = "Debug")]
     pub configuration: String,
 }
@@ -83,8 +83,8 @@ pub fn check(repo: &Repo, args: &CheckArgs) -> Result<()> {
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct DeployArgs {
-    /// devicectl device UDID (default: first connected iPad, else the known
-    /// iPad Pro 11 M4).
+    /// devicectl device UDID (default: first connected iPad or iPhone, else
+    /// the known iPad Pro 11 M4).
     #[arg(long, env = "KRABINK_IPAD_ID")]
     pub device: Option<String>,
     /// DEVELOPMENT_TEAM for automatic signing.
@@ -171,7 +171,8 @@ fn retry(what: &'static str, mut attempt: impl FnMut() -> Result<bool>) -> Resul
     }
 }
 
-/// The first connected iPad in `xcrun devicectl list devices`, if any.
+/// The first connected iPad or iPhone in `xcrun devicectl list devices`,
+/// if any.
 fn connected_ipad() -> Result<Option<String>> {
     let listing = Cmd::xcrun()
         .args(["devicectl", "list", "devices"])
@@ -183,7 +184,9 @@ fn connected_ipad() -> Result<Option<String>> {
 fn first_connected_ipad(listing: &str) -> Option<String> {
     listing
         .lines()
-        .filter(|line| line.contains("iPad") && line.contains("connected"))
+        .filter(|line| {
+            (line.contains("iPad") || line.contains("iPhone")) && line.contains("connected")
+        })
         .find_map(|line| {
             line.split_whitespace()
                 .find(|field| {
@@ -211,6 +214,13 @@ iPhone   ip.local   AAAAAAAA-0000-0000-0000-000000000000   connected            
         assert_eq!(
             first_connected_ipad(listing).as_deref(),
             Some("E894963B-F801-5AFA-B709-3F61603301BA")
+        );
+        let phone_only = "\
+iPhone   ip.local   AAAAAAAA-0000-0000-0000-000000000000   connected            iPhone
+";
+        assert_eq!(
+            first_connected_ipad(phone_only).as_deref(),
+            Some("AAAAAAAA-0000-0000-0000-000000000000")
         );
         assert_eq!(first_connected_ipad(""), None);
     }

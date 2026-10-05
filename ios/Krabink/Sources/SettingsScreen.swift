@@ -71,7 +71,7 @@ struct SettingsScreen: View {
                         Button(role: .destructive) {
                             confirmUnpair = true
                         } label: {
-                            Label("unpair this iPad", systemImage: "xmark.circle")
+                            Label("unpair this \(deviceKind)", systemImage: "xmark.circle")
                         }
                         .accessibilityIdentifier("unpair")
                     }
@@ -79,7 +79,7 @@ struct SettingsScreen: View {
                     Caption("Sync")
                 } footer: {
                     if model.paired != nil {
-                        Text("unpairing removes this iPad from every device's list and stops syncing; notes already here stay")
+                        Text("unpairing removes this \(deviceKind) from every device's list and stops syncing; notes already here stay")
                             .foregroundStyle(Theme.muted)
                     }
                 }
@@ -223,7 +223,7 @@ struct SettingsScreen: View {
                 refresh()
             }
             .confirmationDialog(
-                "Unpair this iPad?",
+                "Unpair this \(deviceKind)?",
                 isPresented: $confirmUnpair,
                 titleVisibility: .visible
             ) {
@@ -233,7 +233,7 @@ struct SettingsScreen: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Removes this iPad from every device's list and stops syncing. Notes already here stay. Scan a pairing code to join again.")
+                Text("Removes this \(deviceKind) from every device's list and stops syncing. Notes already here stay. Scan a pairing code to join again.")
             }
             .confirmationDialog(
                 "Remove \(deviceToRemove?.name ?? "device")?",
@@ -271,7 +271,7 @@ struct SettingsScreen: View {
             : "Notes are drawn on the picked paper whatever the flavour; text switches to stay readable."
         let sync = theme.syncTheme
             ? "Flavour and paper follow the workspace: a change here, or on any device syncing its theme, restyles them all."
-            : "This iPad keeps its own flavour and paper."
+            : "This \(deviceKind) keeps its own flavour and paper."
         return "Catppuccin flavours, lightest to darkest. \(paper) \(sync)"
     }
 
@@ -285,9 +285,13 @@ struct SettingsScreen: View {
         }
     }
 
+    /// "iPad" or "iPhone", for the copy about this device.
+    private var deviceKind: String { UIDevice.current.model }
+
     private func icon(for platform: String) -> String {
         switch platform.lowercased() {
-        case "ios", "ipados", "ipad": "ipad"
+        case "ipados", "ipad": "ipad"
+        case "ios", "iphone": "iphone"
         case "macos", "linux", "windows", "desktop": "desktopcomputer"
         default: "circle.hexagongrid"
         }

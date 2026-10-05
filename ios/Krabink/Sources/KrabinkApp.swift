@@ -1,4 +1,4 @@
-// krabink for iPad: note list + one live-synced note surface the keyboard
+// krabink for iPad and iPhone: note list + one live-synced note surface the keyboard
 // types into and the Pencil draws on.
 
 import KrabinkCore
@@ -396,14 +396,24 @@ private struct NoteDetail: View {
     @State private var theme = ThemeStore.shared
     @State private var showBrushes = false
     @State private var preview = false
+    /// iPhone only: fingers ink instead of scrolling and typing.
+    @State private var drawing = InputPolicy.launchDrawing
+    @Environment(\.horizontalSizeClass) private var sizeClass
+
+    private var compact: Bool { sizeClass == .compact }
+    /// A phone has no width to spare around the page.
+    private var pagePadding: CGFloat { compact ? 8 : Theme.pagePadding }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
-            NoteCanvas(model: note, flavor: theme.flavor, paper: theme.paper, preview: preview)
-                .card(fill: Theme.paper)
-                .padding(.horizontal, Theme.pagePadding)
-                .padding(.bottom, Theme.pagePadding)
+            NoteCanvas(
+                model: note, flavor: theme.flavor, paper: theme.paper, preview: preview,
+                drawing: InputPolicy.hasDrawMode ? drawing : nil
+            )
+            .card(fill: Theme.paper)
+            .padding(.horizontal, pagePadding)
+            .padding(.bottom, pagePadding)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.bg)
@@ -411,6 +421,18 @@ private struct NoteDetail: View {
         .toolbarBackground(Theme.bg, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbar {
+            if InputPolicy.hasDrawMode {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        drawing.toggle()
+                    } label: {
+                        Label(
+                            drawing ? "Stop drawing" : "Draw",
+                            systemImage: drawing ? "pencil.tip.crop.circle.fill" : "pencil.tip.crop.circle")
+                    }
+                    .accessibilityIdentifier("drawToggle")
+                }
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     preview.toggle()
@@ -488,9 +510,9 @@ private struct NoteDetail: View {
                 .lineLimit(1)
                 .accessibilityIdentifier("sketchStatus")
             #endif
-            Caption(preview ? "preview" : "markdown")
+            if !compact { Caption(preview ? "preview" : "markdown") }
         }
-        .padding(.horizontal, Theme.pagePadding + 4)
+        .padding(.horizontal, pagePadding + 4)
         .padding(.top, 8)
     }
 }
