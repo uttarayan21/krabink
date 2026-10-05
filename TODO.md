@@ -53,6 +53,11 @@ desktop + iPad with pen-to-desktop wet ink at p95 71ms on hardware.
       select tool moves one element at a time, no multi-select or marquee.
 - [ ] Shape and move edits have no undo, and peers see a drag only at
       pen-up (no wet preview of a move).
+- [ ] Rotate and scale handles are for shapes only: freehand strokes just
+      move. No flips (scale never goes negative), the pivot is always the
+      centre (a singly bound line swings about its centre, not its bound
+      end), and an ellipse's edge drag scales it uniformly rather than one
+      axis.
 - [ ] Marker translucency not round-tripped through the stroke schema.
 - [ ] IME / marked-text composition not guarded in the remote-apply path of the
       text editor.

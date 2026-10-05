@@ -26,6 +26,8 @@
 //! assert!(matches!(snapped.shape, Shape::Rect { .. }));
 //! ```
 
+#[cfg(test)]
+use core::f32::consts::{FRAC_1_SQRT_2, FRAC_PI_4};
 use core::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use crate::geom::{dedupe, segment_distance2};
@@ -68,6 +70,22 @@ pub enum Shape {
         angle: f32,
     },
 }
+
+/// The rotated box a shape sits in: full `size` rotated by `angle` about
+/// `center`. For a line or arrow it is the axis-aligned box of the ends.
+/// What a select tool lays its handles on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Frame {
+    pub center: P,
+    pub size: P,
+    pub angle: f32,
+}
+
+/// Smallest side a scaled closed shape keeps, canvas units; the floor
+/// [`resize_box`] uses too.
+const MIN_SIDE: f32 = 1.0;
+/// Smallest factor a line or arrow can be scaled by.
+const MIN_LINE_SCALE: f32 = 0.05;
 
 /// Shaft fraction the arrow head's wings span, and their bounds in canvas
 /// units, so a tiny arrow still shows a head and a huge one is not all head.
@@ -232,6 +250,168 @@ impl Shape {
             self,
             Self::Rect { .. } | Self::Diamond { .. } | Self::Ellipse { .. }
         )
+    }
+
+    /// The box the shape sits in; see [`Frame`].
+    pub fn frame(&self) -> Frame {
+        match *self {
+            Self::Line { a, b } | Self::Arrow { a, b } => Frame {
+                center: mid(a, b),
+                size: [(a[0] - b[0]).abs(), (a[1] - b[1]).abs()],
+                angle: 0.0,
+            },
+            Self::Rect {
+                center,
+                size,
+                angle,
+            }
+            | Self::Diamond {
+                center,
+                size,
+                angle,
+            } => Frame {
+                center,
+                size,
+                angle,
+            },
+            Self::Ellipse {
+                center,
+                radii,
+                angle,
+            } => Frame {
+                center,
+                size: scale(radii, 2.0),
+                angle,
+            },
+        }
+    }
+
+    /// Which way the shape points: a closed shape's `angle`, the direction
+    /// from `a` to `b` for a line or arrow. What [`Self::rotated`] snaps.
+    pub fn heading(&self) -> f32 {
+        match *self {
+            Self::Line { a, b } | Self::Arrow { a, b } => {
+                let d = sub(b, a);
+                d[1].atan2(d[0])
+            }
+            Self::Rect { angle, .. }
+            | Self::Diamond { angle, .. }
+            | Self::Ellipse { angle, .. } => angle,
+        }
+    }
+
+    /// The shape turned by `by` radians about `about`. With `snap =
+    /// Some((step, within))` the new heading lands exactly on a multiple
+    /// of `step` when it comes within `within` of one, so a pen drag
+    /// settles on the right angles without being pixel-perfect.
+    #[must_use]
+    pub fn rotated(self, about: P, by: f32, snap: Option<(f32, f32)>) -> Self {
+        let by = match snap {
+            Some((step, within)) if step > 0.0 => {
+                let heading = self.heading() + by;
+                let nearest = (heading / step).round() * step;
+                if (heading - nearest).abs() <= within {
+                    by + (nearest - heading)
+                } else {
+                    by
+                }
+            }
+            _ => by,
+        };
+        let orbit = |p: P| add(about, rotate(sub(p, about), by));
+        match self {
+            Self::Line { a, b } => Self::Line {
+                a: orbit(a),
+                b: orbit(b),
+            },
+            Self::Arrow { a, b } => Self::Arrow {
+                a: orbit(a),
+                b: orbit(b),
+            },
+            Self::Rect {
+                center,
+                size,
+                angle,
+            } => Self::Rect {
+                center: orbit(center),
+                size,
+                angle: normalize_angle(angle + by),
+            },
+            Self::Diamond {
+                center,
+                size,
+                angle,
+            } => Self::Diamond {
+                center: orbit(center),
+                size,
+                angle: normalize_angle(angle + by),
+            },
+            Self::Ellipse {
+                center,
+                radii,
+                angle,
+            } => Self::Ellipse {
+                center: orbit(center),
+                radii,
+                angle: normalize_angle(angle + by),
+            },
+        }
+    }
+
+    /// The shape scaled uniformly by `k` about `about` (which stays put):
+    /// what dragging a corner handle does. `k` is floored so a closed
+    /// shape keeps sides of at least a canvas unit and a line keeps some
+    /// length; it never flips.
+    #[must_use]
+    pub fn scaled(self, about: P, k: f32) -> Self {
+        let floor = match self {
+            Self::Line { .. } | Self::Arrow { .. } => MIN_LINE_SCALE,
+            Self::Rect { size, .. } | Self::Diamond { size, .. } => {
+                MIN_SIDE / size[0].min(size[1]).max(f32::EPSILON)
+            }
+            Self::Ellipse { radii, .. } => {
+                MIN_SIDE / (2.0 * radii[0].min(radii[1])).max(f32::EPSILON)
+            }
+        };
+        let k = if k.is_finite() { k.max(floor) } else { 1.0 };
+        let from = |p: P| add(about, scale(sub(p, about), k));
+        match self {
+            Self::Line { a, b } => Self::Line {
+                a: from(a),
+                b: from(b),
+            },
+            Self::Arrow { a, b } => Self::Arrow {
+                a: from(a),
+                b: from(b),
+            },
+            Self::Rect {
+                center,
+                size,
+                angle,
+            } => Self::Rect {
+                center: from(center),
+                size: scale(size, k),
+                angle,
+            },
+            Self::Diamond {
+                center,
+                size,
+                angle,
+            } => Self::Diamond {
+                center: from(center),
+                size: scale(size, k),
+                angle,
+            },
+            Self::Ellipse {
+                center,
+                radii,
+                angle,
+            } => Self::Ellipse {
+                center: from(center),
+                radii: scale(radii, k),
+                angle,
+            },
+        }
     }
 
     fn is_finite(&self) -> bool {
@@ -422,16 +602,16 @@ fn resize_box(center: P, size: P, angle: f32, from: P, to: P) -> (P, P) {
     let corner = nearest_x <= reach && nearest_y <= reach;
     if corner || nearest_x <= nearest_y {
         if to_x[0] <= to_x[1] {
-            lo[0] = target[0].min(hi[0] - 1.0);
+            lo[0] = target[0].min(hi[0] - MIN_SIDE);
         } else {
-            hi[0] = target[0].max(lo[0] + 1.0);
+            hi[0] = target[0].max(lo[0] + MIN_SIDE);
         }
     }
     if corner || nearest_y < nearest_x {
         if to_y[0] <= to_y[1] {
-            lo[1] = target[1].min(hi[1] - 1.0);
+            lo[1] = target[1].min(hi[1] - MIN_SIDE);
         } else {
-            hi[1] = target[1].max(lo[1] + 1.0);
+            hi[1] = target[1].max(lo[1] + MIN_SIDE);
         }
     }
     (add(center, rotate(mid(lo, hi), angle)), sub(hi, lo))
@@ -1565,6 +1745,12 @@ pub(crate) fn rotate(p: P, angle: f32) -> P {
     [p[0] * c - p[1] * s, p[0] * s + p[1] * c]
 }
 
+/// `angle` wrapped into `(-π, π]`.
+fn normalize_angle(angle: f32) -> f32 {
+    let a = angle.rem_euclid(TAU);
+    if a > PI { a - TAU } else { a }
+}
+
 /// Unsigned angle between two vectors, 0..=π.
 fn angle_between(a: P, b: P) -> f32 {
     signed_angle(a, b).abs()
@@ -2106,6 +2292,180 @@ mod tests {
     }
 
     #[test]
+    fn frames_and_headings() {
+        let rect = Shape::Rect {
+            center: [10.0, 20.0],
+            size: [40.0, 20.0],
+            angle: 0.3,
+        };
+        assert_eq!(
+            rect.frame(),
+            Frame {
+                center: [10.0, 20.0],
+                size: [40.0, 20.0],
+                angle: 0.3
+            }
+        );
+        assert_eq!(rect.heading(), 0.3);
+        let ellipse = Shape::Ellipse {
+            center: [0.0, 0.0],
+            radii: [5.0, 3.0],
+            angle: 1.0,
+        };
+        assert_eq!(ellipse.frame().size, [10.0, 6.0]);
+        let line = Shape::Line {
+            a: [10.0, 10.0],
+            b: [0.0, 20.0],
+        };
+        assert_eq!(
+            line.frame(),
+            Frame {
+                center: [5.0, 15.0],
+                size: [10.0, 10.0],
+                angle: 0.0
+            }
+        );
+        assert!(near_f(line.heading(), 3.0 * FRAC_PI_4));
+    }
+
+    #[test]
+    fn rotating_turns_about_the_pivot() {
+        let rect = Shape::Rect {
+            center: [10.0, 0.0],
+            size: [40.0, 20.0],
+            angle: 0.0,
+        };
+        let Shape::Rect {
+            center,
+            size,
+            angle,
+        } = rect.rotated([0.0, 0.0], FRAC_PI_2, None)
+        else {
+            panic!("rect");
+        };
+        assert!(near(center, [0.0, 10.0], 1e-5));
+        assert_eq!(size, [40.0, 20.0]);
+        assert!(near_f(angle, FRAC_PI_2));
+        let line = Shape::Line {
+            a: [0.0, 0.0],
+            b: [10.0, 0.0],
+        };
+        let turned = line.rotated([5.0, 0.0], PI, None);
+        let Shape::Line { a, b } = turned else {
+            panic!("line");
+        };
+        assert!(near(a, [10.0, 0.0], 1e-5) && near(b, [0.0, 0.0], 1e-5));
+        assert!(near_f(turned.heading().abs(), PI));
+        // Angles wrap into (-π, π].
+        let Shape::Diamond { angle, .. } = Shape::Diamond {
+            center: [0.0, 0.0],
+            size: [10.0, 10.0],
+            angle: 3.0,
+        }
+        .rotated([0.0, 0.0], 1.0, None) else {
+            panic!("diamond");
+        };
+        assert!(near_f(angle, 4.0 - TAU));
+    }
+
+    #[test]
+    fn rotating_snaps_the_heading_near_a_step() {
+        let step = PI / 12.0;
+        let within = 3.0_f32.to_radians();
+        let rect = Shape::Rect {
+            center: [0.0, 0.0],
+            size: [40.0, 20.0],
+            angle: 0.0,
+        };
+        let turned = |deg: f32| {
+            rect.rotated([0.0, 0.0], deg.to_radians(), Some((step, within)))
+                .heading()
+                .to_degrees()
+        };
+        assert!(near_f(turned(88.0), 90.0));
+        assert!(near_f(turned(16.5), 15.0));
+        assert!(near_f(turned(7.0), 7.0));
+        // A line snaps its direction, not an angle field.
+        let line = Shape::Line {
+            a: [0.0, 0.0],
+            b: [10.0, 0.0],
+        };
+        let Shape::Line { a, b } =
+            line.rotated([0.0, 0.0], 44.0_f32.to_radians(), Some((step, within)))
+        else {
+            panic!("line");
+        };
+        assert!(near(a, [0.0, 0.0], 1e-5));
+        assert!(near(b, [10.0 * FRAC_1_SQRT_2, 10.0 * FRAC_1_SQRT_2], 1e-4));
+        assert_eq!(
+            rect.rotated([0.0, 0.0], 1.0, Some((0.0, within))),
+            rect.rotated([0.0, 0.0], 1.0, None)
+        );
+    }
+
+    #[test]
+    fn scaling_keeps_the_pivot_put_and_floors_the_size() {
+        let rect = Shape::Rect {
+            center: [20.0, 10.0],
+            size: [40.0, 20.0],
+            angle: 0.5,
+        };
+        // About the far corner of the unrotated box (0, 0).
+        assert_eq!(
+            rect.scaled([0.0, 0.0], 2.0),
+            Shape::Rect {
+                center: [40.0, 20.0],
+                size: [80.0, 40.0],
+                angle: 0.5,
+            }
+        );
+        let Shape::Rect { size, .. } = rect.scaled([0.0, 0.0], 0.0) else {
+            panic!("rect");
+        };
+        assert!(near_f(size[1], MIN_SIDE));
+        let Shape::Rect { size, .. } = rect.scaled([0.0, 0.0], -3.0) else {
+            panic!("rect");
+        };
+        assert!(size[0] > 0.0 && size[1] > 0.0);
+        assert_eq!(rect.scaled([0.0, 0.0], f32::NAN), rect);
+        let ellipse = Shape::Ellipse {
+            center: [0.0, 0.0],
+            radii: [5.0, 3.0],
+            angle: 0.0,
+        };
+        assert_eq!(
+            ellipse.scaled([5.0, 0.0], 3.0),
+            Shape::Ellipse {
+                center: [-10.0, 0.0],
+                radii: [15.0, 9.0],
+                angle: 0.0,
+            }
+        );
+        let arrow = Shape::Arrow {
+            a: [0.0, 0.0],
+            b: [100.0, 0.0],
+        };
+        assert_eq!(
+            arrow.scaled([100.0, 0.0], 0.5),
+            Shape::Arrow {
+                a: [50.0, 0.0],
+                b: [100.0, 0.0],
+            }
+        );
+        assert_eq!(
+            arrow.scaled([100.0, 0.0], 0.0),
+            Shape::Arrow {
+                a: [95.0, 0.0],
+                b: [100.0, 0.0],
+            }
+        );
+    }
+
+    fn near_f(a: f32, b: f32) -> bool {
+        (a - b).abs() <= 1e-4
+    }
+
+    #[test]
     fn dragging_after_a_snap_resizes() {
         let line = Shape::Line {
             a: [0.0, 0.0],
@@ -2605,6 +2965,85 @@ mod tests {
             prop_assert!(near(hi2, expect(hi), tol), "{:?} vs {:?}", hi2, expect(hi));
             // Deterministic.
             prop_assert_eq!(recognize(&base), rec);
+        }
+    }
+
+    fn arb_any_shape() -> impl Strategy<Value = Shape> {
+        let pt = || (-300.0f32..300.0, -300.0f32..300.0).prop_map(|(x, y)| [x, y]);
+        let size = (10.0f32..200.0, 10.0f32..200.0).prop_map(|(w, h)| [w, h]);
+        (pt(), pt(), size, -3.1f32..3.1, 0..5).prop_map(|(a, b, size, angle, kind)| match kind {
+            // Lines keep some length so their heading is defined.
+            0 => Shape::Line {
+                a,
+                b: add(b, [size[0], 0.0]),
+            },
+            1 => Shape::Arrow {
+                a,
+                b: add(b, [size[0], 0.0]),
+            },
+            2 => Shape::Rect {
+                center: a,
+                size,
+                angle,
+            },
+            3 => Shape::Diamond {
+                center: a,
+                size,
+                angle,
+            },
+            _ => Shape::Ellipse {
+                center: a,
+                radii: scale(size, 0.5),
+                angle,
+            },
+        })
+    }
+
+    fn outline_near(x: &Shape, y: &Shape, tol: f32) -> bool {
+        let (a, b) = (x.outline(), y.outline());
+        a.len() == b.len()
+            && a.iter()
+                .zip(&b)
+                .all(|(p, q)| near([p.x, p.y], [q.x, q.y], tol))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn rotating_back_restores_the_shape(
+            shape in arb_any_shape(),
+            about in (-300.0f32..300.0, -300.0f32..300.0),
+            by in -6.0f32..6.0,
+        ) {
+            let about = [about.0, about.1];
+            let there = shape.rotated(about, by, None);
+            prop_assert!(outline_near(&there.rotated(about, -by, None), &shape, 0.05));
+            prop_assert!(outline_near(&shape.rotated(about, TAU, None), &shape, 0.05));
+            // The pivot is a fixed point and distances to it are kept.
+            let (c0, c1) = (shape.frame().center, there.frame().center);
+            prop_assert!((dist(c0, about) - dist(c1, about)).abs() < 0.05);
+            let (h0, h1) = (shape.heading(), there.heading());
+            let off = angle_diff(h1, h0 + by, TAU);
+            prop_assert!(off < 1e-3, "heading {h1} is not {h0} + {by}");
+        }
+
+        #[test]
+        fn scaling_scales_the_bounds_about_the_pivot(
+            shape in arb_any_shape(),
+            about in (-300.0f32..300.0, -300.0f32..300.0),
+            k in 0.3f32..4.0,
+        ) {
+            let about = [about.0, about.1];
+            let big = shape.scaled(about, k);
+            let ((lo0, hi0), (lo1, hi1)) = (shape.bounds(), big.bounds());
+            let (w0, w1) = (hi0[0] - lo0[0], hi1[0] - lo1[0]);
+            let (h0, h1) = (hi0[1] - lo0[1], hi1[1] - lo1[1]);
+            prop_assert!((w1 - w0 * k).abs() < 0.05 * k.max(1.0), "{w0} * {k} != {w1}");
+            prop_assert!((h1 - h0 * k).abs() < 0.05 * k.max(1.0), "{h0} * {k} != {h1}");
+            let (c0, c1) = (shape.frame().center, big.frame().center);
+            prop_assert!(near(c1, add(about, scale(sub(c0, about), k)), 0.05));
+            prop_assert!(near_f(big.heading(), shape.heading()) || !shape.is_closed());
         }
     }
 }

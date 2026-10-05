@@ -515,6 +515,29 @@ mod tests {
         }
 
         #[test]
+        fn bound_ends_follow_a_turned_or_scaled_target(
+            target in arb_closed(),
+            angle in 0.0f32..core::f32::consts::TAU,
+            by in -3.0f32..3.0,
+            // Not below 1: `on_outline`'s tolerance is too tight for tiny
+            // ellipses hit from far away.
+            k in 1.0f32..3.0,
+            far in 400.0f32..1000.0,
+        ) {
+            let binding = Binding { element: ElementId::new(), fixed_point: BINDING_CENTER, gap: BINDING_GAP };
+            let pivot = add(target.frame().center, [50.0, -20.0]);
+            for target in [target.rotated(pivot, by, None), target.scaled(pivot, k)] {
+                let aim = aim_point(&target, BINDING_CENTER);
+                let toward = add(aim, rotate([far, 0.0], angle));
+                let end = bound_end(&target, &binding, toward);
+                prop_assert!(!contains(&target, end), "end {end:?} inside {target:?}");
+                let dir = sub(aim, end);
+                let hit = add(end, scale(dir, BINDING_GAP / norm(dir)));
+                prop_assert!(on_outline(&target, hit), "{hit:?} off {target:?}");
+            }
+        }
+
+        #[test]
         fn resolving_commutes_with_translation(
             x in arb_closed(),
             y in arb_closed(),

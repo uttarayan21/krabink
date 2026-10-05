@@ -17,7 +17,7 @@ pub use brush::{
     AssetInfo, AssetKind, Blend, BrushKnobs, BrushModeler, BrushRef, BuiltinBrush, CustomBrush,
     INK_VERTEX_FLOATS, InkMesh, InkStyle, InputModel, MaskStyle, Overlap, RawSample, Recording,
     StrokeEnd, StrokeMetrics, builtin_assets, builtin_brushes, ism_available, measure_recording,
-    parse_recording, resolve_page_bindings,
+    parse_recording, resolve_page_bindings, rotate_shape, scale_shape, shape_frame,
 };
 pub use engine::{Core, CoreListener, KrabinkError, NoteListener, NoteSession};
 pub use markdown::{
@@ -25,8 +25,8 @@ pub use markdown::{
     sketch_embed_title, style_runs,
 };
 pub use types::{
-    AppearanceInfo, Binding, BrushInfo, DeviceInfo, Element, ElementOrigin, NoteInfo, PageElement,
-    PageMove, PageProbe, PairInfo, PeerInfo, PeerKind, Point2, PointKind, Recognition, Route,
-    Shape, ShapeElement, Stroke, StrokePoint, SyncState, Tilt, Tool, build_pair_uri,
+    AppearanceInfo, Binding, BrushInfo, DeviceInfo, Element, ElementOrigin, Frame, NoteInfo,
+    PageElement, PageMove, PageProbe, PairInfo, PeerInfo, PeerKind, Point2, PointKind, Recognition,
+    Route, Shape, ShapeElement, Stroke, StrokePoint, SyncState, Tilt, Tool, build_pair_uri,
     parse_pair_uri,
 };

@@ -457,6 +457,26 @@ impl From<Point2> for [f32; 2] {
     }
 }
 
+/// The rotated box a shape sits in: full `size` turned by `angle` radians
+/// about `center`; a line's or arrow's is the axis-aligned box of its ends
+/// with angle 0. What the select tool lays its handles on.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct Frame {
+    pub center: Point2,
+    pub size: Point2,
+    pub angle: f32,
+}
+
+impl From<pcore::Frame> for Frame {
+    fn from(f: pcore::Frame) -> Self {
+        Self {
+            center: f.center.into(),
+            size: f.size.into(),
+            angle: f.angle,
+        }
+    }
+}
+
 /// A recognised primitive in canvas space (x right, y down).
 #[derive(Debug, Clone, Copy, PartialEq, uniffi::Enum)]
 pub enum Shape {

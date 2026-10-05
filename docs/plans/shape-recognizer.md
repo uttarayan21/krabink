@@ -274,6 +274,15 @@ primitives, triangles and polygons.
   `hit_at`; a closed shape is hit anywhere inside), previews drags by
   re-placing and re-meshing on screen, and commits at pen-up. Draw-and-hold
   lines and arrows bind their ends like drawn ones.
+- A selected shape shows Excalidraw-style handles on a box padded out from
+  its frame (`Shape::frame`; a line's is the box of its ends): corner
+  handles scale it uniformly about the opposite corner (`Shape::scaled`),
+  a knob above the top edge turns it about the centre (`Shape::rotated`,
+  snapping the heading to 15° multiples within 3°), and the band along a
+  closed shape's outline still resizes one side. Hit order is ends, knob,
+  corners, band. Both transforms keep bindings: a bound end is re-derived
+  from its target afterwards, so a line bound at both ends offers only its
+  end handles. Freehand strokes only move.
 
 ## Order and effort
 

@@ -131,6 +131,73 @@ final class SketchUITests: XCTestCase {
         waitStatus(app, contains: "bound=1", timeout: 2)
     }
 
+    /// Select handles, local only: a rectangle with an arrow bound to it
+    /// is doubled from a corner handle (the opposite corner stays put),
+    /// then turned a quarter turn by its rotate knob; the arrow stays
+    /// bound through both.
+    func testSelectScalesAndRotatesShape() {
+        let app = launch()
+        let editor = newNote(app, heading: "Handles")
+        func pick(_ title: String) {
+            app.buttons["canvasTool"].tap()
+            let item = app.buttons[title]
+            XCTAssertTrue(item.waitForExistence(timeout: 3), "no \(title) in the tool menu")
+            item.tap()
+        }
+        let (topLeft, bottomRight) = (CGVector(dx: 0.6, dy: 0.35), CGVector(dx: 0.75, dy: 0.45))
+        pick("Rectangle")
+        draw(on: editor, from: topLeft, to: bottomRight)
+        pick("Arrow")
+        draw(on: editor, from: CGVector(dx: 0.3, dy: 0.4), to: CGVector(dx: 0.68, dy: 0.4))
+        waitStatus(app, contains: "shapes=2", timeout: 5)
+        waitStatus(app, contains: "bound=1", timeout: 2)
+
+        pick("Select")
+        // A still finger is the editor's tap until it has been down for
+        // the pen recognizer's tap delay; held longer it is pen input, and
+        // pen-down then up without moving selects.
+        editor.coordinate(withNormalizedOffset: CGVector(dx: 0.7, dy: 0.42)).press(forDuration: 0.6)
+        waitStatus(app, contains: "sel=1", timeout: 5)
+        waitStatus(app, contains: "angle=0 ", timeout: 2)
+        guard let (w, h) = size(app) else { return XCTFail("no size in the status") }
+
+        // The selection box sits `pad` (12pt) outside the shape; its
+        // top-left corner handle scales about the bottom-right corner.
+        // Pulling the handle out by its own offset from that corner doubles.
+        let pad: CGFloat = 12
+        let corner = editor.coordinate(withNormalizedOffset: topLeft)
+        corner.withOffset(CGVector(dx: -pad, dy: -pad))
+            .press(
+                forDuration: 0.1,
+                thenDragTo: corner.withOffset(CGVector(dx: -(w + 2 * pad), dy: -(h + 2 * pad))),
+                withVelocity: .slow, thenHoldForDuration: 0.1)
+        waitStatus(app, contains: "sel=1", timeout: 2)
+        guard let (w2, h2) = size(app) else { return XCTFail("no size in the status") }
+        XCTAssertEqual(w2, 2 * w, accuracy: 0.05 * w)
+        XCTAssertEqual(h2, 2 * h, accuracy: 0.05 * h)
+
+        // Doubled about the bottom-right, the centre is now the old
+        // top-left. The knob hangs 24pt above the box's top edge; dragging
+        // it round to the right of the centre is a quarter turn.
+        let knob = corner.withOffset(CGVector(dx: 0, dy: -(h + pad + 24)))
+        knob.press(
+            forDuration: 0.1,
+            thenDragTo: corner.withOffset(CGVector(dx: h + pad + 24, dy: 0)),
+            withVelocity: .slow, thenHoldForDuration: 0.1)
+        waitStatus(app, contains: "angle=90 ", timeout: 5)
+        waitStatus(app, contains: "bound=1", timeout: 2)
+        waitStatus(app, contains: "shapes=2", timeout: 2)
+    }
+
+    /// The selected shape's frame size from the status line.
+    private func size(_ app: XCUIApplication) -> (CGFloat, CGFloat)? {
+        let label = app.staticTexts["sketchStatus"].label
+        guard let m = label.firstMatch(of: /size=(\d+)x(\d+)/),
+              let w = Double(m.output.1), let h = Double(m.output.2)
+        else { return nil }
+        return (CGFloat(w), CGFloat(h))
+    }
+
     func testPhase1CreateNoteAndDraw() {
         let app = launch()
         waitConnected(app)

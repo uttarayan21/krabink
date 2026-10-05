@@ -61,7 +61,7 @@ pub use markdown::{
 };
 pub use note::{InkChanges, NoteDoc};
 pub use pair::PairInfo;
-pub use shape::{Recognition, RecognizerParams, Shape, recognize, recognize_with};
+pub use shape::{Frame, Recognition, RecognizerParams, Shape, recognize, recognize_with};
 pub use store::{DocKey, Flush, Store, StoredDoc};
 pub use stroke::{
     PointKind, PointSize, Rgba, Stroke, StrokePoint, Tilt, Tool, decode_chunks, encode_chunks,

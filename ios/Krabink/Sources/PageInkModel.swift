@@ -166,6 +166,11 @@ private struct Drag {
         case move
         /// Resize a shape from the outline point under the pen (its space).
         case resize(from: Point2)
+        /// Turn the shape about its frame's centre (its space).
+        case rotate(center: Point2)
+        /// Scale the shape uniformly about the corner opposite the handle
+        /// under the pen (its space).
+        case scale(anchor: Point2)
         /// Move a line's or arrow's `a` (or `b`) end, re-binding it.
         case end(a: Bool)
     }
@@ -191,6 +196,62 @@ private let bindReach: CGFloat = 12
 private let selectReach: CGFloat = 8
 /// The select tool's outline and the bind highlight (systemBlue).
 private let selectionColor: UInt32 = 0x3478_F6CC
+/// Screen points the selection box clears the shape's frame by, and how
+/// far above its top edge the rotate knob sits. The pad keeps a line's
+/// corner handles clear of its end dots (`handleReach` apart at least).
+private let selectionPad: CGFloat = 12
+private let knobOffset: CGFloat = 24
+/// Rotation snaps to multiples of 15° when within 3° of one.
+private let rotateSnapStep: Float = .pi / 12
+private let rotateSnapWithin: Float = 3 * .pi / 180
+
+/// Where the select tool's handles sit for one shape, in the shape's
+/// space: a box padded out from its frame, corner handles on that box, a
+/// rotate knob above the top edge. Shared by hit testing and drawing.
+private struct SelectionFrame {
+    /// The shape's own box, unpadded.
+    let frame: KrabinkCore.Frame
+    /// Half the padded box, along its axes.
+    let half: Point2
+    let knobOffset: Float
+
+    init(of shape: ShapeElement, zoom: CGFloat) {
+        frame = shapeFrame(shape: shape.shape)
+        let pad = Float(selectionPad / zoom) + shape.width / 2
+        half = Point2(x: frame.size.x / 2 + pad, y: frame.size.y / 2 + pad)
+        knobOffset = Float(Krabink.knobOffset / zoom)
+    }
+
+    var center: Point2 { frame.center }
+    var paddedSize: Point2 { Point2(x: half.x * 2, y: half.y * 2) }
+
+    /// The point `(dx, dy)` along the box's axes from its centre.
+    private func place(_ dx: Float, _ dy: Float) -> Point2 {
+        Point2(x: dx, y: dy).rotated(by: frame.angle, about: .zero).offset(by: center)
+    }
+
+    /// Top-left, top-right, bottom-right, bottom-left of the padded box.
+    var corners: [Point2] {
+        [place(-half.x, -half.y), place(half.x, -half.y), place(half.x, half.y), place(-half.x, half.y)]
+    }
+
+    /// The shape's own corner diagonally opposite padded corner `i`: what
+    /// stays put when that corner is dragged.
+    func anchor(opposite i: Int) -> Point2 {
+        let (hx, hy) = (frame.size.x / 2, frame.size.y / 2)
+        let signs: [(Float, Float)] = [(1, 1), (-1, 1), (-1, -1), (1, -1)]
+        return place(signs[i].0 * hx, signs[i].1 * hy)
+    }
+
+    /// Where the rotate knob's stem leaves the box, and the knob.
+    var top: Point2 { place(0, -half.y) }
+    var knob: Point2 { place(0, -(half.y + knobOffset)) }
+
+    /// `p` in the box's own axes, centre at the origin.
+    func inFrame(_ p: Point2) -> Point2 {
+        Point2(x: p.x - center.x, y: p.y - center.y).rotated(by: -frame.angle, about: .zero)
+    }
+}
 
 /// A local stroke: in progress, or past pen-up and settling. Its points
 /// are in its layer's space (page point − `origin`).
@@ -312,9 +373,23 @@ final class PageInkModel {
     /// The status line the UI tests read.
     var status: String {
         String(
-            format: "strokes=%d shapes=%d wetSent=%d wetRecv=%d est=%d custom=%d originY=%.0f inline=%d boxY=%.0f sel=%d bound=%d",
+            format: "strokes=%d shapes=%d wetSent=%d wetRecv=%d est=%d custom=%d originY=%.0f inline=%d boxY=%.0f sel=%d bound=%d angle=%.0f size=%.0fx%.0f",
             strokeCount, shapeCount, wetSent, wetRecv, estUpdated, customCount, originY,
-            inlineCount, boxY, selected == nil ? 0 : 1, boundCount)
+            inlineCount, boxY, selected == nil ? 0 : 1, boundCount, selectedAngle,
+            selectedFrame?.size.x ?? 0, selectedFrame?.size.y ?? 0)
+    }
+
+    /// The selected shape's frame as committed; nil for strokes and no
+    /// selection.
+    private var selectedFrame: KrabinkCore.Frame? {
+        guard let id = selected, case .shape(let s)? = elements[id] else { return nil }
+        return shapeFrame(shape: s.shape)
+    }
+
+    /// The selected shape's angle in whole degrees, (-180, 180].
+    private var selectedAngle: Double {
+        let deg = (Double(selectedFrame?.angle ?? 0) * 180 / .pi).rounded()
+        return deg == 0 ? 0 : deg
     }
 
     /// Lines and arrows on screen with at least one bound end.
@@ -1417,8 +1492,11 @@ final class PageInkModel {
             from: point, to: point)
     }
 
-    /// The selected element's handle under the pen: a line's or arrow's
-    /// end, or near a closed shape's outline (resize).
+    /// The selected element's handle under the pen, nearest first: a
+    /// line's or arrow's end, the rotate knob, a corner of the selection
+    /// box (scale), or near a closed shape's outline (resize). A line
+    /// bound at both ends only offers its ends: turning or scaling it
+    /// would re-route straight back.
     private func handle(of id: String, at point: CGPoint) -> Drag.Kind? {
         guard case .shape(let s)? = elements[id], let origin = placed[id]?.origin else { return nil }
         let reach = handleReach / zoom
@@ -1426,13 +1504,17 @@ final class PageInkModel {
         if let ends = s.shape.ends {
             if ends.a.distance(to: local) <= reach { return .end(a: true) }
             if ends.b.distance(to: local) <= reach { return .end(a: false) }
-            return nil
+            if s.start != nil && s.end != nil { return nil }
         }
-        guard let bounds = renderer?.bounds(for: id),
-              bounds.insetBy(dx: -reach, dy: -reach).contains(point),
-              !bounds.insetBy(dx: reach, dy: reach).contains(point)
-        else { return nil }
-        return .resize(from: local)
+        let box = SelectionFrame(of: s, zoom: zoom)
+        if box.knob.distance(to: local) <= reach { return .rotate(center: box.center) }
+        if let i = box.corners.firstIndex(where: { $0.distance(to: local) <= reach }) {
+            return .scale(anchor: box.anchor(opposite: i))
+        }
+        guard s.shape.ends == nil else { return nil }
+        let q = box.inFrame(local)
+        let outside = max(abs(q.x) - box.frame.size.x / 2, abs(q.y) - box.frame.size.y / 2)
+        return abs(outside) <= Float(reach) ? .resize(from: local) : nil
     }
 
     /// The topmost element under the pen: overlay ink first (it is drawn
@@ -1470,9 +1552,26 @@ final class PageInkModel {
             let moved = CGPoint(x: drag.origin.x + drag.delta.x, y: drag.origin.y + drag.delta.y)
             renderer.setOrigins([drag.id: moved])
             reroute(layerIds(drag.placement), overrides: [drag.id: (drag.element, moved)])
-        case .resize(let from):
+        case .resize, .rotate, .scale:
             guard case .shape(var s) = drag.element else { break }
-            s.shape = resizeShape(shape: s.shape, from: from, to: point.local(to: drag.origin))
+            let (from, to) = (drag.from.local(to: drag.origin), point.local(to: drag.origin))
+            switch drag.kind {
+            case .resize(let handle):
+                s.shape = resizeShape(shape: s.shape, from: handle, to: to)
+            case .rotate(let c):
+                let by = atan2(to.y - c.y, to.x - c.x) - atan2(from.y - c.y, from.x - c.x)
+                s.shape = rotateShape(
+                    shape: s.shape, about: c, by: by, snapStep: rotateSnapStep,
+                    snapWithin: rotateSnapWithin)
+            case .scale(let anchor):
+                // How far along the handle's diagonal the pen is now.
+                let (f, t) = (from.offset(by: anchor.negated), to.offset(by: anchor.negated))
+                let k = (f.x * t.x + f.y * t.y) / max(f.x * f.x + f.y * f.y, .ulpOfOne)
+                s.shape = scaleShape(shape: s.shape, about: anchor, k: k)
+            default: break
+            }
+            // A bound end goes back where its target says; show that.
+            if s.start != nil || s.end != nil { s = route(s, at: drag.origin) }
             drag.edited = s
             renderer.update(.shape(s))
             reroute(layerIds(drag.placement), overrides: [drag.id: (.shape(s), drag.origin)])
@@ -1561,8 +1660,10 @@ final class PageInkModel {
         if case .sketch(let sketch) = placement { onSketchChanged?(sketch) }
     }
 
-    /// Outline the selection (with handles on a line's or arrow's ends)
-    /// and the shapes a drawn or dragged arrow end binds to.
+    /// Outline the selection with its handles (corners and rotate knob on
+    /// a shape's box, dots on a line's or arrow's ends; a stroke gets a
+    /// plain box) and the shapes a drawn or dragged arrow end binds to.
+    /// Drawn from what the renderer shows, so handles follow a drag.
     private func showSelection(targets: [Binding?] = []) {
         guard let renderer else { return }
         let thin = BrushRef(tool: .monoline, baseWidth: Float(1.5 / zoom), custom: nil)
@@ -1571,22 +1672,41 @@ final class PageInkModel {
         func outline(_ shape: KrabinkCore.Shape, _ brush: BrushRef) -> InkMesh {
             shapeOutlineMesh(shape: shape, brush: brush, color: selectionColor, tolerance: tolerance)
         }
+        let dotRadius = Float(5 / zoom)
+        func dot(_ at: Point2) -> KrabinkCore.Shape {
+            .ellipse(center: at, radii: Point2(x: dotRadius, y: dotRadius), angle: 0)
+        }
         var meshes: [(InkMesh, CGPoint)] = []
-        if let id = selected, let bounds = renderer.bounds(for: id) {
-            let pad = 6 / zoom
-            let r = bounds.insetBy(dx: -pad, dy: -pad)
-            let box = KrabinkCore.Shape.rect(
-                center: Point2(x: Float(r.midX), y: Float(r.midY)),
-                size: Point2(x: Float(r.width), y: Float(r.height)), angle: 0)
-            meshes.append((outline(box, thin), .zero))
-            if let shown = renderer.shown(id), case .shape(let s) = shown.element,
-               let ends = s.shape.ends
-            {
-                let radius = Float(5 / zoom)
-                for end in [ends.a, ends.b] {
-                    let dot = KrabinkCore.Shape.ellipse(
-                        center: end, radii: Point2(x: radius, y: radius), angle: 0)
-                    meshes.append((outline(dot, thin), shown.origin))
+        if let id = selected, let shown = renderer.shown(id) {
+            switch shown.element {
+            case .shape(let s):
+                let box = SelectionFrame(of: s, zoom: zoom)
+                let rect = KrabinkCore.Shape.rect(
+                    center: box.center, size: box.paddedSize, angle: box.frame.angle)
+                meshes.append((outline(rect, thin), shown.origin))
+                let fixed = s.shape.ends != nil && s.start != nil && s.end != nil
+                if !fixed {
+                    let side = Float(8 / zoom)
+                    for corner in box.corners {
+                        let handle = KrabinkCore.Shape.rect(
+                            center: corner, size: Point2(x: side, y: side), angle: box.frame.angle)
+                        meshes.append((outline(handle, thin), shown.origin))
+                    }
+                    meshes.append((outline(.line(a: box.top, b: box.knob), thin), shown.origin))
+                    meshes.append((outline(dot(box.knob), thin), shown.origin))
+                }
+                if let ends = s.shape.ends {
+                    for end in [ends.a, ends.b] {
+                        meshes.append((outline(dot(end), thin), shown.origin))
+                    }
+                }
+            case .stroke:
+                if let bounds = renderer.bounds(for: id) {
+                    let r = bounds.insetBy(dx: -selectionPad / zoom, dy: -selectionPad / zoom)
+                    let rect = KrabinkCore.Shape.rect(
+                        center: Point2(x: Float(r.midX), y: Float(r.midY)),
+                        size: Point2(x: Float(r.width), y: Float(r.height)), angle: 0)
+                    meshes.append((outline(rect, thin), .zero))
                 }
             }
         }

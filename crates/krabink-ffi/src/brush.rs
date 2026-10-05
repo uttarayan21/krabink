@@ -10,8 +10,8 @@ use krabink_core as pcore;
 use crate::engine::Result;
 
 use crate::types::{
-    Element, ElementOrigin, PageElement, Point2, Recognition, Shape, Stroke, StrokePoint, Tilt,
-    Tool, origin_lookup, rgba_from_u32, rgba_to_u32,
+    Element, ElementOrigin, Frame, PageElement, Point2, Recognition, Shape, Stroke, StrokePoint,
+    Tilt, Tool, origin_lookup, rgba_from_u32, rgba_to_u32,
 };
 
 /// One raw touch sample, before smoothing.
@@ -872,6 +872,39 @@ pub fn resize_shape(shape: Shape, from: Point2, to: Point2) -> Shape {
     pcore::Shape::from(shape)
         .resized(from.into(), to.into())
         .into()
+}
+
+/// The box a shape sits in; where the select tool puts its handles.
+#[uniffi::export]
+pub fn shape_frame(shape: Shape) -> Frame {
+    pcore::Shape::from(shape).frame().into()
+}
+
+/// The shape turned by `by` radians about `about`. The new heading (a
+/// closed shape's angle, a line's direction) snaps to a multiple of
+/// `snap_step` when within `snap_within` of one; a step of 0 never snaps.
+/// Pass the shape as it was at pen-down and the whole turn so far.
+#[uniffi::export]
+pub fn rotate_shape(
+    shape: Shape,
+    about: Point2,
+    by: f32,
+    snap_step: f32,
+    snap_within: f32,
+) -> Shape {
+    let snap = (snap_step > 0.0).then_some((snap_step, snap_within));
+    pcore::Shape::from(shape)
+        .rotated(about.into(), by, snap)
+        .into()
+}
+
+/// The shape scaled uniformly by `k` about `about`, which stays put: a
+/// corner handle dragged with the opposite corner fixed. `k` is floored so
+/// the shape keeps a size and never flips. Pass the pen-down shape and the
+/// whole factor so far.
+#[uniffi::export]
+pub fn scale_shape(shape: Shape, about: Point2, k: f32) -> Shape {
+    pcore::Shape::from(shape).scaled(about.into(), k).into()
 }
 
 /// The page layer with every bound line and arrow end re-derived from
