@@ -219,9 +219,16 @@ final class SketchUITests: XCTestCase {
         // The relaunch is on the draw tool. Fingers off the ink first (caret tap, scroll): they are the
         // editor's and must not leave the recognizer deaf to the next one.
         at(0.3, 0.8).tap()
-        at(0.3, 0.8).press(
-            forDuration: 0.1, thenDragTo: at(0.3, 0.7), withVelocity: .slow,
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3), "a finger tap did not land the caret")
+        at(0.3, 0.3).press(
+            forDuration: 0.1, thenDragTo: at(0.3, 0.2), withVelocity: .slow,
             thenHoldForDuration: 0.1)
+        at(0.7, 0.42).tap()
+        waitStatus(app, contains: "sel=1", timeout: 5)
+        // A tap off the ink lets go of it (high up: the first tap may
+        // have raised the keyboard).
+        at(0.3, 0.3).tap()
+        waitStatus(app, contains: "sel=0", timeout: 5)
         at(0.7, 0.42).tap()
         waitStatus(app, contains: "sel=1", timeout: 5)
 

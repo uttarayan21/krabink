@@ -290,7 +290,8 @@ primitives, triangles and polygons.
   drag moves. A finger anywhere else still scrolls or places the caret.
   Where only the Pencil draws, fingers select and move under every tool
   and the toolbar's tool stays the Pencil's; the next Pencil stroke with
-  another tool drops the selection.
+  another tool drops the selection. A finger tap off the elements and
+  handles drops it too.
 
 ## Order and effort
 

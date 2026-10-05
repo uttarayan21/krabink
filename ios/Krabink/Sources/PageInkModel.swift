@@ -1509,6 +1509,14 @@ final class PageInkModel {
         return hitTest(point) != nil
     }
 
+    /// A finger tap off the elements and the selection's handles drops
+    /// the selection.
+    func fingerTapped(at point: CGPoint) {
+        guard let id = selected, !penDown, handle(of: id, at: point) == nil, hitTest(point) == nil
+        else { return }
+        select(nil)
+    }
+
     /// The pen-down that follows is a claimed finger's: it selects,
     /// whatever the tool.
     func fingerClaimed() {
