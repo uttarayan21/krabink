@@ -1,4 +1,4 @@
-# Shipping the iPad app to the App Store
+# Shipping the iPad and iPhone app to the App Store
 
 What the repo already carries for a store build, what still lives outside
 it, and the exact commands. Pair this with `docs/architecture.md` for what
@@ -12,7 +12,7 @@ the app actually does.
 | Privacy manifest | `ios/Krabink/PrivacyInfo.xcprivacy` | No tracking, no collected data; required-reason APIs: UserDefaults (CA92.1), file timestamps (C617.1), system boot time (35F9.1). |
 | Version / build | `project.yml` → `MARKETING_VERSION`, `CURRENT_PROJECT_VERSION` | Marketing version is hand-bumped with `Cargo.toml`. Build number = `git rev-list --count HEAD`, set by `cargo xtask archive ios`. |
 | Store metadata in Info.plist | `project.yml` → `info.properties` | Display name, productivity category, launch screen, orientations, usage strings (camera, local network, Bonjour), `krabink://` URL scheme. No encryption key until ASC issues a compliance code (see below). |
-| Release config | `project.yml` → `settings.configs.Release` | iPad-only (`TARGETED_DEVICE_FAMILY: 2`), dSYMs. Debug stays universal for iPhone simulator checks. |
+| Release config | `project.yml` → `settings.configs.Release` | dSYMs. The app is universal (`TARGETED_DEVICE_FAMILY: 1,2` in the base settings): one build for iPad and iPhone. |
 | Dev screens | `KrabinkApp.swift` | Spike and brush-lab screens are `#if DEBUG`; store builds cannot reach them. |
 | Archive + export | `cargo xtask archive ios` (`paseo run archive-ios`) | Rebuilds the Rust core, archives Release, exports an `.ipa` or uploads to App Store Connect. |
 
@@ -74,8 +74,9 @@ processing finishes.
 - **External testers** (email invites or a public link, up to 10,000)
   need Beta App Review for the first build of each version. It uses the
   "Test Information" page:
-  - Beta App Description: "Krabink is a markdown notebook for iPad where
-    Apple Pencil ink lives on the page next to the text. Notes and ink
+  - Beta App Description: "Krabink is a markdown notebook for iPad and
+    iPhone where ink (Apple Pencil, or a finger on iPhone) lives on the
+    page next to the text. Notes and ink
     sync peer-to-peer between your own devices; no account."
   - Feedback email and a contact (name, phone, email) for the reviewer.
   - Sign-in: not required.
@@ -96,8 +97,12 @@ processing finishes.
   their own relay; nothing reaches the developer.
 - **Age rating**: none of the content flags apply → 4+.
 - **Category**: Productivity.
-- **Screenshots**: iPad 13" and 12.9" (2nd/3rd gen) sets are required for
-  iPad-only apps. Capture from the archive build on the M4 iPad Pro: note
+- **Screenshots**: a universal app needs an iPad 13" set and an iPhone
+  6.9" set (ASC scales both down for the smaller sizes). The iPhone set
+  does not exist yet: capture it before the first universal submission
+  (note list, a note in the editor, the same note in draw mode with the
+  tool picker up, settings). iPad: capture from the archive build on the
+  M4 iPad Pro: note
   list with a note open, the reading view of a note with ink on it, the
   page mid-stroke with the keyboard up, settings with a paired desktop.
   A simulator set with placeholder notes and ink lives in
@@ -119,8 +124,9 @@ processing finishes.
 ## Checks before uploading
 
 - `cargo xtask check ios --configuration Release` compiles the store
-  configuration for the simulator (iPad-only, dev screens compiled out).
-- `cargo xtask run ios` still installs the Debug build on the iPad;
+  configuration for the simulator (dev screens compiled out).
+- `cargo xtask run ios` still installs the Debug build on the iPad
+  (or a connected iPhone, `--device <udid>` to pick one);
   the store build is the same code with `-Osize`/whole-module Swift and
   the release Rust core.
 - Local network prompt: first sync on a new iPad shows the iOS "local

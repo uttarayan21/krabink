@@ -38,9 +38,21 @@ private let tapDelay: Duration = .milliseconds(250)
 /// Which touches ink. The Pencil only on device (fingers scroll and place
 /// the caret); fingers too on the simulator and under `-anyInput 1`, so
 /// UI tests can draw with drags. `-anyInput 0` forces pencil-only anywhere.
+///
+/// An iPhone has no Pencil, so there the note's draw mode picks the policy
+/// (`phone(drawing:)`): off, fingers scroll and type as on the iPad; on,
+/// one finger inks and two scroll.
 enum InputPolicy {
     case pencilOnly
     case anyInput
+
+    /// No Pencil to tell ink from scrolling: the note offers a draw mode.
+    static var hasDrawMode: Bool { UIDevice.current.userInterfaceIdiom == .phone }
+
+    /// Draw mode at launch: off, unless `-anyInput 1` asks for ink.
+    static var launchDrawing: Bool { UserDefaults.standard.bool(forKey: "anyInput") }
+
+    static func phone(drawing: Bool) -> InputPolicy { drawing ? .anyInput : .pencilOnly }
 
     static var launch: InputPolicy {
         let defaults = UserDefaults.standard
@@ -135,7 +147,6 @@ final class PenGestureRecognizer: UIGestureRecognizer, UIGestureRecognizerDelega
     var onFingerClaimed: (() -> Void)?
     /// A recognizer on the same view that does not wait for this one.
     weak var bystander: UIGestureRecognizer?
-    private let policy: InputPolicy
     /// Touch locations are taken in this view (the text view: its bounds
     /// are content coordinates).
     weak var canvasSpace: UIView?
@@ -144,6 +155,11 @@ final class PenGestureRecognizer: UIGestureRecognizer, UIGestureRecognizerDelega
     /// where and when it landed.
     private var pending: (samples: [RawSample], at: CGPoint, since: TimeInterval)?
     private var pendingTask: Task<Void, Never>?
+
+    /// Which touches ink; changes with the iPhone's draw mode.
+    var policy: InputPolicy {
+        didSet { applyPolicy() }
+    }
 
     init(policy: InputPolicy) {
         self.policy = policy
@@ -154,11 +170,15 @@ final class PenGestureRecognizer: UIGestureRecognizer, UIGestureRecognizerDelega
         // Once this recognizes, the text view never sees the touch: no
         // caret, no magnifier, no selection under a stroke.
         cancelsTouchesInView = true
+        delaysTouchesEnded = false
+        delegate = self
+        applyPolicy()
+    }
+
+    private func applyPolicy() {
         // A finger that turns out to be a tap is handed to the view late
         // (≤ `tapDelay`), a stroke never.
         delaysTouchesBegan = policy == .anyInput
-        delaysTouchesEnded = false
-        delegate = self
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {

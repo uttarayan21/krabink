@@ -63,6 +63,14 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
     let textView: UITextView
     let pen: PenGestureRecognizer
     let model: NoteModel
+    /// Which touches ink; changes with the iPhone's draw mode.
+    var policy: InputPolicy {
+        didSet {
+            guard policy != oldValue else { return }
+            pen.policy = policy
+            applyScrollPolicy()
+        }
+    }
     /// Pencil hover (Pencil 2 on M2 iPads, Pencil Pro): the sample under
     /// the tip while it hovers, `nil` when it leaves.
     var onHover: ((RawSample?) -> Void)?
@@ -108,6 +116,7 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
 
     init?(model: NoteModel, policy: InputPolicy) {
         self.model = model
+        self.policy = policy
         metal = MTKView(frame: .zero, device: MTLCreateSystemDefaultDevice())
         guard let renderer = InkRenderer(view: metal) else { return nil }
         self.renderer = renderer
@@ -140,16 +149,7 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
         textView.delegate = self
         textView.layoutManager.delegate = self
         textView.layoutManager.allowsNonContiguousLayout = false
-        let direct = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
-        switch policy {
-        case .pencilOnly:
-            // The Pencil never scrolls; fingers do.
-            textView.panGestureRecognizer.allowedTouchTypes =
-                direct + [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
-        case .anyInput:
-            // One finger inks; two scroll.
-            textView.panGestureRecognizer.minimumNumberOfTouches = 2
-        }
+        applyScrollPolicy()
         textView.addInteraction(UIScribbleInteraction(delegate: self))
         textView.addSubview(boxOverlay)
         addSubview(textView)
@@ -173,6 +173,22 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    private func applyScrollPolicy() {
+        let pan = textView.panGestureRecognizer
+        switch policy {
+        case .pencilOnly:
+            // The Pencil never scrolls; fingers do.
+            pan.allowedTouchTypes = [
+                NSNumber(value: UITouch.TouchType.direct.rawValue),
+                NSNumber(value: UITouch.TouchType.indirectPointer.rawValue),
+            ]
+            pan.minimumNumberOfTouches = 1
+        case .anyInput:
+            // One finger inks; two scroll.
+            pan.minimumNumberOfTouches = 2
+        }
+    }
 
     override var canBecomeFirstResponder: Bool { true }
 
@@ -583,11 +599,16 @@ struct NoteCanvas: UIViewRepresentable {
     let paper: UInt32?
     /// Reading view instead of the editor.
     let preview: Bool
+    /// iPhone draw mode: fingers ink and the tool picker shows. `nil` on
+    /// the iPad, where the Pencil inks and the picker is always there.
+    var drawing: Bool?
+
+    private var policy: InputPolicy { drawing.map(InputPolicy.phone) ?? .launch }
 
     func makeCoordinator() -> Coordinator { Coordinator(model: model.ink) }
 
     func makeUIView(context: Context) -> UIView {
-        guard let canvas = NoteCanvasView(model: model, policy: .launch) else {
+        guard let canvas = NoteCanvasView(model: model, policy: policy) else {
             // No Metal device: nothing to draw with. Leave a labelled blank so
             // the note still opens.
             let fallback = UILabel()
@@ -630,10 +651,9 @@ struct NoteCanvas: UIViewRepresentable {
         // instead (UI tests).
         if ink.toolOverride == nil {
             let picker = Self.makePicker()
-            picker.setVisible(true, forFirstResponder: canvas)
-            picker.setVisible(true, forFirstResponder: canvas.textView)
             picker.addObserver(context.coordinator)
             context.coordinator.picker = picker
+            context.coordinator.showPicker(drawing ?? true, on: canvas)
             canvas.becomeFirstResponder()
             if let selected = context.coordinator.selectedPick { ink.picked = selected }
         }
@@ -647,6 +667,12 @@ struct NoteCanvas: UIViewRepresentable {
     func updateUIView(_ view: UIView, context: Context) {
         guard let canvas = view as? NoteCanvasView else { return }
         canvas.preview = preview
+        canvas.policy = policy
+        if let drawing, context.coordinator.pickerShown != drawing {
+            context.coordinator.showPicker(drawing, on: canvas)
+            // Drawing needs the page, not the keyboard.
+            if drawing { canvas.becomeFirstResponder() }
+        }
         canvas.applyTheme()
         canvas.syncFromModel()
     }
@@ -687,7 +713,19 @@ struct NoteCanvas: UIViewRepresentable {
         /// Kept alive for the ink model, which only holds it weakly.
         var layout: CanvasLineLayout?
 
+        private(set) var pickerShown = false
+
         init(model: PageInkModel) { self.model = model }
+
+        /// On the iPhone the picker is a bar across the bottom of the
+        /// screen, so it only shows in draw mode, and never with the
+        /// keyboard.
+        func showPicker(_ visible: Bool, on canvas: NoteCanvasView) {
+            pickerShown = visible
+            guard let picker else { return }
+            picker.setVisible(visible, forFirstResponder: canvas)
+            picker.setVisible(visible && !InputPolicy.hasDrawMode, forFirstResponder: canvas.textView)
+        }
 
         /// The picker's selection as a brush or the eraser; `nil` for an
         /// item the core has no brush for.
