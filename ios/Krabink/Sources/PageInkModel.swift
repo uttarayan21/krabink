@@ -1491,11 +1491,15 @@ final class PageInkModel {
     /// Whether a finger landing at `point` belongs to the select tool
     /// rather than the editor: it is on the selection's handle or on an
     /// element, so a tap selects and a drag moves. Elsewhere the finger
-    /// scrolls or places the caret.
-    func claimsFinger(at point: CGPoint) -> Bool {
-        guard tool == .select, !penDown else { return false }
-        if let id = selected, handle(of: id, at: point) != nil { return true }
-        return hitTest(point) != nil
+    /// scrolls or places the caret. With `switching` (fingers do not ink)
+    /// a finger on an element under any other tool switches to the
+    /// select tool first.
+    func claimsFinger(at point: CGPoint, switching: Bool) -> Bool {
+        guard !penDown else { return false }
+        if tool == .select, let id = selected, handle(of: id, at: point) != nil { return true }
+        guard tool == .select || switching, hitTest(point) != nil else { return false }
+        tool = .select
+        return true
     }
 
     private func startDrag(_ id: String, kind: Drag.Kind, at point: CGPoint) {

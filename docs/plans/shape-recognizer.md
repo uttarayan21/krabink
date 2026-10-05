@@ -288,6 +288,8 @@ primitives, triangles and polygons.
 - With the select tool a finger that lands on an element or a handle is
   pen input at once, also where only the Pencil draws: a tap selects, a
   drag moves. A finger anywhere else still scrolls or places the caret.
+  Where only the Pencil draws, a finger on an element under any other
+  tool switches to the select tool first.
 
 ## Order and effort
 

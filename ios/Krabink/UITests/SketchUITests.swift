@@ -187,8 +187,8 @@ final class SketchUITests: XCTestCase {
         waitStatus(app, contains: "shapes=2", timeout: 2)
     }
 
-    /// The select tool takes a finger that lands on ink even where only
-    /// the Pencil draws (`-anyInput 0`, the device's policy): a tap
+    /// Where only the Pencil draws (`-anyInput 0`, the device's policy)
+    /// a finger that lands on ink switches to the select tool: a tap
     /// selects at once and a drag moves the shape instead of scrolling.
     func testFingerSelectsAndDragsWhenOnlyThePencilDraws() {
         func pick(_ app: XCUIApplication, _ title: String) {
@@ -215,7 +215,12 @@ final class SketchUITests: XCTestCase {
         app.collectionViews.firstMatch.staticTexts["Finger"].firstMatch.tap()
         waitStatus(app, contains: "shapes=1", timeout: 10)
         editor = page(app)
-        pick(app, "Select")
+        // The relaunch is on the draw tool. Fingers off the ink first (caret tap, scroll): they are the
+        // editor's and must not leave the recognizer deaf to the next one.
+        at(0.3, 0.8).tap()
+        at(0.3, 0.8).press(
+            forDuration: 0.1, thenDragTo: at(0.3, 0.7), withVelocity: .slow,
+            thenHoldForDuration: 0.1)
         at(0.7, 0.42).tap()
         waitStatus(app, contains: "sel=1", timeout: 5)
 

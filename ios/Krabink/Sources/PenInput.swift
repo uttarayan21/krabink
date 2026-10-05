@@ -12,10 +12,12 @@
 // `tapSlop` points or lasted `tapDelay`, and fails instead when the touch
 // ends before that, so the text view's tap lands the caret.
 //
-// Under either policy a finger the canvas claims (`claimsFinger`: the
-// select tool, over an element or a handle) is pen input the moment it
-// lands, so a tap selects and a drag moves. Any other finger under
-// `.pencilOnly` is ignored here: it scrolls or lands the caret.
+// Under either policy a finger the canvas claims (`claimsFinger`: over an
+// element or a handle of the selection, for the select tool) is pen input
+// the moment it lands, so a tap selects and a drag moves. Under
+// `.pencilOnly` that holds whatever the tool is (the canvas switches to
+// the select tool); any other finger is ignored here and scrolls or lands
+// the caret.
 
 import KrabinkCore
 import UIKit
