@@ -196,6 +196,9 @@ private let bindReach: CGFloat = 12
 private let selectReach: CGFloat = 8
 /// The select tool's outline and the bind highlight (systemBlue).
 private let selectionColor: UInt32 = 0x3478_F6CC
+/// The selected element's ink while it is selected: the same blue,
+/// opaque so it hides the ink's own colour. Never stored.
+private let selectionTint: UInt32 = 0x3478_F6FF
 /// Screen points the selection box clears the shape's frame by, and how
 /// far above its top edge the rotate knob sits. The pad keeps a line's
 /// corner handles clear of its end dots (`handleReach` apart at least).
@@ -1660,9 +1663,10 @@ final class PageInkModel {
         if case .sketch(let sketch) = placement { onSketchChanged?(sketch) }
     }
 
-    /// Outline the selection with its handles (corners and rotate knob on
-    /// a shape's box, dots on a line's or arrow's ends; a stroke gets a
-    /// plain box) and the shapes a drawn or dragged arrow end binds to.
+    /// Tint the selection and outline it with its handles (corners and
+    /// rotate knob on a shape's box, dots on a line's or arrow's ends; a
+    /// stroke gets a plain box) and the shapes a drawn or dragged arrow
+    /// end binds to.
     /// Drawn from what the renderer shows, so handles follow a drag.
     private func showSelection(targets: [Binding?] = []) {
         guard let renderer else { return }
@@ -1678,6 +1682,18 @@ final class PageInkModel {
         }
         var meshes: [(InkMesh, CGPoint)] = []
         if let id = selected, let shown = renderer.shown(id) {
+            // The selection's own ink again in the selection colour, over
+            // the ink: the box alone is ambiguous where elements overlap.
+            var tinted = shown.element
+            switch tinted {
+            case .shape(var s):
+                s.color = selectionTint
+                tinted = .shape(s)
+            case .stroke(var s):
+                s.color = selectionTint
+                tinted = .stroke(s)
+            }
+            meshes.append((elementMesh(element: tinted, tolerance: tolerance), shown.origin))
             switch shown.element {
             case .shape(let s):
                 let box = SelectionFrame(of: s, zoom: zoom)
