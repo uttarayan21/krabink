@@ -1,7 +1,10 @@
 {
   "scripts": {
     "run-ipad": {
-      "command": "cargo xtask run ios"
+      "command": "cargo xtask run ios --name ipad"
+    },
+    "run-iphone": {
+      "command": "cargo xtask run ios --name iphone"
     },
     "check-ipad": {
       "command": "cargo xtask check ios"

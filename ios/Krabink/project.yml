@@ -48,6 +48,10 @@ targets:
         # instead; once it issues a code, set both keys here.
         # See docs/release-ios.md.
         UILaunchScreen: {}
+        # iPhone caps an app's own drawing (the Metal ink layer, display
+        # links) at 60 Hz unless this is set; iPad never does. Without it
+        # ink trails the 120 Hz text scroll on ProMotion phones.
+        CADisableMinimumFrameDurationOnPhone: true
         # Documents visible in Files, for `-recordStrokes 1` recordings.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true

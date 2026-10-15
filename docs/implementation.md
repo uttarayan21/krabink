@@ -621,7 +621,7 @@ cargo run -p krabink -- --data-dir /tmp/b pair '<uri>'   # second desktop joins
 cargo xtask build core                   # xcframework + Krabink.swift
 cargo xtask test swift                      # bindings smoke
 cargo xtask check ios                       # simulator compile, no signing
-cargo xtask run ios                         # device build + install + launch (paseo: run-ipad)
+cargo xtask run ios                         # device build + install + launch (paseo: run-ipad, run-iphone)
 cargo xtask gen xcodeproj                    # regenerate Krabink.xcodeproj from project.yml
 xcodebuild -project Krabink.xcodeproj -scheme Krabink -destination 'platform=iOS Simulator,id=<udid>' build-for-testing
 KRABINK_TEST_PAIR='krabink://pair?…' xcodebuild test-without-building ... -only-testing:KrabinkUITests/SketchUITests
