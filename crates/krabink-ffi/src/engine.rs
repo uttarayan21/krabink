@@ -21,8 +21,9 @@ use tokio::sync::mpsc;
 use crate::brush::{AssetInfo, AssetKind};
 use crate::net::{self, Cmd};
 use crate::types::{
-    AppearanceInfo, BrushInfo, DeviceInfo, Element, NoteInfo, PageElement, PageProbe, PairInfo,
-    PeerInfo, ShapeElement, Stroke, StrokePoint, SyncState, Tilt, Tool, rgba_from_u32,
+    AppearanceInfo, Binding, BrushInfo, DeviceInfo, Element, ElementOrigin, NoteInfo, PageElement,
+    PageMove, PageProbe, PairInfo, PeerInfo, ShapeElement, Stroke, StrokePoint, SyncState, Tilt,
+    Tool, origin_lookup, rgba_from_u32,
 };
 
 /// Errors crossing the FFI boundary. Flattened to message-carrying variants;
@@ -1078,6 +1079,94 @@ impl NoteSession {
         self.commit(Flush::Immediate, |doc| doc.remove_page_element(id))
     }
 
+    /// The topmost page element under the pen, changing nothing: the
+    /// select tool's hit test. Probes as for [`Self::erase_page_at`]; a
+    /// closed shape is hit anywhere inside, not only on its outline.
+    pub fn hit_page_at(&self, probes: Vec<PageProbe>, radius: f32) -> Result<Option<String>> {
+        let probes: HashMap<pcore::ElementId, [f32; 2]> = probes
+            .iter()
+            .filter_map(|p| Some((p.element.parse().ok()?, [p.x, p.y])))
+            .collect();
+        self.read(|doc| {
+            Ok(doc
+                .page_elements()
+                .iter()
+                .rev()
+                .map(|p| &p.element)
+                .find(|el| {
+                    probes
+                        .get(&el.id())
+                        .is_some_and(|&p| touches(el, p, radius))
+                })
+                .map(|el| el.id().to_string()))
+        })
+    }
+
+    /// Commit a drag of page elements: each moves by its delta and may be
+    /// re-anchored to the line it was dropped on. Lines and arrows bound
+    /// to a moved element are re-routed in the same commit, and a line or
+    /// arrow moved without its targets lets go of them. `origins` gives
+    /// every page element's line origin after the move.
+    pub fn move_page_elements(
+        &self,
+        moves: Vec<PageMove>,
+        origins: Vec<ElementOrigin>,
+    ) -> Result<()> {
+        let moves = moves
+            .into_iter()
+            .map(|m| {
+                Ok(pcore::ElementMove {
+                    id: self.parse_element(&m.element)?,
+                    delta: [m.dx, m.dy],
+                    anchor: m.anchor.map(pcore::Anchor),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let origin_of = origin_lookup(&origins);
+        self.commit(Flush::Immediate, |doc| {
+            doc.move_page_elements(&moves, origin_of)
+        })
+    }
+
+    /// Replace a page shape's geometry and bindings (a resize, a re-bound
+    /// arrow end), optionally re-anchoring it; re-routes what is bound to
+    /// it. `origins` as for [`Self::move_page_elements`].
+    pub fn update_page_shape(
+        &self,
+        shape: ShapeElement,
+        anchor: Option<Vec<u8>>,
+        origins: Vec<ElementOrigin>,
+    ) -> Result<()> {
+        self.parse_element(&shape.id)?;
+        let shape = pcore::ShapeElement::from(shape);
+        let anchor = anchor.map(pcore::Anchor);
+        let origin_of = origin_lookup(&origins);
+        self.commit(Flush::Immediate, |doc| {
+            doc.update_page_shape(&shape, anchor.as_ref(), origin_of)
+        })
+    }
+
+    /// The binding a line or arrow end at (`x`, `y`) in page space would
+    /// take: the topmost rect, diamond or ellipse containing the point or
+    /// within `reach` of its outline. `exclude` skips the arrow being
+    /// edited.
+    pub fn binding_at_page(
+        &self,
+        x: f32,
+        y: f32,
+        origins: Vec<ElementOrigin>,
+        reach: f32,
+        exclude: Option<String>,
+    ) -> Result<Option<Binding>> {
+        let exclude = exclude.and_then(|id| id.parse().ok());
+        let origin_of = origin_lookup(&origins);
+        self.read(|doc| {
+            let elements: Vec<pcore::Element> =
+                doc.page_elements().into_iter().map(|p| p.element).collect();
+            Ok(pcore::binding_at(&elements, [x, y], origin_of, reach, exclude).map(Into::into))
+        })
+    }
+
     /// Where the pen is on the page, in `anchor`'s space, hovering
     /// (`down == false`) or drawing: peers show a pointer there. `tool ==
     /// None` means the eraser is selected and `base_width` is its
@@ -1249,4 +1338,74 @@ impl NoteSession {
         let id = self.parse_element(&element)?;
         self.commit(Flush::Immediate, |doc| doc.remove_element(sketch, id))
     }
+
+    /// The topmost sketch element under (`x`, `y`) in the sketch's local
+    /// space, changing nothing. Same rule as [`Self::hit_page_at`].
+    pub fn hit_at(&self, sketch: String, x: f32, y: f32, radius: f32) -> Result<Option<String>> {
+        let sketch = self.parse_sketch(&sketch)?;
+        self.read(|doc| {
+            Ok(doc
+                .elements(sketch)?
+                .iter()
+                .rev()
+                .find(|el| touches(el, [x, y], radius))
+                .map(|el| el.id().to_string()))
+        })
+    }
+
+    /// Commit a drag of sketch elements by (`dx`, `dy`), re-routing what
+    /// is bound to them. Same rules as [`Self::move_page_elements`].
+    pub fn move_elements(
+        &self,
+        sketch: String,
+        elements: Vec<String>,
+        dx: f32,
+        dy: f32,
+    ) -> Result<()> {
+        let sketch = self.parse_sketch(&sketch)?;
+        let ids = elements
+            .iter()
+            .map(|id| self.parse_element(id))
+            .collect::<Result<Vec<_>>>()?;
+        self.commit(Flush::Immediate, |doc| {
+            doc.move_elements(sketch, &ids, [dx, dy])
+        })
+    }
+
+    /// Replace a sketch shape's geometry and bindings, re-routing what is
+    /// bound to it.
+    pub fn update_shape(&self, sketch: String, shape: ShapeElement) -> Result<()> {
+        let sketch = self.parse_sketch(&sketch)?;
+        self.parse_element(&shape.id)?;
+        let shape = pcore::ShapeElement::from(shape);
+        self.commit(Flush::Immediate, |doc| doc.update_shape(sketch, &shape))
+    }
+
+    /// The binding a line or arrow end at (`x`, `y`) in the sketch's local
+    /// space would take. Same rule as [`Self::binding_at_page`].
+    pub fn binding_at(
+        &self,
+        sketch: String,
+        x: f32,
+        y: f32,
+        reach: f32,
+        exclude: Option<String>,
+    ) -> Result<Option<Binding>> {
+        let sketch = self.parse_sketch(&sketch)?;
+        let exclude = exclude.and_then(|id| id.parse().ok());
+        self.read(|doc| {
+            let elements = doc.elements(sketch)?;
+            Ok(
+                pcore::binding_at(&elements, [x, y], |_| [0.0, 0.0], reach, exclude)
+                    .map(Into::into),
+            )
+        })
+    }
+}
+
+/// Whether a pen circle at `p` touches the element: its ink, or anywhere
+/// inside a closed shape.
+fn touches(el: &pcore::Element, p: [f32; 2], radius: f32) -> bool {
+    el.ink().hits(&el.outline(), p[0], p[1], radius)
+        || matches!(el, pcore::Element::Shape(s) if pcore::contains(&s.shape, p))
 }

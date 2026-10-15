@@ -11,6 +11,13 @@
 // the caret: the recognizer holds the first samples until the touch moved
 // `tapSlop` points or lasted `tapDelay`, and fails instead when the touch
 // ends before that, so the text view's tap lands the caret.
+//
+// Under either policy a finger the canvas claims (`claimsFinger`: over an
+// element or a handle of the selection, for the select tool) is pen input
+// the moment it lands, so a tap selects and a drag moves. Under
+// `.pencilOnly` that holds whatever the tool is (fingers always select,
+// the Pencil keeps the toolbar's tool); any other finger is ignored here
+// and scrolls or lands the caret.
 
 import KrabinkCore
 import UIKit
@@ -93,6 +100,9 @@ extension RawSample {
             expectsUpdate: expectsUpdate)
     }
 
+    /// Where the sample is, in content space.
+    var point: CGPoint { CGPoint(x: CGFloat(x), y: CGFloat(y)) }
+
     /// The same sample moved by `-origin`: content space to anchor space.
     func translated(by origin: CGPoint) -> RawSample {
         var out = self
@@ -118,6 +128,14 @@ final class PenGestureRecognizer: UIGestureRecognizer, UIGestureRecognizerDelega
     }
 
     var onPhase: ((Phase) -> Void)?
+    /// Whether a finger landing here (in `canvasSpace`) is pen input at
+    /// once, whatever the policy.
+    var claimsFinger: ((CGPoint) -> Bool)?
+    /// A finger was claimed: the view's scroll must let go of it.
+    var onFingerClaimed: (() -> Void)?
+    /// A recognizer on the same view that does not wait for this one.
+    weak var bystander: UIGestureRecognizer?
+    private let policy: InputPolicy
     /// Touch locations are taken in this view (the text view: its bounds
     /// are content coordinates).
     weak var canvasSpace: UIView?
@@ -128,8 +146,11 @@ final class PenGestureRecognizer: UIGestureRecognizer, UIGestureRecognizerDelega
     private var pendingTask: Task<Void, Never>?
 
     init(policy: InputPolicy) {
+        self.policy = policy
         super.init(target: nil, action: nil)
-        allowedTouchTypes = policy.touchTypes
+        // Fingers may be seen (one may be claimed); `shouldReceive` keeps
+        // out those the policy leaves to the view.
+        allowedTouchTypes = InputPolicy.anyInput.touchTypes
         // Once this recognizes, the text view never sees the touch: no
         // caret, no magnifier, no selection under a stroke.
         cancelsTouchesInView = true
@@ -141,15 +162,22 @@ final class PenGestureRecognizer: UIGestureRecognizer, UIGestureRecognizerDelega
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard let space = canvasSpace else { return }
         if tracked != nil {
             // A second finger: a scroll, not a stroke.
             cancelStroke()
             return
         }
-        guard let touch = touches.first, let space = canvasSpace else { return }
+        guard let touch = touches.first else { return }
         tracked = touch
         let sample = RawSample(touch, in: space)
         if touch.type == .pencil {
+            onPhase?(.began(sample))
+            state = .began
+            return
+        }
+        if claims(touch, in: space) {
+            onFingerClaimed?()
             onPhase?(.began(sample))
             state = .began
             return
@@ -206,6 +234,10 @@ final class PenGestureRecognizer: UIGestureRecognizer, UIGestureRecognizerDelega
         onPhase?(.estimateUpdated(touches.map { RawSample($0, in: space) }))
     }
 
+    private func claims(_ touch: UITouch, in space: UIView) -> Bool {
+        claimsFinger?(touch.location(in: space)) ?? false
+    }
+
     override func reset() {
         tracked = nil
         dropPending()
@@ -247,6 +279,15 @@ final class PenGestureRecognizer: UIGestureRecognizer, UIGestureRecognizerDelega
 
     // MARK: arbitration with the text view
 
+    /// Under `.pencilOnly` a finger is the view's (and a resting palm must
+    /// not cancel a stroke) unless it is claimed. One this recognizer
+    /// never receives does not hold up the text view's taps.
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        guard policy == .pencilOnly, touch.type != .pencil else { return true }
+        guard tracked == nil, let space = canvasSpace else { return false }
+        return claims(touch, in: space)
+    }
+
     /// Two-finger scrolling (the text view's pan) may run alongside a
     /// stroke; the stroke cancels itself when the second finger lands.
     func gestureRecognizer(
@@ -263,7 +304,8 @@ final class PenGestureRecognizer: UIGestureRecognizer, UIGestureRecognizerDelega
         _ gestureRecognizer: UIGestureRecognizer,
         shouldBeRequiredToFailBy other: UIGestureRecognizer
     ) -> Bool {
-        !(other is UIPanGestureRecognizer) && other.view === gestureRecognizer.view
+        !(other is UIPanGestureRecognizer) && other !== bystander
+            && other.view === gestureRecognizer.view
     }
 }
 

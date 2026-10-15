@@ -2,19 +2,49 @@
 //! exchanging updates in arbitrary order always converge.
 
 use krabink_core::{
-    ElementId, NoteDoc, NoteId, PointKind, Rgba, Shape, ShapeElement, Stroke, StrokeId,
-    StrokePoint, Style, Tool,
+    Binding, Element, ElementId, ElementMove, NoteDoc, NoteId, PointKind, Rgba, Shape,
+    ShapeElement, SketchId, Stroke, StrokeId, StrokePoint, Style, Tool,
 };
 use proptest::prelude::*;
 
 #[derive(Debug, Clone)]
 enum Op {
-    Insert { at: usize, text: String },
-    Delete { at: usize, len: usize },
-    AddStroke { seed: u32 },
-    AddShape { seed: u32 },
-    AddPageStroke { seed: u32, at: usize },
-    RemovePage { nth: usize },
+    Insert {
+        at: usize,
+        text: String,
+    },
+    Delete {
+        at: usize,
+        len: usize,
+    },
+    AddStroke {
+        seed: u32,
+    },
+    AddShape {
+        seed: u32,
+    },
+    AddPageStroke {
+        seed: u32,
+        at: usize,
+    },
+    RemovePage {
+        nth: usize,
+    },
+    MoveSketch {
+        nth: usize,
+        dx: f32,
+        dy: f32,
+    },
+    MovePage {
+        nth: usize,
+        dx: f32,
+        dy: f32,
+        reanchor: Option<usize>,
+    },
+    Connect {
+        from: usize,
+        to: usize,
+    },
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -25,6 +55,24 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         (0u32..1000).prop_map(|seed| Op::AddShape { seed }),
         (0u32..1000, 0usize..64).prop_map(|(seed, at)| Op::AddPageStroke { seed, at }),
         (0usize..8).prop_map(|nth| Op::RemovePage { nth }),
+        (0usize..8, -50.0f32..50.0, -50.0f32..50.0).prop_map(|(nth, dx, dy)| Op::MoveSketch {
+            nth,
+            dx,
+            dy
+        }),
+        (
+            0usize..8,
+            -50.0f32..50.0,
+            -50.0f32..50.0,
+            proptest::option::of(0usize..64)
+        )
+            .prop_map(|(nth, dx, dy, reanchor)| Op::MovePage {
+                nth,
+                dx,
+                dy,
+                reanchor
+            }),
+        (0usize..8, 0usize..8).prop_map(|(from, to)| Op::Connect { from, to }),
     ]
 }
 
@@ -51,7 +99,32 @@ fn sample_stroke(seed: u32) -> Stroke {
     }
 }
 
-fn apply(doc: &NoteDoc, sketch: krabink_core::SketchId, op: &Op) {
+const STYLE: Style = Style {
+    tool: Tool::Pen,
+    color: Rgba::BLACK,
+    width: 2.0,
+};
+
+fn shape_element(shape: Shape, created_ms: u64) -> ShapeElement {
+    ShapeElement {
+        id: ElementId::new(),
+        shape,
+        style: STYLE,
+        start: None,
+        end: None,
+        created_ms,
+    }
+}
+
+fn bind(element: ElementId) -> Option<Binding> {
+    Some(Binding {
+        element,
+        fixed_point: [0.5, 0.5],
+        gap: 4.0,
+    })
+}
+
+fn apply(doc: &NoteDoc, sketch: SketchId, op: &Op) {
     match op {
         Op::Insert { at, text } => {
             let len = doc.text_len();
@@ -78,9 +151,58 @@ fn apply(doc: &NoteDoc, sketch: krabink_core::SketchId, op: &Op) {
                 doc.remove_page_element(entry.element.id()).unwrap();
             }
         }
+        Op::MoveSketch { nth, dx, dy } => {
+            let elements = doc.elements(sketch).unwrap();
+            if let Some(el) = elements.get(*nth % elements.len().max(1)) {
+                doc.move_elements(sketch, &[el.id()], [*dx, *dy]).unwrap();
+            }
+        }
+        Op::MovePage {
+            nth,
+            dx,
+            dy,
+            reanchor,
+        } => {
+            let page = doc.page_elements();
+            if let Some(entry) = page.get(*nth % page.len().max(1)) {
+                let anchor = reanchor.map(|at| doc.anchor_at(at.min(doc.text_len())).unwrap());
+                let moves = [ElementMove {
+                    id: entry.element.id(),
+                    delta: [*dx, *dy],
+                    anchor,
+                }];
+                doc.move_page_elements(&moves, |_| [0.0, 0.0]).unwrap();
+            }
+        }
+        Op::Connect { from, to } => {
+            let closed: Vec<ElementId> = doc
+                .elements(sketch)
+                .unwrap()
+                .into_iter()
+                .filter_map(|el| match el {
+                    Element::Shape(s) if s.shape.is_closed() => Some(s.id),
+                    _ => None,
+                })
+                .collect();
+            if closed.is_empty() {
+                return;
+            }
+            let arrow = ShapeElement {
+                start: bind(closed[*from % closed.len()]),
+                end: bind(closed[*to % closed.len()]),
+                ..shape_element(
+                    Shape::Arrow {
+                        a: [0.0, 0.0],
+                        b: [1.0, 1.0],
+                    },
+                    0,
+                )
+            };
+            doc.add_shape(sketch, &arrow).unwrap();
+        }
         Op::AddShape { seed } => {
             let s = *seed as f32;
-            let shape = match seed % 4 {
+            let shape = match seed % 5 {
                 0 => Shape::Line {
                     a: [s, 0.0],
                     b: [s + 10.0, 5.0],
@@ -94,28 +216,19 @@ fn apply(doc: &NoteDoc, sketch: krabink_core::SketchId, op: &Op) {
                     size: [30.0, 20.0],
                     angle: 0.1,
                 },
+                3 => Shape::Diamond {
+                    center: [0.0, s],
+                    size: [30.0, 20.0],
+                    angle: 0.0,
+                },
                 _ => Shape::Ellipse {
                     center: [s, 0.0],
                     radii: [15.0, 10.0],
                     angle: 0.0,
                 },
             };
-            doc.add_shape(
-                sketch,
-                &ShapeElement {
-                    id: ElementId::new(),
-                    shape,
-                    style: Style {
-                        tool: Tool::Pen,
-                        color: Rgba::BLACK,
-                        width: 2.0,
-                    },
-                    start: None,
-                    end: None,
-                    created_ms: u64::from(*seed),
-                },
-            )
-            .unwrap();
+            doc.add_shape(sketch, &shape_element(shape, u64::from(*seed)))
+                .unwrap();
         }
     }
 }
@@ -132,9 +245,20 @@ proptest! {
         let id = NoteId::new();
         let a = NoteDoc::new(id);
 
-        // Shared baseline so both replicas know the sketch container.
+        // Shared baseline so both replicas know the sketch container, and
+        // two boxes joined by an arrow for concurrent moves to pull apart.
         let sketch = a.create_sketch(0).unwrap();
         a.splice_text(0, 0, "baseline text\n").unwrap();
+        let rect = |x: f32| shape_element(Shape::Rect { center: [x, 0.0], size: [40.0, 40.0], angle: 0.0 }, 0);
+        let (x, y) = (rect(0.0), rect(200.0));
+        a.add_shape(sketch, &x).unwrap();
+        a.add_shape(sketch, &y).unwrap();
+        let arrow = ShapeElement {
+            start: bind(x.id),
+            end: bind(y.id),
+            ..shape_element(Shape::Arrow { a: [20.0, 0.0], b: [180.0, 0.0] }, 0)
+        };
+        a.add_shape(sketch, &arrow).unwrap();
         let b = NoteDoc::new(id);
         b.import_update(&a.export_updates_since(&[]).unwrap()).unwrap();
 

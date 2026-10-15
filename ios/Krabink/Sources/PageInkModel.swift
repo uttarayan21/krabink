@@ -26,6 +26,13 @@
 // pen held (the core's `resizeShape`), so the snap is never lost.
 // Erasing: the eraser's samples hit-test whole elements in the core, each
 // probe expressed in that element's own space.
+// Toolbar tools (`CanvasTool`) take over the pen from the picker: a preset
+// shape is dragged out corner to corner (a line or arrow end to end, its
+// ends binding to the rect, diamond or ellipse they land on); the select
+// tool picks the topmost element, drags it (re-anchoring page ink to the
+// line it is dropped on), resizes a shape from its outline and re-binds an
+// arrow's ends. Arrows bound to a shape follow it live while it is dragged
+// and are re-routed in the same commit, so peers see both move together.
 // Remote elements: wet batches render through `pointsMesh`; pageChanged
 // diffs the CRDT into meshes — deferred while a local pen is down.
 //
@@ -73,6 +80,180 @@ enum Placement: Equatable {
     case line(anchor: Data)
     /// Inline: inside the box of this sketch.
     case sketch(String)
+}
+
+/// A preset the shape tool draws.
+enum ShapeKind: String, CaseIterable, Identifiable {
+    case rect, diamond, ellipse, line, arrow
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .rect: "Rectangle"
+        case .diamond: "Diamond"
+        case .ellipse: "Ellipse"
+        case .line: "Line"
+        case .arrow: "Arrow"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .rect: "square"
+        case .diamond: "diamond"
+        case .ellipse: "circle"
+        case .line: "line.diagonal"
+        case .arrow: "arrow.up.right"
+        }
+    }
+
+    /// Lines and arrows have ends that bind; the rest enclose an area.
+    var hasEnds: Bool { self == .line || self == .arrow }
+}
+
+/// What the pen does (toolbar). Shapes are styled by the picker's brush.
+enum CanvasTool: Hashable {
+    case draw
+    case shape(ShapeKind)
+    case select
+}
+
+/// A shape being dragged out with the shape tool; points in page space.
+@MainActor
+private struct ShapeDraft {
+    /// The wet id the shape commits under.
+    let id: String
+    let kind: ShapeKind
+    let selection: BrushSelection
+    let placement: Placement
+    /// Where the shape's space is on the page.
+    let origin: CGPoint
+    let start: CGPoint
+    var end: CGPoint
+    var startBinding: Binding?
+    var endBinding: Binding?
+
+    /// The shape in its own space: the box from `start` to `end`, or the
+    /// segment between them.
+    var shape: KrabinkCore.Shape {
+        let a = Point2(x: Float(start.x - origin.x), y: Float(start.y - origin.y))
+        let b = Point2(x: Float(end.x - origin.x), y: Float(end.y - origin.y))
+        let center = Point2(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
+        let size = Point2(x: max(abs(b.x - a.x), 1), y: max(abs(b.y - a.y), 1))
+        switch kind {
+        case .rect: return .rect(center: center, size: size, angle: 0)
+        case .diamond: return .diamond(center: center, size: size, angle: 0)
+        case .ellipse:
+            return .ellipse(center: center, radii: Point2(x: size.x / 2, y: size.y / 2), angle: 0)
+        case .line: return .line(a: a, b: b)
+        case .arrow: return .arrow(a: a, b: b)
+        }
+    }
+
+    var element: ShapeElement {
+        ShapeElement(
+            id: id, shape: shape, tool: selection.brush.tool, color: selection.color,
+            width: selection.brush.baseWidth, start: startBinding, end: endBinding,
+            createdMs: UInt64(max(0, Date().timeIntervalSince1970 * 1000)))
+    }
+}
+
+/// A select-tool drag of one committed element; points in page space.
+@MainActor
+private struct Drag {
+    enum Kind {
+        /// Translate the element.
+        case move
+        /// Resize a shape from the outline point under the pen (its space).
+        case resize(from: Point2)
+        /// Turn the shape about its frame's centre (its space).
+        case rotate(center: Point2)
+        /// Scale the shape uniformly about the corner opposite the handle
+        /// under the pen (its space).
+        case scale(anchor: Point2)
+        /// Move a line's or arrow's `a` (or `b`) end, re-binding it.
+        case end(a: Bool)
+    }
+
+    let id: String
+    let placement: Placement
+    /// Where the element's space was on the page at pen-down.
+    let origin: CGPoint
+    /// The element as committed at pen-down.
+    let element: Element
+    let kind: Kind
+    let from: CGPoint
+    var to: CGPoint
+    /// What the drag would commit (resize and end drags).
+    var edited: ShapeElement?
+    var delta: CGPoint { CGPoint(x: to.x - from.x, y: to.y - from.y) }
+}
+
+/// Screen points within which the pen grabs an arrow end or a shape's
+/// outline for resizing, binds an arrow end to a shape, or selects ink.
+private let handleReach: CGFloat = 14
+private let bindReach: CGFloat = 12
+private let selectReach: CGFloat = 8
+/// The select tool's outline and the bind highlight (systemBlue).
+private let selectionColor: UInt32 = 0x3478_F6CC
+/// The selected element's ink while it is selected: the same blue,
+/// opaque so it hides the ink's own colour. Never stored.
+private let selectionTint: UInt32 = 0x3478_F6FF
+/// Screen points the selection box clears the shape's frame by, and how
+/// far above its top edge the rotate knob sits. The pad keeps a line's
+/// corner handles clear of its end dots (`handleReach` apart at least).
+private let selectionPad: CGFloat = 12
+private let knobOffset: CGFloat = 24
+/// Rotation snaps to multiples of 15° when within 3° of one.
+private let rotateSnapStep: Float = .pi / 12
+private let rotateSnapWithin: Float = 3 * .pi / 180
+
+/// Where the select tool's handles sit for one shape, in the shape's
+/// space: a box padded out from its frame, corner handles on that box, a
+/// rotate knob above the top edge. Shared by hit testing and drawing.
+private struct SelectionFrame {
+    /// The shape's own box, unpadded.
+    let frame: KrabinkCore.Frame
+    /// Half the padded box, along its axes.
+    let half: Point2
+    let knobOffset: Float
+
+    init(of shape: ShapeElement, zoom: CGFloat) {
+        frame = shapeFrame(shape: shape.shape)
+        let pad = Float(selectionPad / zoom) + shape.width / 2
+        half = Point2(x: frame.size.x / 2 + pad, y: frame.size.y / 2 + pad)
+        knobOffset = Float(Krabink.knobOffset / zoom)
+    }
+
+    var center: Point2 { frame.center }
+    var paddedSize: Point2 { Point2(x: half.x * 2, y: half.y * 2) }
+
+    /// The point `(dx, dy)` along the box's axes from its centre.
+    private func place(_ dx: Float, _ dy: Float) -> Point2 {
+        Point2(x: dx, y: dy).rotated(by: frame.angle, about: .zero).offset(by: center)
+    }
+
+    /// Top-left, top-right, bottom-right, bottom-left of the padded box.
+    var corners: [Point2] {
+        [place(-half.x, -half.y), place(half.x, -half.y), place(half.x, half.y), place(-half.x, half.y)]
+    }
+
+    /// The shape's own corner diagonally opposite padded corner `i`: what
+    /// stays put when that corner is dragged.
+    func anchor(opposite i: Int) -> Point2 {
+        let (hx, hy) = (frame.size.x / 2, frame.size.y / 2)
+        let signs: [(Float, Float)] = [(1, 1), (-1, 1), (-1, -1), (1, -1)]
+        return place(signs[i].0 * hx, signs[i].1 * hy)
+    }
+
+    /// Where the rotate knob's stem leaves the box, and the knob.
+    var top: Point2 { place(0, -half.y) }
+    var knob: Point2 { place(0, -(half.y + knobOffset)) }
+
+    /// `p` in the box's own axes, centre at the origin.
+    func inFrame(_ p: Point2) -> Point2 {
+        Point2(x: p.x - center.x, y: p.y - center.y).rotated(by: -frame.angle, about: .zero)
+    }
 }
 
 /// A local stroke: in progress, or past pen-up and settling. Its points
@@ -149,8 +330,22 @@ final class PageInkModel {
     /// A sketch's elements changed here or remotely: its box height may
     /// have moved. The canvas re-measures.
     @ObservationIgnored var onSketchChanged: ((String) -> Void)?
-    /// What the picker selected: ink, or the eraser.
-    var picked: PickedTool
+    /// What the picker selected: ink, or the eraser. Picking the eraser
+    /// leaves the toolbar tools.
+    var picked: PickedTool {
+        didSet {
+            if case .eraser = picked { tool = .draw }
+        }
+    }
+    /// The toolbar tool: draw with the picker's brush, drag out a preset
+    /// shape, or select and move.
+    var tool: CanvasTool = .draw {
+        didSet {
+            if tool != oldValue { select(nil) }
+        }
+    }
+    /// The select tool's element, if any.
+    private(set) var selected: String?
 
     /// The id of the custom brush the pen draws with, if any.
     var activeCustomBrush: String? {
@@ -181,9 +376,31 @@ final class PageInkModel {
     /// The status line the UI tests read.
     var status: String {
         String(
-            format: "strokes=%d shapes=%d wetSent=%d wetRecv=%d est=%d custom=%d originY=%.0f inline=%d boxY=%.0f",
+            format: "strokes=%d shapes=%d wetSent=%d wetRecv=%d est=%d custom=%d originY=%.0f inline=%d boxY=%.0f sel=%d bound=%d angle=%.0f size=%.0fx%.0f",
             strokeCount, shapeCount, wetSent, wetRecv, estUpdated, customCount, originY,
-            inlineCount, boxY)
+            inlineCount, boxY, selected == nil ? 0 : 1, boundCount, selectedAngle,
+            selectedFrame?.size.x ?? 0, selectedFrame?.size.y ?? 0)
+    }
+
+    /// The selected shape's frame as committed; nil for strokes and no
+    /// selection.
+    private var selectedFrame: KrabinkCore.Frame? {
+        guard let id = selected, case .shape(let s)? = elements[id] else { return nil }
+        return shapeFrame(shape: s.shape)
+    }
+
+    /// The selected shape's angle in whole degrees, (-180, 180].
+    private var selectedAngle: Double {
+        let deg = (Double(selectedFrame?.angle ?? 0) * 180 / .pi).rounded()
+        return deg == 0 ? 0 : deg
+    }
+
+    /// Lines and arrows on screen with at least one bound end.
+    private var boundCount: Int {
+        elements.values.filter { element in
+            if case .shape(let s) = element { return s.start != nil || s.end != nil }
+            return false
+        }.count
     }
 
     private weak var renderer: InkRenderer?
@@ -206,6 +423,8 @@ final class PageInkModel {
     /// Remote wet strokes' placements, for re-placing.
     private var wetPlacements: [String: Placement] = [:]
     private var penDown = false
+    /// The next pen-down is a claimed finger's (`claimsFinger`).
+    private var fingerNext = false
     /// Sketches that changed remotely while the pen was down.
     private var pendingSketches: Set<String> = []
     /// The remote pointer as last sent: when, where (page space) and
@@ -216,6 +435,8 @@ final class PageInkModel {
     private var pendingRefresh = false
     private var erasing = false
     private var live: LiveStroke?
+    private var draft: ShapeDraft?
+    private var drag: Drag?
     /// Pen-up strokes waiting for estimated-property updates, by id.
     private var settling: [String: LiveStroke] = [:]
     private var flushTask: Task<Void, Never>?
@@ -244,6 +465,7 @@ final class PageInkModel {
         shapeIds = []
         customIds = []
         wetPlacements = [:]
+        selected = nil
         renderer.removeAll()
         refreshFromCrdt()
         if UserDefaults.standard.bool(forKey: "figureEight"), !selfTestDone {
@@ -282,6 +504,7 @@ final class PageInkModel {
         originY = ids.first.flatMap { placed[$0]?.origin.y } ?? 0
         inlineCount = inlineIds.values.reduce(0) { $0 + $1.count }
         boxY = layout?.inlineBoxes().first?.rect.minY ?? 0
+        showSelection()
     }
 
     /// Re-place every element in z: inline sketches (box order, then CRDT
@@ -311,6 +534,23 @@ final class PageInkModel {
         penDown = true
         renderer?.clearHover()
         sendPointer(sample, down: true)
+        let finger = fingerNext
+        fingerNext = false
+        if finger {
+            beginSelect(at: sample)
+            return
+        }
+        // The pen is back at its own tool: a finger's selection goes.
+        if tool != .select { select(nil) }
+        switch tool {
+        case .shape(let kind):
+            beginShape(kind, at: sample)
+            return
+        case .select:
+            beginSelect(at: sample)
+            return
+        case .draw: break
+        }
         let selection: BrushSelection
         switch picked {
         case .eraser(let eraser):
@@ -377,6 +617,10 @@ final class PageInkModel {
     /// the next event.
     func penMoved(coalesced: [RawSample], predicted: [RawSample]) {
         if let last = coalesced.last { sendPointer(last, down: true) }
+        if draft != nil || drag != nil {
+            if let last = coalesced.last { toolMoved(to: last.point) }
+            return
+        }
         if erasing, case .eraser(let eraser) = picked {
             let radius = Self.eraserRadius(eraser)
             for sample in coalesced { erase(at: sample, radius: radius) }
@@ -516,6 +760,14 @@ final class PageInkModel {
             erasing = false
             return
         }
+        if draft != nil {
+            endShape(cancelled: cancelled)
+            return
+        }
+        if drag != nil {
+            endDrag(cancelled: cancelled)
+            return
+        }
         flushTask?.cancel()
         flushTask = nil
         flushWet()
@@ -574,14 +826,21 @@ final class PageInkModel {
         let createdMs = UInt64(max(0, Date().timeIntervalSince1970 * 1000))
         let element: Element
         if let snapped = stroke.shape {
-            // Same id as the wet stream: receivers swap ink for shape.
-            let shape = ShapeElement(
+            // Same id as the wet stream: receivers swap ink for shape. A
+            // recognised line or arrow binds its ends like a drawn one.
+            var shape = ShapeElement(
                 id: stroke.id, shape: snapped, tool: stroke.brush.tool, color: stroke.color,
                 width: stroke.brush.baseWidth, start: nil, end: nil, createdMs: createdMs)
+            if let ends = snapped.ends {
+                shape.start = binding(
+                    at: ends.a.page(from: stroke.origin), in: stroke.placement, exclude: nil)
+                shape.end = binding(
+                    at: ends.b.page(from: stroke.origin), in: stroke.placement, exclude: nil)
+                shape = route(shape, at: stroke.origin)
+            }
             switch stroke.placement {
             case .line(let anchor):
                 try? session.finishPageShape(shape: shape, anchor: anchor)
-                shapeIds.insert(stroke.id)
             case .sketch(let sketch):
                 try? session.finishShape(sketch: sketch, shape: shape)
             }
@@ -609,22 +868,31 @@ final class PageInkModel {
                 stroke.estPushed, stroke.estUpdated, stroke.estLate, stroke.maxLateMs, waited,
                 stroke.modeler.pendingEstimates().count, stroke.redraws, stroke.maxRedrawMs)
         }
-        elements[stroke.id] = element
-        placed[stroke.id] = (stroke.placement, stroke.origin)
-        switch stroke.placement {
+        adopt(element, placement: stroke.placement, origin: stroke.origin)
+    }
+
+    /// A local commit landed: show it on top of its layer and count it.
+    private func adopt(_ element: Element, placement: Placement, origin: CGPoint) {
+        let id = element.id
+        elements[id] = element
+        placed[id] = (placement, origin)
+        switch placement {
         case .line:
             // `show` also drops the settling copy of the same id.
             let base = inlineIds.values.reduce(0) { $0 + $1.count }
-            renderer?.show(element, z: base + ids.count, origin: stroke.origin)
-            ids.append(stroke.id)
-            if stroke.brush.custom != nil, stroke.shape == nil { customIds.insert(stroke.id) }
+            renderer?.show(element, z: base + ids.count, origin: origin)
+            ids.append(id)
+            switch element {
+            case .shape: shapeIds.insert(id)
+            case .stroke(let s): if s.brush != nil { customIds.insert(id) }
+            }
             updateCounts()
         case .sketch(let sketch):
             if inlineIds[sketch] == nil {
                 inlineIds[sketch] = []
                 inlineOrder.append(sketch)
             }
-            inlineIds[sketch]!.append(stroke.id)
+            inlineIds[sketch]!.append(id)
             // Below every overlay element: re-place the lot (`show` also
             // drops the settling copy of the same id).
             rezAll()
@@ -666,7 +934,7 @@ final class PageInkModel {
             pointerGone()
         }
         guard let renderer else { return }
-        guard let sample, !penDown, case .ink(let selection) = picked else {
+        guard let sample, !penDown, tool == .draw, case .ink(let selection) = picked else {
             renderer.clearHover()
             return
         }
@@ -811,6 +1079,7 @@ final class PageInkModel {
         for sketch in inlineOrder { inlineIds[sketch]?.removeAll { gone.contains($0) } }
         shapeIds.subtract(gone)
         customIds.subtract(gone)
+        if let selected, gone.contains(selected) { self.selected = nil }
         updateCounts()
     }
 
@@ -919,7 +1188,11 @@ final class PageInkModel {
                     moved[id] = origin
                 }
             }
-            if !moved.isEmpty { renderer.setOrigins(moved) }
+            if !moved.isEmpty {
+                renderer.setOrigins(moved)
+                // Lines moved apart or together: bound arrows follow.
+                reroutePage()
+            }
         }
         syncInline()
         for (id, placement) in wetPlacements {
@@ -951,6 +1224,7 @@ final class PageInkModel {
             unloadSketch(sketch)
             changed = true
         }
+        if let selected, placed[selected] == nil { self.selected = nil }
         var moved: [String: CGPoint] = [:]
         for box in boxes {
             if inlineIds[box.sketch] == nil {
@@ -1021,6 +1295,484 @@ final class PageInkModel {
         onSketchChanged?(sketch)
     }
 
+    // MARK: shape tool
+
+    private var zoom: CGFloat { max(renderer?.viewport.zoom ?? 1, 0.01) }
+
+    /// The brush shapes are inked with: the picked one, a pen under the
+    /// eraser. Shapes store a preset tool, so a custom brush's spec is not
+    /// carried.
+    private var shapeSelection: BrushSelection {
+        let selection: BrushSelection
+        if case .ink(let ink) = picked {
+            selection = ink
+        } else {
+            selection = toolOverride ?? StrokeCodec.selection(named: "pen")!
+        }
+        var out = selection
+        out.brush.custom = nil
+        return out
+    }
+
+    /// Pen-down with the shape tool: the shape lives in the box or on the
+    /// line under the pen, like a stroke, and commits under a wet id so
+    /// peers can drop a cancelled one.
+    private func beginShape(_ kind: ShapeKind, at sample: RawSample) {
+        guard let layout else { return }
+        let at = sample.point
+        let selection = shapeSelection
+        let brush = selection.brush
+        let placement: Placement
+        let origin: CGPoint
+        let id: String?
+        if let box = layout.inlineBox(at: at) {
+            placement = .sketch(box.sketch)
+            origin = box.origin
+            id = try? session.beginStroke(
+                sketch: box.sketch, tool: brush.tool, color: selection.color,
+                baseWidth: brush.baseWidth, spec: nil)
+        } else {
+            let line = layout.line(at: at)
+            guard let anchor = try? session.anchorAt(charIndex: UInt64(line.scalar)) else { return }
+            placement = .line(anchor: anchor)
+            origin = line.origin
+            id = try? session.beginPageStroke(
+                anchor: anchor, tool: brush.tool, color: selection.color,
+                baseWidth: brush.baseWidth, spec: nil)
+        }
+        guard let id else { return }
+        draft = ShapeDraft(
+            id: id, kind: kind, selection: selection, placement: placement, origin: origin,
+            start: at, end: at,
+            startBinding: kind.hasEnds ? binding(at: at, in: placement, exclude: nil) : nil)
+        showDraft()
+    }
+
+    private func toolMoved(to point: CGPoint) {
+        if draft != nil {
+            draft!.end = point
+            if draft!.kind.hasEnds {
+                draft!.endBinding = binding(at: point, in: draft!.placement, exclude: nil)
+            }
+            showDraft()
+        } else if drag != nil {
+            dragMoved(to: point)
+        }
+    }
+
+    /// The draft as it would commit: bound ends routed to their targets.
+    private var draftElement: ShapeElement? {
+        draft.map { route($0.element, at: $0.origin) }
+    }
+
+    private func showDraft() {
+        guard let draft, let shape = draftElement, let renderer else { return }
+        renderer.setLocalShape(
+            shape.shape, brush: BrushRef(tool: shape.tool, baseWidth: shape.width, custom: nil),
+            color: shape.color, origin: draft.origin)
+        showSelection(targets: [draft.startBinding, draft.endBinding])
+    }
+
+    /// Pen-up with the shape tool: commit the shape, or drop it when it is
+    /// a tap rather than a drag.
+    private func endShape(cancelled: Bool) {
+        guard let draft else { return }
+        let shape = draftElement
+        self.draft = nil
+        renderer?.clearLocal()
+        showSelection()
+        let span = hypot(draft.end.x - draft.start.x, draft.end.y - draft.start.y)
+        guard !cancelled, span * zoom >= 4, let shape else {
+            try? session.cancelStroke(stroke: draft.id)
+            return
+        }
+        switch draft.placement {
+        case .line(let anchor):
+            try? session.finishPageShape(shape: shape, anchor: anchor)
+        case .sketch(let sketch):
+            try? session.finishShape(sketch: sketch, shape: shape)
+        }
+        adopt(.shape(shape), placement: draft.placement, origin: draft.origin)
+    }
+
+    // MARK: bindings
+
+    /// The binding a line or arrow end at `point` (page space) in
+    /// `placement`'s layer would take: the topmost closed shape there.
+    private func binding(at point: CGPoint, in placement: Placement, exclude: String?) -> Binding? {
+        let reach = Float(bindReach / zoom)
+        switch placement {
+        case .line:
+            return (try? session.bindingAtPage(
+                x: Float(point.x), y: Float(point.y), origins: pageOrigins(), reach: reach,
+                exclude: exclude)) ?? nil
+        case .sketch(let sketch):
+            guard let origin = origin(of: placement) else { return nil }
+            let local = point.local(to: origin)
+            return (try? session.bindingAt(
+                sketch: sketch, x: local.x, y: local.y, reach: reach, exclude: exclude)) ?? nil
+        }
+    }
+
+    /// Every overlay element's line origin; `overrides` for elements
+    /// mid-drag.
+    private func pageOrigins(_ overrides: [String: CGPoint] = [:]) -> [ElementOrigin] {
+        ids.compactMap { id in
+            guard let o = overrides[id] ?? placed[id]?.origin else { return nil }
+            return ElementOrigin(element: id, x: Float(o.x), y: Float(o.y))
+        }
+    }
+
+    /// `arrow` (in the space at `origin`) with its bound ends re-derived
+    /// from its targets as drawn now; `overrides` stand in for elements
+    /// mid-drag. Targets may sit on other lines than the arrow.
+    private func route(
+        _ arrow: ShapeElement, at origin: CGPoint,
+        overrides: [String: (element: Element, origin: CGPoint)] = [:]
+    ) -> ShapeElement {
+        let targets = Set([arrow.start?.element, arrow.end?.element].compactMap { $0 })
+        guard !targets.isEmpty else { return arrow }
+        var entries: [PageElement] = []
+        var origins: [ElementOrigin] = []
+        func add(_ element: Element, _ o: CGPoint) {
+            entries.append(PageElement(element: element, anchor: Data(), charIndex: nil))
+            origins.append(ElementOrigin(element: element.id, x: Float(o.x), y: Float(o.y)))
+        }
+        for id in targets {
+            if let over = overrides[id] {
+                add(over.element, over.origin)
+            } else if let element = elements[id], let o = placed[id]?.origin {
+                add(element, o)
+            }
+        }
+        add(.shape(arrow), origin)
+        guard case .shape(let routed)? = resolvePageBindings(elements: entries, origins: origins).last?.element
+        else { return arrow }
+        return routed
+    }
+
+    /// Re-route the bound arrows of a layer (`layer` ids) from where their
+    /// targets are drawn. With `overrides` (a drag preview) only arrows
+    /// bound to those elements, on screen only; otherwise every bound
+    /// arrow, kept.
+    private func reroute(
+        _ layer: [String], overrides: [String: (element: Element, origin: CGPoint)] = [:]
+    ) {
+        for id in layer where overrides[id] == nil {
+            guard case .shape(let arrow)? = elements[id], let origin = placed[id]?.origin else {
+                continue
+            }
+            let targets = [arrow.start?.element, arrow.end?.element].compactMap { $0 }
+            if targets.isEmpty { continue }
+            if !overrides.isEmpty, !targets.contains(where: { overrides[$0] != nil }) { continue }
+            let routed = route(arrow, at: origin, overrides: overrides)
+            renderer?.update(.shape(routed))
+            if overrides.isEmpty { elements[id] = .shape(routed) }
+        }
+    }
+
+    private func reroutePage() { reroute(ids) }
+
+    private func layerIds(_ placement: Placement) -> [String] {
+        switch placement {
+        case .line: ids
+        case .sketch(let sketch): inlineIds[sketch] ?? []
+        }
+    }
+
+    // MARK: select tool
+
+    /// Pen-down with the select tool: grab the selected shape's end or
+    /// outline, else pick the topmost element under the pen and drag it.
+    private func beginSelect(at sample: RawSample) {
+        let at = sample.point
+        if let id = selected, let kind = handle(of: id, at: at) {
+            startDrag(id, kind: kind, at: at)
+            return
+        }
+        guard let hit = hitTest(at) else {
+            select(nil)
+            return
+        }
+        select(hit)
+        startDrag(hit, kind: .move, at: at)
+    }
+
+    /// Whether a finger landing at `point` selects rather than going to
+    /// the editor: it is on the selection's handle or on an element, so a
+    /// tap selects and a drag moves. Elsewhere the finger scrolls or
+    /// places the caret. With `anyTool` (fingers do not ink) that holds
+    /// under every tool, and the toolbar's tool stays the pen's.
+    func claimsFinger(at point: CGPoint, anyTool: Bool) -> Bool {
+        guard !penDown, tool == .select || anyTool else { return false }
+        if let id = selected, handle(of: id, at: point) != nil { return true }
+        return hitTest(point) != nil
+    }
+
+    /// A finger tap off the elements and the selection's handles drops
+    /// the selection.
+    func fingerTapped(at point: CGPoint) {
+        guard let id = selected, !penDown, handle(of: id, at: point) == nil, hitTest(point) == nil
+        else { return }
+        select(nil)
+    }
+
+    /// The pen-down that follows is a claimed finger's: it selects,
+    /// whatever the tool.
+    func fingerClaimed() {
+        fingerNext = true
+    }
+
+    private func startDrag(_ id: String, kind: Drag.Kind, at point: CGPoint) {
+        guard let element = elements[id], let place = placed[id] else { return }
+        drag = Drag(
+            id: id, placement: place.placement, origin: place.origin, element: element, kind: kind,
+            from: point, to: point)
+    }
+
+    /// The selected element's handle under the pen, nearest first: a
+    /// line's or arrow's end, the rotate knob, a corner of the selection
+    /// box (scale), or near a closed shape's outline (resize). A line
+    /// bound at both ends only offers its ends: turning or scaling it
+    /// would re-route straight back.
+    private func handle(of id: String, at point: CGPoint) -> Drag.Kind? {
+        guard case .shape(let s)? = elements[id], let origin = placed[id]?.origin else { return nil }
+        let reach = handleReach / zoom
+        let local = point.local(to: origin)
+        if let ends = s.shape.ends {
+            if ends.a.distance(to: local) <= reach { return .end(a: true) }
+            if ends.b.distance(to: local) <= reach { return .end(a: false) }
+            if s.start != nil && s.end != nil { return nil }
+        }
+        let box = SelectionFrame(of: s, zoom: zoom)
+        if box.knob.distance(to: local) <= reach { return .rotate(center: box.center) }
+        if let i = box.corners.firstIndex(where: { $0.distance(to: local) <= reach }) {
+            return .scale(anchor: box.anchor(opposite: i))
+        }
+        guard s.shape.ends == nil else { return nil }
+        let q = box.inFrame(local)
+        let outside = max(abs(q.x) - box.frame.size.x / 2, abs(q.y) - box.frame.size.y / 2)
+        return abs(outside) <= Float(reach) ? .resize(from: local) : nil
+    }
+
+    /// The topmost element under the pen: overlay ink first (it is drawn
+    /// above), then the inline sketch whose box the pen is in. A closed
+    /// shape is hit anywhere inside.
+    private func hitTest(_ point: CGPoint) -> String? {
+        guard let renderer, let layout else { return nil }
+        let reach = selectReach / zoom
+        let probes: [PageProbe] = ids.compactMap { id in
+            guard let bounds = renderer.bounds(for: id), let origin = placed[id]?.origin,
+                  bounds.insetBy(dx: -reach, dy: -reach).contains(point)
+            else { return nil }
+            let local = point.local(to: origin)
+            return PageProbe(element: id, x: local.x, y: local.y)
+        }
+        if !probes.isEmpty,
+           let hit = (try? session.hitPageAt(probes: probes, radius: Float(reach))) ?? nil
+        {
+            return hit
+        }
+        guard let box = layout.inlineBox(at: point), inlineIds[box.sketch] != nil else { return nil }
+        let local = point.local(to: box.origin)
+        return (try? session.hitAt(
+            sketch: box.sketch, x: local.x, y: local.y, radius: Float(reach))) ?? nil
+    }
+
+    /// Preview the drag: the element (and the arrows bound to it) where
+    /// it would land. Nothing is committed until pen-up.
+    private func dragMoved(to point: CGPoint) {
+        guard var drag, let renderer else { return }
+        drag.to = point
+        var targets: [Binding?] = []
+        switch drag.kind {
+        case .move:
+            let moved = CGPoint(x: drag.origin.x + drag.delta.x, y: drag.origin.y + drag.delta.y)
+            renderer.setOrigins([drag.id: moved])
+            reroute(layerIds(drag.placement), overrides: [drag.id: (drag.element, moved)])
+        case .resize, .rotate, .scale:
+            guard case .shape(var s) = drag.element else { break }
+            let (from, to) = (drag.from.local(to: drag.origin), point.local(to: drag.origin))
+            switch drag.kind {
+            case .resize(let handle):
+                s.shape = resizeShape(shape: s.shape, from: handle, to: to)
+            case .rotate(let c):
+                let by = atan2(to.y - c.y, to.x - c.x) - atan2(from.y - c.y, from.x - c.x)
+                s.shape = rotateShape(
+                    shape: s.shape, about: c, by: by, snapStep: rotateSnapStep,
+                    snapWithin: rotateSnapWithin)
+            case .scale(let anchor):
+                // How far along the handle's diagonal the pen is now.
+                let (f, t) = (from.offset(by: anchor.negated), to.offset(by: anchor.negated))
+                let k = (f.x * t.x + f.y * t.y) / max(f.x * f.x + f.y * f.y, .ulpOfOne)
+                s.shape = scaleShape(shape: s.shape, about: anchor, k: k)
+            default: break
+            }
+            // A bound end goes back where its target says; show that.
+            if s.start != nil || s.end != nil { s = route(s, at: drag.origin) }
+            drag.edited = s
+            renderer.update(.shape(s))
+            reroute(layerIds(drag.placement), overrides: [drag.id: (.shape(s), drag.origin)])
+        case .end(let atA):
+            guard case .shape(var s) = drag.element, let ends = s.shape.ends else { break }
+            let p = point.local(to: drag.origin)
+            let bound = binding(at: point, in: drag.placement, exclude: drag.id)
+            s.shape = s.shape.withEnds(atA ? p : ends.a, atA ? ends.b : p)
+            if atA { s.start = bound } else { s.end = bound }
+            s = route(s, at: drag.origin)
+            drag.edited = s
+            renderer.update(.shape(s))
+            targets = [bound]
+        }
+        self.drag = drag
+        showSelection(targets: targets)
+    }
+
+    /// Pen-up with the select tool: commit the drag (a tap only selects);
+    /// a cancelled drag puts everything back.
+    private func endDrag(cancelled: Bool) {
+        guard let drag else { return }
+        self.drag = nil
+        let moved = hypot(drag.delta.x, drag.delta.y) * zoom >= 2
+        if cancelled || !moved {
+            if moved { reload(drag.placement) }
+            showSelection()
+            return
+        }
+        switch (drag.kind, drag.placement) {
+        case (.move, .line):
+            commitPageMove(drag)
+        case (.move, .sketch(let sketch)):
+            try? session.moveElements(
+                sketch: sketch, elements: [drag.id], dx: Float(drag.delta.x),
+                dy: Float(drag.delta.y))
+        case (_, .line):
+            if let edited = drag.edited {
+                try? session.updatePageShape(shape: edited, anchor: nil, origins: pageOrigins())
+            }
+        case (_, .sketch(let sketch)):
+            if let edited = drag.edited { try? session.updateShape(sketch: sketch, shape: edited) }
+        }
+        reload(drag.placement)
+    }
+
+    /// Commit an overlay move: re-anchor the element to the line its ink's
+    /// top-left was dropped on, with the delta in that line's space, so it
+    /// follows that line when the text reflows.
+    private func commitPageMove(_ drag: Drag) {
+        guard let layout, let renderer else { return }
+        let dropped = CGPoint(x: drag.origin.x + drag.delta.x, y: drag.origin.y + drag.delta.y)
+        let corner = renderer.bounds(for: drag.id)?.origin ?? dropped
+        let line = layout.line(at: corner)
+        guard let anchor = try? session.anchorAt(charIndex: UInt64(line.scalar)) else { return }
+        let move = PageMove(
+            element: drag.id, dx: Float(dropped.x - line.origin.x),
+            dy: Float(dropped.y - line.origin.y), anchor: anchor)
+        try? session.movePageElements(moves: [move], origins: pageOrigins([drag.id: line.origin]))
+    }
+
+    /// Re-read a layer from the CRDT after an edit (or to undo a preview).
+    private func reload(_ placement: Placement) {
+        switch placement {
+        case .line: refreshFromCrdt()
+        case .sketch(let sketch): reloadSketch(sketch)
+        }
+    }
+
+    private func select(_ id: String?) {
+        selected = id
+        showSelection()
+    }
+
+    /// Toolbar: delete the selected element. Arrows bound to it stay where
+    /// they are, unbound.
+    func deleteSelected() {
+        guard let id = selected, let placement = placed[id]?.placement else { return }
+        switch placement {
+        case .line:
+            try? session.removePageElement(element: id)
+        case .sketch(let sketch):
+            try? session.removeElement(sketch: sketch, element: id)
+        }
+        forget([id])
+        if case .sketch(let sketch) = placement { onSketchChanged?(sketch) }
+    }
+
+    /// Tint the selection and outline it with its handles (corners and
+    /// rotate knob on a shape's box, dots on a line's or arrow's ends; a
+    /// stroke gets a plain box) and the shapes a drawn or dragged arrow
+    /// end binds to.
+    /// Drawn from what the renderer shows, so handles follow a drag.
+    private func showSelection(targets: [Binding?] = []) {
+        guard let renderer else { return }
+        let thin = BrushRef(tool: .monoline, baseWidth: Float(1.5 / zoom), custom: nil)
+        let thick = BrushRef(tool: .monoline, baseWidth: Float(3 / zoom), custom: nil)
+        let tolerance = renderer.tolerance
+        func outline(_ shape: KrabinkCore.Shape, _ brush: BrushRef) -> InkMesh {
+            shapeOutlineMesh(shape: shape, brush: brush, color: selectionColor, tolerance: tolerance)
+        }
+        let dotRadius = Float(5 / zoom)
+        func dot(_ at: Point2) -> KrabinkCore.Shape {
+            .ellipse(center: at, radii: Point2(x: dotRadius, y: dotRadius), angle: 0)
+        }
+        var meshes: [(InkMesh, CGPoint)] = []
+        if let id = selected, let shown = renderer.shown(id) {
+            // The selection's own ink again in the selection colour, over
+            // the ink: the box alone is ambiguous where elements overlap.
+            var tinted = shown.element
+            switch tinted {
+            case .shape(var s):
+                s.color = selectionTint
+                tinted = .shape(s)
+            case .stroke(var s):
+                s.color = selectionTint
+                tinted = .stroke(s)
+            }
+            meshes.append((elementMesh(element: tinted, tolerance: tolerance), shown.origin))
+            switch shown.element {
+            case .shape(let s):
+                let box = SelectionFrame(of: s, zoom: zoom)
+                let rect = KrabinkCore.Shape.rect(
+                    center: box.center, size: box.paddedSize, angle: box.frame.angle)
+                meshes.append((outline(rect, thin), shown.origin))
+                let fixed = s.shape.ends != nil && s.start != nil && s.end != nil
+                if !fixed {
+                    let side = Float(8 / zoom)
+                    for corner in box.corners {
+                        let handle = KrabinkCore.Shape.rect(
+                            center: corner, size: Point2(x: side, y: side), angle: box.frame.angle)
+                        meshes.append((outline(handle, thin), shown.origin))
+                    }
+                    meshes.append((outline(.line(a: box.top, b: box.knob), thin), shown.origin))
+                    meshes.append((outline(dot(box.knob), thin), shown.origin))
+                }
+                if let ends = s.shape.ends {
+                    for end in [ends.a, ends.b] {
+                        meshes.append((outline(dot(end), thin), shown.origin))
+                    }
+                }
+            case .stroke:
+                if let bounds = renderer.bounds(for: id) {
+                    let r = bounds.insetBy(dx: -selectionPad / zoom, dy: -selectionPad / zoom)
+                    let rect = KrabinkCore.Shape.rect(
+                        center: Point2(x: Float(r.midX), y: Float(r.midY)),
+                        size: Point2(x: Float(r.width), y: Float(r.height)), angle: 0)
+                    meshes.append((outline(rect, thin), .zero))
+                }
+            }
+        }
+        for target in targets.compactMap({ $0 }) {
+            guard let shown = renderer.shown(target.element), case .shape(let s) = shown.element
+            else { continue }
+            meshes.append((outline(s.shape, thick), shown.origin))
+        }
+        if meshes.isEmpty {
+            renderer.clearSelection()
+        } else {
+            renderer.setSelection(meshes: meshes)
+        }
+    }
+
     // MARK: CRDT → renderer
 
     func remoteChanged() {
@@ -1062,6 +1814,7 @@ final class PageInkModel {
             placed[id] = nil
             elements[id] = nil
         }
+        if let selected, placed[selected] == nil { self.selected = nil }
         let base = inlineIds.values.reduce(0) { $0 + $1.count }
         for (i, entry) in page.enumerated() {
             let scalar = entry.charIndex.map { Int($0) } ?? Int.max
@@ -1071,6 +1824,9 @@ final class PageInkModel {
             renderer.show(entry.element, z: base + i, origin: origin)
         }
         ids = newIds
+        // Bound arrows derive their ends from where their targets' lines
+        // are drawn now.
+        reroutePage()
         shapeIds = Set(page.map(\.element).filter(\.isShape).map(\.id))
         customIds = Set(
             page.compactMap { entry in

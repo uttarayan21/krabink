@@ -8,7 +8,7 @@
 //! own; a fatal session error (bad import) reopens it after a pause so a
 //! fresh handshake re-subscribes and backfills.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -486,8 +486,7 @@ impl ClientDocs for Docs<'_> {
             return Ok(false); // note was closed since we subscribed
         };
         let text_before = note.doc.text();
-        let page_before = note.doc.page_len();
-        let sketches_before = sketch_lens(&note.doc);
+        let ink_before = note.doc.frontiers();
         let changed = note.doc.import_update(payload)?;
         state.store.append_update(doc, payload, Flush::Eventual)?;
         if let Some(listener) = note.listener.clone() {
@@ -496,23 +495,15 @@ impl ClientDocs for Docs<'_> {
                 self.pending
                     .push(Notify::Text(listener.clone(), text_after));
             }
-            // Page and sketch elements are only ever added/removed whole,
-            // so a length diff catches every change.
-            if note.doc.page_len() != page_before {
+            // Elements are moved and reshaped in place, so ask the doc what
+            // changed rather than comparing list lengths.
+            let ink = note.doc.ink_changes_since(&ink_before);
+            if ink.page {
                 self.pending.push(Notify::Page(listener.clone()));
             }
-            let sketches_after = sketch_lens(&note.doc);
-            for (sketch, len) in &sketches_after {
-                if sketches_before.get(sketch) != Some(len) {
-                    self.pending
-                        .push(Notify::Strokes(listener.clone(), sketch.to_string()));
-                }
-            }
-            for sketch in sketches_before.keys() {
-                if !sketches_after.contains_key(sketch) {
-                    self.pending
-                        .push(Notify::Strokes(listener.clone(), sketch.to_string()));
-                }
+            for sketch in ink.sketches {
+                self.pending
+                    .push(Notify::Strokes(listener.clone(), sketch.to_string()));
             }
         }
         Ok(changed)
@@ -531,13 +522,4 @@ impl ClientDocs for Docs<'_> {
                 .unwrap_or_else(|| Ok(Vec::new()))
         }
     }
-}
-
-/// Element count per sketch container; cheap (list lengths only) so it can
-/// run around every import.
-fn sketch_lens(doc: &krabink_core::NoteDoc) -> HashMap<krabink_core::SketchId, usize> {
-    doc.sketch_ids()
-        .into_iter()
-        .map(|sketch| (sketch, doc.sketch_len(sketch)))
-        .collect()
 }

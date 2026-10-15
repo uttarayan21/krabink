@@ -247,10 +247,51 @@ unchanged. No desktop recognition (no pen input there).
 
 ## Not in v1 (reserved by the schema)
 
-Bindings UI (auto-bind arrow ends to nearby shapes, derive endpoints from
-the target on move), `update_shape`, move/resize handles, unsnap (needs the
-sender to keep the last freehand points), native SVG primitives, triangles
-and polygons.
+Unsnap (needs the sender to keep the last freehand points), native SVG
+primitives, triangles and polygons.
+
+## Since v1: preset shapes, moving, bound arrows
+
+- `Shape::Diamond` (schema kind `diamond`, rect keys) joins the presets the
+  iPad's shape tool drags out (rect, diamond, ellipse, line, arrow); the
+  recognizer never yields one.
+- Bindings are live (`binding.rs`): an end bound to a rect, diamond or
+  ellipse sits where the ray from the other end's aim point toward the
+  target's aim point (`fixed_point`, the center for new bindings) crosses
+  the outline, pulled back by `gap`. Closed form and one-way, so no
+  constraint solver: every peer derives the same ends from the same
+  targets. Sketches resolve on read (`NoteDoc::elements`); the page layer
+  resolves in the renderers with each element's line origin
+  (`resolve_bindings`, FFI `resolve_page_bindings`), since the core cannot
+  place lines.
+- Moves and edits merge per key: `move_page_elements` / `move_elements`
+  rewrite a shape's geometry keys or bump a stroke's `ox`/`oy` offset (its
+  point chunks stay), re-anchor page ink to the line it was dropped on, and
+  re-route the stored ends of bound arrows in the same commit.
+  `update_page_shape` / `update_shape` do the same for resizes and re-bound
+  ends. A line or arrow moved without its targets lets go of them.
+- The iPad's select tool hit-tests without erasing (`hit_page_at`,
+  `hit_at`; a closed shape is hit anywhere inside), previews drags by
+  re-placing and re-meshing on screen, and commits at pen-up. Draw-and-hold
+  lines and arrows bind their ends like drawn ones.
+- A selected shape shows Excalidraw-style handles on a box padded out from
+  its frame (`Shape::frame`; a line's is the box of its ends): corner
+  handles scale it uniformly about the opposite corner (`Shape::scaled`),
+  a knob above the top edge turns it about the centre (`Shape::rotated`,
+  snapping the heading to 15° multiples within 3°), and the band along a
+  closed shape's outline still resizes one side. Hit order is ends, knob,
+  corners, band. Both transforms keep bindings: a bound end is re-derived
+  from its target afterwards, so a line bound at both ends offers only its
+  end handles. Freehand strokes only move.
+- The selection's own ink is redrawn in the selection colour while it is
+  selected (display only), so overlapping elements are told apart.
+- With the select tool a finger that lands on an element or a handle is
+  pen input at once, also where only the Pencil draws: a tap selects, a
+  drag moves. A finger anywhere else still scrolls or places the caret.
+  Where only the Pencil draws, fingers select and move under every tool
+  and the toolbar's tool stays the Pencil's; the next Pencil stroke with
+  another tool drops the selection. A finger tap off the elements and
+  handles drops it too.
 
 ## Order and effort
 

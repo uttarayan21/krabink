@@ -38,8 +38,8 @@ use bevy::render::render_resource::TextureUsages;
 use bevy::render::storage::ShaderBuffer;
 use bevy_egui::{EguiTextureHandle, EguiUserTextures, egui};
 use krabink_core::{
-    Anchor, BrushSpec, DEFAULT_TOLERANCE, DeviceId, DocKey, ElementId, Ink, InkMesh, InkStyle,
-    NoteDoc, NoteId, Rgba, SketchId, StrokeEnd, StrokeId, StrokePoint, Tool, WetInk,
+    Anchor, BrushSpec, DEFAULT_TOLERANCE, DeviceId, DocKey, Element, ElementId, Ink, InkMesh,
+    InkStyle, NoteDoc, NoteId, Rgba, SketchId, StrokeEnd, StrokeId, StrokePoint, Tool, WetInk,
 };
 
 use crate::docs::{Docs, now_ms};
@@ -298,6 +298,10 @@ struct PageScene {
     /// Committed inline element → ink entity, keyed by its sketch too so
     /// a box vanishing drops its elements in one sweep.
     inline: HashMap<(SketchId, ElementId), Option<InkEntity>>,
+    /// What each committed entity was meshed from: an element changed in
+    /// place (moved, reshaped, its arrow re-routed) is meshed again.
+    meshed: HashMap<ElementId, Element>,
+    inline_meshed: HashMap<(SketchId, ElementId), Element>,
     /// Committed overlay elements spawned so far; the next one's z slot.
     committed: u16,
     /// Committed inline elements spawned so far; the next one's z slot.
@@ -630,6 +634,8 @@ fn sync_page_scene(
             layout_generation: None,
             strokes: HashMap::new(),
             inline: HashMap::new(),
+            meshed: HashMap::new(),
+            inline_meshed: HashMap::new(),
             committed: 0,
             inline_serial: 0,
             wet_serial: 0,
@@ -695,14 +701,25 @@ fn sync_page_scene(
         let origin = to_bevy(b.origin());
         for el in elements {
             let key = (b.sketch, el.id());
-            if let Some(drawn) = stale.remove(&key) {
-                if let Some(drawn) = drawn {
-                    commands.entity(drawn.entity).insert(place(origin, drawn.z));
+            let z = match stale.remove(&key) {
+                Some(drawn) if scene.inline_meshed.get(&key) == Some(&el) => {
+                    if let Some(drawn) = drawn {
+                        commands.entity(drawn.entity).insert(place(origin, drawn.z));
+                    }
+                    continue;
                 }
-                continue;
-            }
-            let z = inline_z(scene.inline_serial);
-            scene.inline_serial = scene.inline_serial.saturating_add(1);
+                // Changed in place: re-mesh at the same depth.
+                Some(Some(drawn)) => {
+                    commands.entity(drawn.entity).despawn();
+                    scene.palette.remove(drawn.slot);
+                    drawn.z
+                }
+                _ => {
+                    let z = inline_z(scene.inline_serial);
+                    scene.inline_serial = scene.inline_serial.saturating_add(1);
+                    z
+                }
+            };
             let drawn = spawn_committed(
                 &mut commands,
                 &mut meshes,
@@ -715,6 +732,7 @@ fn sync_page_scene(
             );
             scene.inline.insert(key, drawn);
             drop_wet_preview(&mut commands, scene, wet, el.id());
+            scene.inline_meshed.insert(key, el);
         }
     }
     for (key, drawn) in stale {
@@ -723,37 +741,64 @@ fn sync_page_scene(
             scene.palette.remove(drawn.slot);
         }
         scene.inline.remove(&key);
+        scene.inline_meshed.remove(&key);
     }
 
-    // Then the overlay: re-place the elements that stay.
+    // Then the overlay: re-place the elements that stay, with bound
+    // arrows re-derived from where their targets' lines are now.
+    let page = note.page_elements();
+    let origins: HashMap<ElementId, Vec2> = page
+        .iter()
+        .map(|el| {
+            let id = el.element.id();
+            let origin = layout
+                .origins
+                .get(&id)
+                .map(|o| to_bevy(*o))
+                .unwrap_or_else(|| origin_of(&layout, galley, note, &el.anchor));
+            (id, origin)
+        })
+        .collect();
+    let mut elements: Vec<Element> = page.into_iter().map(|p| p.element).collect();
+    krabink_core::resolve_bindings(&mut elements, |id| {
+        origins.get(&id).map_or([0.0, 0.0], |o| o.to_array())
+    });
     let mut stale: HashMap<_, _> = scene.strokes.clone();
-    for el in note.page_elements() {
-        let id = el.element.id();
-        let origin = layout
-            .origins
-            .get(&id)
-            .map(|o| to_bevy(*o))
-            .unwrap_or_else(|| origin_of(&layout, galley, note, &el.anchor));
-        if let Some(drawn) = stale.remove(&id) {
-            if let Some(drawn) = drawn {
-                commands.entity(drawn.entity).insert(place(origin, drawn.z));
+    for element in elements {
+        let id = element.id();
+        let origin = origins[&id];
+        let z = match stale.remove(&id) {
+            Some(drawn) if scene.meshed.get(&id) == Some(&element) => {
+                if let Some(drawn) = drawn {
+                    commands.entity(drawn.entity).insert(place(origin, drawn.z));
+                }
+                continue;
             }
-            continue;
-        }
-        let z = committed_z(scene.committed);
-        scene.committed = scene.committed.saturating_add(1);
+            // Changed in place: re-mesh at the same depth.
+            Some(Some(drawn)) => {
+                commands.entity(drawn.entity).despawn();
+                scene.palette.remove(drawn.slot);
+                drawn.z
+            }
+            _ => {
+                let z = committed_z(scene.committed);
+                scene.committed = scene.committed.saturating_add(1);
+                z
+            }
+        };
         let drawn = spawn_committed(
             &mut commands,
             &mut meshes,
             scene,
             &ink_assets,
-            &el.element,
+            &element,
             origin,
             z,
             tolerance,
         );
         scene.strokes.insert(id, drawn);
         drop_wet_preview(&mut commands, scene, wet, id);
+        scene.meshed.insert(id, element);
     }
     for (id, drawn) in stale {
         if let Some(drawn) = drawn {
@@ -761,6 +806,7 @@ fn sync_page_scene(
             scene.palette.remove(drawn.slot);
         }
         scene.strokes.remove(&id);
+        scene.meshed.remove(&id);
     }
 
     // Wet strokes and pointers follow their lines and boxes too.

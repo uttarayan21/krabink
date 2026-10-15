@@ -8,13 +8,15 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use loro::cursor::{Cursor, Side};
+use loro::event::Diff;
 use loro::{
-    ContainerID, ContainerType, ExportMode, LoroDoc, LoroList, LoroMap, LoroMovableList, LoroValue,
-    ValueOrContainer,
+    ContainerID, ContainerType, ExportMode, Frontiers, Index, LoroDoc, LoroList, LoroMap,
+    LoroMovableList, LoroValue, ValueOrContainer,
 };
 
+use crate::binding::{bound_to, resolve_bindings};
 use crate::brush::{BrushId, BrushSpec, CustomBrush};
-use crate::element::{Anchor, Binding, Element, PageElement, ShapeElement, Style};
+use crate::element::{Anchor, Binding, Element, ElementMove, PageElement, ShapeElement, Style};
 use crate::shape::Shape;
 use crate::stroke::{Rgba, Stroke, Tool, decode_chunks, encode_chunks};
 use crate::{ElementId, Error, NoteId, Result, SketchId, StrokeId};
@@ -33,6 +35,17 @@ const ELEMENTS: &str = "strokes";
 const ELEM_STROKE: &str = "stroke";
 const ELEM_SHAPE: &str = "shape";
 const ANCHOR: &str = "anchor";
+
+/// Which ink changed between two versions of a note: see
+/// [`NoteDoc::ink_changes_since`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct InkChanges {
+    /// Anything in the page layer: an element added, removed, moved,
+    /// reshaped or re-anchored.
+    pub page: bool,
+    /// Sketches with any change, including created and deleted ones.
+    pub sketches: Vec<SketchId>,
+}
 
 /// A single note: CommonMark text + page ink + sketches, one Loro doc.
 pub struct NoteDoc {
@@ -180,6 +193,36 @@ impl NoteDoc {
         Ok(())
     }
 
+    /// Move page elements, each by its delta in the space of the line it
+    /// ends up anchored to (`anchor`, or its current one), and re-route the
+    /// lines and arrows bound to them. `origin_of` gives every element's
+    /// line origin after the move, in one shared page space (see
+    /// [`crate::resolve_bindings`]). One commit, so peers see a moved box
+    /// and its re-routed arrows together.
+    pub fn move_page_elements(
+        &self,
+        moves: &[ElementMove],
+        origin_of: impl Fn(ElementId) -> [f32; 2],
+    ) -> Result<()> {
+        move_in(&self.page_list(), moves, &origin_of)?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// Replace a page shape's geometry and bindings (a resize, a re-bound
+    /// arrow end), optionally re-anchoring it, and re-route what is bound
+    /// to it. `origin_of` as for [`Self::move_page_elements`].
+    pub fn update_page_shape(
+        &self,
+        shape: &ShapeElement,
+        anchor: Option<&Anchor>,
+        origin_of: impl Fn(ElementId) -> [f32; 2],
+    ) -> Result<()> {
+        update_in(&self.page_list(), shape, anchor, &origin_of)?;
+        self.doc.commit();
+        Ok(())
+    }
+
     /// The page layer in z-order. Entries this version cannot read, or
     /// that carry no anchor, are logged and skipped.
     pub fn page_elements(&self) -> Vec<PageElement> {
@@ -264,10 +307,15 @@ impl NoteDoc {
     }
 
     /// Append a shape on top of the sketch's z-order. Geometry is stored
-    /// as flat scalar keys so a later edit merges per field.
+    /// as flat scalar keys so a later edit merges per field; a bound line
+    /// or arrow is stored with its ends already routed.
     pub fn add_shape(&self, sketch: SketchId, shape: &ShapeElement) -> Result<()> {
-        let map = self.elements_list(sketch)?.push_container(LoroMap::new())?;
+        let list = self.elements_list(sketch)?;
+        let map = list.push_container(LoroMap::new())?;
         write_shape(&map, shape)?;
+        if shape.start.is_some() || shape.end.is_some() {
+            reroute(&list, &[shape.id], &|_| [0.0, 0.0])?;
+        }
         self.doc.commit();
         Ok(())
     }
@@ -275,6 +323,35 @@ impl NoteDoc {
     /// Remove the element with `id` (stroke or shape).
     pub fn remove_element(&self, sketch: SketchId, id: ElementId) -> Result<()> {
         remove_by_id(&self.elements_list(sketch)?, id)?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// Move sketch elements by `delta` and re-route the lines and arrows
+    /// bound to them, in one commit.
+    pub fn move_elements(
+        &self,
+        sketch: SketchId,
+        ids: &[ElementId],
+        delta: [f32; 2],
+    ) -> Result<()> {
+        let moves: Vec<ElementMove> = ids
+            .iter()
+            .map(|&id| ElementMove {
+                id,
+                delta,
+                anchor: None,
+            })
+            .collect();
+        move_in(&self.elements_list(sketch)?, &moves, &|_| [0.0, 0.0])?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// Replace a sketch shape's geometry and bindings and re-route what is
+    /// bound to it, in one commit.
+    pub fn update_shape(&self, sketch: SketchId, shape: &ShapeElement) -> Result<()> {
+        update_in(&self.elements_list(sketch)?, shape, None, &|_| [0.0, 0.0])?;
         self.doc.commit();
         Ok(())
     }
@@ -287,7 +364,8 @@ impl NoteDoc {
     /// All elements of a sketch in z-order. Entries this version cannot
     /// read (a newer element kind, a malformed map) are logged and skipped
     /// rather than hiding the whole sketch; a binding whose target is not
-    /// in the sketch is dropped.
+    /// in the sketch is dropped, and bound line and arrow ends are
+    /// re-derived from their targets.
     pub fn elements(&self, sketch: SketchId) -> Result<Vec<Element>> {
         let list = self.elements_list(sketch)?;
         let mut elements: Vec<Element> = (0..list.len())
@@ -306,6 +384,7 @@ impl NoteDoc {
             })
             .collect();
         prune_bindings(&mut elements);
+        resolve_bindings(&mut elements, |_| [0.0, 0.0]);
         Ok(elements)
     }
 
@@ -372,6 +451,14 @@ impl NoteDoc {
             _ => None,
         };
 
+        let mut points = decode_chunks(chunks.iter().map(Vec::as_slice))?;
+        let [ox, oy] = stroke_offset(map);
+        if ox != 0.0 || oy != 0.0 {
+            for p in &mut points {
+                p.x += ox;
+                p.y += oy;
+            }
+        }
         Ok(Stroke {
             id: get_str(map, "id")?.parse()?,
             tool,
@@ -379,7 +466,7 @@ impl NoteDoc {
             color: Rgba::from_packed(get_i64(map, "color")?),
             base_width: get_f32(map, "width")?,
             kind: get_str(map, "kind")?.parse()?,
-            points: decode_chunks(chunks.iter().map(Vec::as_slice))?,
+            points,
             created_ms: u64::try_from(get_i64(map, "created")?).unwrap_or(0),
         })
     }
@@ -404,6 +491,11 @@ impl NoteDoc {
             "ellipse" => Shape::Ellipse {
                 center: [f("cx")?, f("cy")?],
                 radii: [f("rx")?, f("ry")?],
+                angle: f("angle")?,
+            },
+            "diamond" => Shape::Diamond {
+                center: [f("cx")?, f("cy")?],
+                size: [f("w")?, f("h")?],
                 angle: f("angle")?,
             },
             other => return Err(Error::Schema(format!("unknown shape {other:?}"))),
@@ -500,6 +592,67 @@ impl NoteDoc {
         Ok(self.doc.export(ExportMode::Snapshot)?)
     }
 
+    /// Opaque marker of the current version, for [`Self::ink_changes_since`].
+    pub fn frontiers(&self) -> Vec<u8> {
+        self.doc.state_frontiers().encode()
+    }
+
+    /// Which ink containers changed since `before` (from
+    /// [`Self::frontiers`]). Elements are edited in place (moved,
+    /// reshaped), so a length probe is not enough to notice a change.
+    /// Unreadable `before` bytes report every layer as changed.
+    pub fn ink_changes_since(&self, before: &[u8]) -> InkChanges {
+        let everything = || InkChanges {
+            page: true,
+            sketches: self.sketch_ids(),
+        };
+        let Ok(before) = Frontiers::decode(before) else {
+            return everything();
+        };
+        let after = self.doc.state_frontiers();
+        if before == after {
+            return InkChanges::default();
+        }
+        let diff = match self.doc.diff(&before, &after) {
+            Ok(diff) => diff,
+            Err(err) => {
+                tracing::warn!(%err, "ink diff failed; reporting every layer");
+                return everything();
+            }
+        };
+        let mut changes = InkChanges::default();
+        let mut note_sketch = |key: &str| {
+            if let Ok(id) = key.parse::<SketchId>()
+                && !changes.sketches.contains(&id)
+            {
+                changes.sketches.push(id);
+            }
+        };
+        let mut page = false;
+        for (cid, delta) in diff.iter() {
+            // A deleted container has no path; its parent's diff covers it.
+            let Some(path) = self.doc.get_path_to_container(cid) else {
+                continue;
+            };
+            match path.as_slice() {
+                [(_, Index::Key(root)), ..] if root.as_str() == PAGE => page = true,
+                [(_, Index::Key(root))] if root.as_str() == SKETCHES => {
+                    if let Diff::Map(map) = delta {
+                        map.updated.keys().for_each(|k| note_sketch(k));
+                    }
+                }
+                [(_, Index::Key(root)), (_, Index::Key(sketch)), ..]
+                    if root.as_str() == SKETCHES =>
+                {
+                    note_sketch(sketch.as_str());
+                }
+                _ => {}
+            }
+        }
+        changes.page = page;
+        changes
+    }
+
     /// Import a remote update. Returns whether it added anything the doc
     /// did not already have (false = duplicate, safe to not re-broadcast).
     pub fn import_update(&self, bytes: &[u8]) -> Result<bool> {
@@ -541,7 +694,20 @@ fn write_shape(map: &LoroMap, shape: &ShapeElement) -> Result<()> {
     map.insert("color", shape.style.color.packed())?;
     map.insert("width", f64::from(shape.style.width))?;
     map.insert("created", to_i64(shape.created_ms))?;
-    let (kind, fields): (&str, Vec<(&str, f32)>) = match shape.shape {
+    write_geometry(map, &shape.shape)?;
+    for (key, binding) in [("start", shape.start), ("end", shape.end)] {
+        if let Some(b) = binding {
+            write_binding(map, key, &b)?;
+        }
+    }
+    Ok(())
+}
+
+/// The shape's kind and flat geometry keys. Only keys whose value changed
+/// are written, so a concurrent edit of the other keys (an arrow's other
+/// end, say) survives the merge.
+fn write_geometry(map: &LoroMap, shape: &Shape) -> Result<()> {
+    let (kind, fields): (&str, Vec<(&str, f32)>) = match *shape {
         Shape::Line { a, b } => (
             "line",
             vec![("ax", a[0]), ("ay", a[1]), ("bx", b[0]), ("by", b[1])],
@@ -556,6 +722,20 @@ fn write_shape(map: &LoroMap, shape: &ShapeElement) -> Result<()> {
             angle,
         } => (
             "rect",
+            vec![
+                ("cx", center[0]),
+                ("cy", center[1]),
+                ("w", size[0]),
+                ("h", size[1]),
+                ("angle", angle),
+            ],
+        ),
+        Shape::Diamond {
+            center,
+            size,
+            angle,
+        } => (
+            "diamond",
             vec![
                 ("cx", center[0]),
                 ("cy", center[1]),
@@ -579,34 +759,164 @@ fn write_shape(map: &LoroMap, shape: &ShapeElement) -> Result<()> {
             ],
         ),
     };
-    map.insert("shape", kind)?;
-    for (key, value) in fields {
-        map.insert(key, f64::from(value))?;
+    if map.get("shape").and_then(as_string).as_deref() != Some(kind) {
+        map.insert("shape", kind)?;
     }
-    for (key, binding) in [("start", shape.start), ("end", shape.end)] {
-        if let Some(b) = binding {
-            let m = map.insert_container(key, LoroMap::new())?;
-            m.insert("element", b.element.to_string())?;
-            m.insert("fx", f64::from(b.fixed_point[0]))?;
-            m.insert("fy", f64::from(b.fixed_point[1]))?;
-            m.insert("gap", f64::from(b.gap))?;
+    for (key, value) in fields {
+        let value = f64::from(value);
+        if map.get(key).and_then(as_f64) != Some(value) {
+            map.insert(key, value)?;
         }
     }
     Ok(())
 }
 
+fn write_binding(map: &LoroMap, key: &str, b: &Binding) -> Result<()> {
+    let m = map.insert_container(key, LoroMap::new())?;
+    m.insert("element", b.element.to_string())?;
+    m.insert("fx", f64::from(b.fixed_point[0]))?;
+    m.insert("fy", f64::from(b.fixed_point[1]))?;
+    m.insert("gap", f64::from(b.gap))?;
+    Ok(())
+}
+
+/// Replace `start`/`end` where they differ from what is stored.
+fn write_bindings(map: &LoroMap, stored: &ShapeElement, shape: &ShapeElement) -> Result<()> {
+    for (key, old, new) in [
+        ("start", stored.start, shape.start),
+        ("end", stored.end, shape.end),
+    ] {
+        if old == new {
+            continue;
+        }
+        match new {
+            Some(b) => write_binding(map, key, &b)?,
+            None => map.delete(key)?,
+        }
+    }
+    Ok(())
+}
+
+/// A stroke's translation since it was drawn (`ox`/`oy`, missing = 0):
+/// moving a stroke rewrites two scalars, not its point chunks.
+fn stroke_offset(map: &LoroMap) -> [f32; 2] {
+    // f64 -> f32 has no trait conversion; canvas coordinates fit easily.
+    let get = |key: &str| map.get(key).and_then(as_f64).unwrap_or(0.0) as f32; // ast-grep-ignore: no-as-cast
+    [get("ox"), get("oy")]
+}
+
+/// The entry whose `id` field is `id`, with its index.
+fn find_by_id(list: &LoroMovableList, id: ElementId) -> Option<(usize, LoroMap)> {
+    let target = id.to_string();
+    (0..list.len()).find_map(|i| {
+        let map = list.get(i).and_then(as_map)?;
+        let found = map.get("id").and_then(as_string)?;
+        (found == target).then_some((i, map))
+    })
+}
+
+/// Every readable entry of an element list with its map, in z-order.
+fn entries(list: &LoroMovableList) -> Vec<(LoroMap, Element)> {
+    (0..list.len())
+        .filter_map(|i| {
+            let map = list.get(i).and_then(as_map)?;
+            let element = NoteDoc::read_element(&map).ok().flatten()?;
+            Some((map, element))
+        })
+        .collect()
+}
+
+/// Translate the entries in `moves` by their delta (re-anchoring page
+/// entries that carry one) and re-route every line and arrow bound to a
+/// moved element. A line or arrow moved without its target lets go of it.
+/// The caller commits.
+fn move_in(
+    list: &LoroMovableList,
+    moves: &[ElementMove],
+    origin_of: &dyn Fn(ElementId) -> [f32; 2],
+) -> Result<()> {
+    let ids: Vec<ElementId> = moves.iter().map(|m| m.id).collect();
+    for m in moves {
+        let Some((_, map)) = find_by_id(list, m.id) else {
+            return Err(Error::Schema(format!("element {} not found", m.id)));
+        };
+        match NoteDoc::read_element(&map)? {
+            Some(Element::Shape(stored)) => {
+                let mut moved = stored;
+                moved.shape = stored.shape.translated(m.delta);
+                for binding in [&mut moved.start, &mut moved.end] {
+                    if binding.is_some_and(|b| !ids.contains(&b.element)) {
+                        *binding = None;
+                    }
+                }
+                write_geometry(&map, &moved.shape)?;
+                write_bindings(&map, &stored, &moved)?;
+            }
+            Some(Element::Stroke(_)) => {
+                let [ox, oy] = stroke_offset(&map);
+                map.insert("ox", f64::from(ox + m.delta[0]))?;
+                map.insert("oy", f64::from(oy + m.delta[1]))?;
+            }
+            None => {}
+        }
+        if let Some(anchor) = &m.anchor {
+            map.insert(ANCHOR, LoroValue::Binary(anchor.0.clone().into()))?;
+        }
+    }
+    reroute(list, &ids, origin_of)
+}
+
+/// Rewrite the stored ends of every line and arrow bound to one of `ids`
+/// (or that is one of them) from where their targets now are.
+fn reroute(
+    list: &LoroMovableList,
+    ids: &[ElementId],
+    origin_of: &dyn Fn(ElementId) -> [f32; 2],
+) -> Result<()> {
+    let entries = entries(list);
+    let mut elements: Vec<Element> = entries.iter().map(|(_, el)| el.clone()).collect();
+    prune_bindings(&mut elements);
+    resolve_bindings(&mut elements, origin_of);
+    for ((map, stored), resolved) in entries.iter().zip(&elements) {
+        let affected = ids.contains(&resolved.id()) || bound_to(resolved, ids);
+        if let (true, Element::Shape(before), Element::Shape(after)) = (affected, stored, resolved)
+            && before.shape != after.shape
+        {
+            write_geometry(map, &after.shape)?;
+        }
+    }
+    Ok(())
+}
+
+/// Store `shape`'s geometry and bindings over the entry with its id, then
+/// re-route what is bound to it. The caller commits.
+fn update_in(
+    list: &LoroMovableList,
+    shape: &ShapeElement,
+    anchor: Option<&Anchor>,
+    origin_of: &dyn Fn(ElementId) -> [f32; 2],
+) -> Result<()> {
+    let Some((_, map)) = find_by_id(list, shape.id) else {
+        return Err(Error::Schema(format!("element {} not found", shape.id)));
+    };
+    let Some(Element::Shape(stored)) = NoteDoc::read_element(&map)? else {
+        return Err(Error::Schema(format!(
+            "element {} is not a shape",
+            shape.id
+        )));
+    };
+    write_geometry(&map, &shape.shape)?;
+    write_bindings(&map, &stored, shape)?;
+    if let Some(anchor) = anchor {
+        map.insert(ANCHOR, LoroValue::Binary(anchor.0.clone().into()))?;
+    }
+    reroute(list, &[shape.id], origin_of)
+}
+
 /// Delete the entry whose `id` field is `id`; the caller commits.
 fn remove_by_id(list: &LoroMovableList, id: ElementId) -> Result<()> {
-    let target = id.to_string();
-    let index = (0..list.len()).find(|&i| {
-        list.get(i)
-            .and_then(as_map)
-            .and_then(|m| m.get("id"))
-            .and_then(as_string)
-            .is_some_and(|id| id == target)
-    });
-    let Some(index) = index else {
-        return Err(Error::Schema(format!("element {target} not found")));
+    let Some((index, _)) = find_by_id(list, id) else {
+        return Err(Error::Schema(format!("element {id} not found")));
     };
     list.delete(index, 1)?;
     Ok(())
@@ -786,8 +1096,13 @@ mod tests {
         b.import_update(&a.export_updates_since(&[]).unwrap())
             .unwrap();
 
-        // The dangling end binding is dropped; the one to the rect stays.
-        let expect_arrow = ShapeElement { end: None, ..arrow };
+        // The dangling end binding is dropped; the one to the rect stays
+        // and places the arrow's tail on the rect's right edge.
+        let mut expect_arrow = ShapeElement { end: None, ..arrow };
+        crate::binding::resolve_arrow(&mut expect_arrow, |id| {
+            (id == rect.id).then_some(rect.shape)
+        });
+        assert_ne!(expect_arrow.shape, arrow.shape);
         let expected = vec![
             Element::Shape(rect),
             Element::Stroke(stroke),
@@ -1119,5 +1434,260 @@ mod tests {
 
         assert_eq!(a.text(), " hello\n");
         assert!(a.strokes(sketch).unwrap().is_empty());
+    }
+
+    fn bind(target: &ShapeElement) -> Option<Binding> {
+        Some(Binding {
+            element: target.id,
+            fixed_point: [0.5, 0.5],
+            gap: 4.0,
+        })
+    }
+
+    fn square(center: [f32; 2]) -> ShapeElement {
+        sample_shape(Shape::Rect {
+            center,
+            size: [40.0, 40.0],
+            angle: 0.0,
+        })
+    }
+
+    /// Two squares on a sketch joined by an arrow.
+    fn connected_sketch(a: &NoteDoc) -> (SketchId, ShapeElement, ShapeElement, ShapeElement) {
+        let sketch = a.create_sketch(0).unwrap();
+        let (x, y) = (square([0.0, 0.0]), square([200.0, 0.0]));
+        let arrow = ShapeElement {
+            start: bind(&x),
+            end: bind(&y),
+            ..sample_shape(Shape::Arrow {
+                a: [20.0, 0.0],
+                b: [180.0, 0.0],
+            })
+        };
+        for s in [&x, &y, &arrow] {
+            a.add_shape(sketch, s).unwrap();
+        }
+        (sketch, x, y, arrow)
+    }
+
+    fn shape_of(elements: &[Element], id: ElementId) -> ShapeElement {
+        elements
+            .iter()
+            .find_map(|el| match el {
+                Element::Shape(s) if s.id == id => Some(*s),
+                _ => None,
+            })
+            .expect("shape present")
+    }
+
+    #[test]
+    fn diamonds_roundtrip() {
+        let a = NoteDoc::new(NoteId::new());
+        let sketch = a.create_sketch(0).unwrap();
+        let diamond = sample_shape(Shape::Diamond {
+            center: [5.0, 6.0],
+            size: [30.0, 20.0],
+            angle: 0.25,
+        });
+        a.add_shape(sketch, &diamond).unwrap();
+        assert_eq!(a.elements(sketch).unwrap(), vec![Element::Shape(diamond)]);
+    }
+
+    #[test]
+    fn moved_strokes_keep_their_points_and_offset_on_read() {
+        let (a, b) = (NoteDoc::new(NoteId::new()), NoteDoc::new(NoteId::new()));
+        let sketch = a.create_sketch(0).unwrap();
+        let stroke = sample_stroke();
+        a.add_stroke(sketch, &stroke).unwrap();
+        a.move_elements(sketch, &[stroke.id], [5.0, -2.0]).unwrap();
+        a.move_elements(sketch, &[stroke.id], [1.0, 1.0]).unwrap();
+        b.import_update(&a.export_snapshot().unwrap()).unwrap();
+        let elements = b.elements(sketch).unwrap();
+        let [Element::Stroke(moved)] = elements.as_slice() else {
+            panic!("one stroke");
+        };
+        for (p, q) in stroke.points.iter().zip(&moved.points) {
+            assert_eq!((q.x, q.y), (p.x + 6.0, p.y - 1.0));
+        }
+    }
+
+    #[test]
+    fn moving_a_box_reroutes_its_arrow_in_the_same_commit() {
+        let id = NoteId::new();
+        let (a, b) = (NoteDoc::new(id), NoteDoc::new(id));
+        let (sketch, _, y, arrow) = connected_sketch(&a);
+        sync(&a, &b);
+        let before = b.frontiers();
+
+        a.move_elements(sketch, &[y.id], [0.0, 200.0]).unwrap();
+        sync(&a, &b);
+        assert_eq!(
+            b.ink_changes_since(&before),
+            InkChanges {
+                page: false,
+                sketches: vec![sketch],
+            }
+        );
+        let moved = shape_of(&b.elements(sketch).unwrap(), arrow.id);
+        assert_eq!(moved.end, bind(&y), "the target moved, the binding stays");
+        let Shape::Arrow { a: from, b: to } = moved.shape else {
+            panic!("arrow");
+        };
+        // From the first square toward (200, 200): both ends leave through
+        // a corner and sit a gap further along the diagonal.
+        let off = 20.0 + 4.0 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!(
+            (from[0] - off).abs() < 1e-3 && (from[1] - off).abs() < 1e-3,
+            "{from:?}"
+        );
+        assert!((to[0] - (200.0 - off)).abs() < 1e-3, "{to:?}");
+
+        // Stored geometry was rewritten too, not only derived on read.
+        let (_, map) = find_by_id(&a.elements_list(sketch).unwrap(), arrow.id).unwrap();
+        let stored = NoteDoc::read_shape(&map).unwrap();
+        assert_eq!(stored.shape, moved.shape);
+    }
+
+    #[test]
+    fn moving_an_arrow_alone_lets_go_of_its_targets() {
+        let a = NoteDoc::new(NoteId::new());
+        let (sketch, x, y, arrow) = connected_sketch(&a);
+        a.move_elements(sketch, &[arrow.id], [0.0, 100.0]).unwrap();
+        let moved = shape_of(&a.elements(sketch).unwrap(), arrow.id);
+        assert_eq!((moved.start, moved.end), (None, None));
+        assert_eq!(
+            moved.shape,
+            Shape::Arrow {
+                a: [24.0, 100.0],
+                b: [176.0, 100.0],
+            }
+        );
+
+        // Moved with both its targets, it stays bound.
+        a.update_shape(sketch, &arrow).unwrap();
+        a.move_elements(sketch, &[x.id, y.id, arrow.id], [10.0, 0.0])
+            .unwrap();
+        let moved = shape_of(&a.elements(sketch).unwrap(), arrow.id);
+        assert_eq!((moved.start, moved.end), (bind(&x), bind(&y)));
+    }
+
+    #[test]
+    fn concurrent_moves_of_both_targets_keep_both_ends() {
+        let id = NoteId::new();
+        let (a, b) = (NoteDoc::new(id), NoteDoc::new(id));
+        let (sketch, x, y, arrow) = connected_sketch(&a);
+        sync(&a, &b);
+        a.move_elements(sketch, &[x.id], [0.0, -50.0]).unwrap();
+        b.move_elements(sketch, &[y.id], [0.0, 50.0]).unwrap();
+        sync(&a, &b);
+        sync(&b, &a);
+        let (ea, eb) = (a.elements(sketch).unwrap(), b.elements(sketch).unwrap());
+        assert_eq!(ea, eb);
+        // Each peer re-routed its end against the other box's old place;
+        // reading derives both ends from where the boxes are now.
+        let Shape::Arrow { a: from, b: to } = shape_of(&ea, arrow.id).shape else {
+            panic!("arrow");
+        };
+        let (sx, sy) = (shape_of(&ea, x.id).shape, shape_of(&ea, y.id).shape);
+        assert_eq!(sx.translated([0.0, 50.0]), x.shape);
+        assert_eq!(sy.translated([0.0, -50.0]), y.shape);
+        assert!(from[1] < -20.0 && to[1] > 20.0, "{from:?} {to:?}");
+    }
+
+    #[test]
+    fn page_moves_reanchor_and_reroute_across_lines() {
+        let id = NoteId::new();
+        let (a, b) = (NoteDoc::new(id), NoteDoc::new(id));
+        a.splice_text(0, 0, "one\ntwo\nthree\n").unwrap();
+        let (top, two) = (a.anchor_at(0).unwrap(), a.anchor_at(4).unwrap());
+        let (x, y) = (square([0.0, 0.0]), square([200.0, 0.0]));
+        let arrow = ShapeElement {
+            start: bind(&x),
+            end: bind(&y),
+            ..sample_shape(Shape::Arrow {
+                a: [20.0, 0.0],
+                b: [180.0, 0.0],
+            })
+        };
+        a.add_page_shape(&x, &top).unwrap();
+        a.add_page_shape(&y, &top).unwrap();
+        a.add_page_shape(&arrow, &top).unwrap();
+        sync(&a, &b);
+        let before = b.frontiers();
+
+        // Drag `y` down onto line two (origin y = 20): it lands 30 below
+        // that line's origin, i.e. 50 in page space.
+        let origin = |el: ElementId| if el == y.id { [0.0, 20.0] } else { [0.0, 0.0] };
+        a.move_page_elements(
+            &[ElementMove {
+                id: y.id,
+                delta: [0.0, 30.0],
+                anchor: Some(two.clone()),
+            }],
+            origin,
+        )
+        .unwrap();
+        sync(&a, &b);
+        assert!(b.ink_changes_since(&before).page);
+        let page = b.page_elements();
+        let moved_y = page.iter().find(|p| p.element.id() == y.id).unwrap();
+        assert_eq!(moved_y.anchor, two);
+        let Element::Shape(ShapeElement {
+            shape: Shape::Arrow { a: from, b: to },
+            ..
+        }) = page
+            .iter()
+            .find(|p| p.element.id() == arrow.id)
+            .unwrap()
+            .element
+        else {
+            panic!("arrow");
+        };
+        // The arrow (on the top line) now runs from (0, 0) toward (200, 50).
+        let dir = [200.0f32, 50.0];
+        let len = dir[0].hypot(dir[1]);
+        let cross = |p: [f32; 2]| p[0] * dir[1] - p[1] * dir[0];
+        assert!(cross(from).abs() / len < 1e-2 && cross(to).abs() / len < 1e-2);
+        // Each end leaves a side (x = ±20 off its center) then backs off
+        // the 4 gap along the shaft.
+        let back = 4.0 * dir[0] / len;
+        assert!((from[0] - (20.0 + back)).abs() < 1e-3, "{from:?}");
+        assert!((to[0] - (180.0 - back)).abs() < 1e-3, "{to:?}");
+    }
+
+    #[test]
+    fn ink_changes_name_only_what_changed() {
+        let id = NoteId::new();
+        let (a, b) = (NoteDoc::new(id), NoteDoc::new(id));
+        let before = b.frontiers();
+        a.splice_text(0, 0, "hi").unwrap();
+        sync(&a, &b);
+        assert_eq!(b.ink_changes_since(&before), InkChanges::default());
+
+        let before = b.frontiers();
+        let sketch = a.create_sketch(0).unwrap();
+        sync(&a, &b);
+        assert_eq!(b.ink_changes_since(&before).sketches, vec![sketch]);
+
+        let before = b.frontiers();
+        let (stroke, _) = page_stroke(&a, 0);
+        sync(&a, &b);
+        let changes = b.ink_changes_since(&before);
+        assert!(changes.page && changes.sketches.is_empty());
+
+        let before = b.frontiers();
+        a.move_page_elements(
+            &[ElementMove {
+                id: stroke.id,
+                delta: [1.0, 0.0],
+                anchor: None,
+            }],
+            |_| [0.0, 0.0],
+        )
+        .unwrap();
+        sync(&a, &b);
+        assert!(b.ink_changes_since(&before).page);
+
+        assert!(b.ink_changes_since(b"garbage").page);
     }
 }

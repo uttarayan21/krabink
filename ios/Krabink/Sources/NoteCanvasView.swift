@@ -66,6 +66,9 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
     /// Pencil hover (Pencil 2 on M2 iPads, Pencil Pro): the sample under
     /// the tip while it hovers, `nil` when it leaves.
     var onHover: ((RawSample?) -> Void)?
+    /// A finger tapped here (content space), claimed or not.
+    var onFingerTap: ((CGPoint) -> Void)?
+    private let fingerTap = UITapGestureRecognizer()
     /// The lines moved (text or width changed); coalesced per run-loop pass.
     var onLayoutChanged: (() -> Void)?
     private let hoverRecognizer = UIHoverGestureRecognizer()
@@ -157,6 +160,14 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
         hoverRecognizer.addTarget(self, action: #selector(hoverChanged))
         hoverRecognizer.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
         textView.addGestureRecognizer(hoverRecognizer)
+        // Unlike the text view's own taps it does not wait for `pen` and
+        // runs beside them.
+        pen.bystander = fingerTap
+        fingerTap.addTarget(self, action: #selector(fingerTapped))
+        fingerTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        fingerTap.cancelsTouchesInView = false
+        fingerTap.delegate = self
+        textView.addGestureRecognizer(fingerTap)
 
         setText(model.text)
     }
@@ -420,6 +431,16 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
         }
     }
 
+    /// The toolbar's keyboard button: bring the keyboard up at the caret,
+    /// or put it away.
+    func toggleKeyboard() {
+        if textView.isFirstResponder {
+            textView.resignFirstResponder()
+        } else if !preview {
+            textView.becomeFirstResponder()
+        }
+    }
+
     /// The keyboard went away: keep the tool picker by taking the
     /// responder chain back.
     nonisolated func textViewDidEndEditing(_ textView: UITextView) {
@@ -437,6 +458,10 @@ final class NoteCanvasView: UIView, UITextViewDelegate, NSLayoutManagerDelegate,
         _ interaction: UIScribbleInteraction, shouldBeginAt location: CGPoint
     ) -> Bool {
         false
+    }
+
+    @objc private func fingerTapped() {
+        onFingerTap?(fingerTap.location(in: textView))
     }
 
     @objc private func hoverChanged(_ gesture: UIHoverGestureRecognizer) {
@@ -582,10 +607,23 @@ struct NoteCanvas: UIViewRepresentable {
             case .cancelled: ink.penEnded(cancelled: true)
             }
         }
+        // Where fingers ink they keep inking over ink; where only the
+        // Pencil draws, a finger on ink selects under any tool.
+        let anyTool = InputPolicy.launch == .pencilOnly
+        canvas.pen.claimsFinger = { ink.claimsFinger(at: $0, anyTool: anyTool) }
+        // The scroll already tracks the finger: cancel it for this touch.
+        canvas.pen.onFingerClaimed = { [weak canvas] in
+            ink.fingerClaimed()
+            guard let pan = canvas?.textView.panGestureRecognizer else { return }
+            pan.isEnabled = false
+            pan.isEnabled = true
+        }
         canvas.onHover = { ink.hover($0) }
+        canvas.onFingerTap = { ink.fingerTapped(at: $0) }
         canvas.onLayoutChanged = { ink.layoutChanged() }
         ink.onSketchChanged = { [weak canvas] sketch in canvas?.sketchChanged(sketch) }
         ink.hapticView = canvas
+        model.toggleKeyboard = { [weak canvas] in canvas?.toggleKeyboard() }
 
         // PencilKit's picker works with any first responder; it hands us
         // the selected tool through the observer. `-tool` pins the tool
@@ -686,5 +724,15 @@ struct NoteCanvas: UIViewRepresentable {
                 if let selected = selectedPick { model.picked = selected }
             }
         }
+    }
+}
+
+extension NoteCanvasView: UIGestureRecognizerDelegate {
+    /// The deselecting tap never keeps the caret's tap from landing.
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+    ) -> Bool {
+        true
     }
 }

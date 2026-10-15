@@ -161,3 +161,56 @@ extension Element {
         }
     }
 }
+
+extension KrabinkCore.Shape {
+    /// A line's or arrow's ends; `nil` for closed shapes.
+    var ends: (a: Point2, b: Point2)? {
+        switch self {
+        case .line(let a, let b), .arrow(let a, let b): (a, b)
+        default: nil
+        }
+    }
+
+    /// The same line or arrow between new ends; closed shapes unchanged.
+    func withEnds(_ a: Point2, _ b: Point2) -> Self {
+        switch self {
+        case .line: .line(a: a, b: b)
+        case .arrow: .arrow(a: a, b: b)
+        default: self
+        }
+    }
+}
+
+extension Point2 {
+    /// Where this point of the space at `origin` is on the page.
+    func page(from origin: CGPoint) -> CGPoint {
+        CGPoint(x: origin.x + CGFloat(x), y: origin.y + CGFloat(y))
+    }
+
+    func distance(to other: Point2) -> CGFloat {
+        CGFloat(hypot(x - other.x, y - other.y))
+    }
+
+    static let zero = Point2(x: 0, y: 0)
+
+    var negated: Point2 { Point2(x: -x, y: -y) }
+
+    func offset(by d: Point2) -> Point2 {
+        Point2(x: x + d.x, y: y + d.y)
+    }
+
+    /// This point turned `angle` radians about `pivot` (y down, so
+    /// positive is clockwise on screen).
+    func rotated(by angle: Float, about pivot: Point2) -> Point2 {
+        let (dx, dy) = (x - pivot.x, y - pivot.y)
+        let (s, c) = (sin(angle), cos(angle))
+        return Point2(x: pivot.x + dx * c - dy * s, y: pivot.y + dx * s + dy * c)
+    }
+}
+
+extension CGPoint {
+    /// This page point in the space whose origin is at `origin`.
+    func local(to origin: CGPoint) -> Point2 {
+        Point2(x: Float(x - origin.x), y: Float(y - origin.y))
+    }
+}

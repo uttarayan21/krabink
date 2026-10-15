@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use krabink_ffi::{
     AppearanceInfo, AssetInfo, AssetKind, BrushInfo, Core, CoreListener, DeviceInfo, Element,
-    NoteInfo, NoteListener, PageProbe, PairInfo, Point2, PointKind, Route, Shape, ShapeElement,
-    Stroke, StrokePoint, StyleKind, SyncState, Tool, inline_min_height, inline_padding, style_runs,
+    ElementOrigin, NoteInfo, NoteListener, PageMove, PageProbe, PairInfo, Point2, PointKind, Route,
+    Shape, ShapeElement, Stroke, StrokePoint, StyleKind, SyncState, Tool, inline_min_height,
+    inline_padding, resolve_page_bindings, style_runs,
 };
 
 fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
@@ -938,6 +939,185 @@ fn erase_page_hits_only_touched_elements() {
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].element.id(), far);
     assert_eq!(left[0].char_index, Some(2));
+}
+
+fn square(id: String, x: f32, y: f32) -> ShapeElement {
+    ShapeElement {
+        id,
+        shape: Shape::Rect {
+            center: Point2 { x, y },
+            size: Point2 { x: 40.0, y: 40.0 },
+            angle: 0.0,
+        },
+        tool: Tool::Monoline,
+        color: 0xff,
+        width: 2.0,
+        start: None,
+        end: None,
+        created_ms: 1,
+    }
+}
+
+fn arrow_ends(page: &[krabink_ffi::PageElement], id: &str) -> (Point2, Point2) {
+    page.iter()
+        .find_map(|p| match &p.element {
+            Element::Shape(ShapeElement {
+                id: found,
+                shape: Shape::Arrow { a, b },
+                ..
+            }) if found == id => Some((*a, *b)),
+            _ => None,
+        })
+        .expect("arrow on the page")
+}
+
+/// Two squares on different lines joined by an arrow: selecting hits
+/// inside a square, moving one on A reaches B as `page_changed` with the
+/// arrow re-routed, and `resolve_page_bindings` follows line origins.
+#[test]
+fn moving_a_bound_square_reroutes_its_arrow_on_the_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let core_a = Core::new(dir.path().join("a").to_str().unwrap().into()).unwrap();
+    let core_b = Core::new(dir.path().join("b").to_str().unwrap().into()).unwrap();
+    let mut pair = core_a.pair_info();
+    pair.addrs = vec![format!("127.0.0.1:{}", core_a.bound_port().unwrap())];
+    core_b.set_pairing(pair).unwrap();
+    wait_for("B connects to A", || connected(&core_b.sync_state()));
+
+    let note_a = core_a.clone().create_note("bound".into()).unwrap();
+    note_a.apply_text_edit(0, 0, "one\ntwo\n".into()).unwrap();
+    let (top, two) = (note_a.anchor_at(0).unwrap(), note_a.anchor_at(4).unwrap());
+    let (x, y, arrow) = (
+        note_a
+            .begin_page_stroke(top.clone(), Tool::Monoline, 0xff, 2.0, None)
+            .unwrap(),
+        note_a
+            .begin_page_stroke(top.clone(), Tool::Monoline, 0xff, 2.0, None)
+            .unwrap(),
+        note_a
+            .begin_page_stroke(top.clone(), Tool::Monoline, 0xff, 2.0, None)
+            .unwrap(),
+    );
+    note_a
+        .finish_page_shape(square(x.clone(), 0.0, 0.0), top.clone())
+        .unwrap();
+    note_a
+        .finish_page_shape(square(y.clone(), 200.0, 0.0), top.clone())
+        .unwrap();
+
+    // The pen lands inside each square: both bind.
+    let origins = |y_origin: f32| {
+        vec![
+            ElementOrigin {
+                element: x.clone(),
+                x: 0.0,
+                y: 0.0,
+            },
+            ElementOrigin {
+                element: y.clone(),
+                x: 0.0,
+                y: y_origin,
+            },
+            ElementOrigin {
+                element: arrow.clone(),
+                x: 0.0,
+                y: 0.0,
+            },
+        ]
+    };
+    let start = note_a
+        .binding_at_page(5.0, 5.0, origins(0.0), 6.0, None)
+        .unwrap();
+    let end = note_a
+        .binding_at_page(195.0, 0.0, origins(0.0), 6.0, None)
+        .unwrap();
+    assert_eq!(start.as_ref().map(|b| b.element.clone()), Some(x.clone()));
+    assert_eq!(end.as_ref().map(|b| b.element.clone()), Some(y.clone()));
+    assert_eq!(
+        note_a
+            .binding_at_page(100.0, 0.0, origins(0.0), 6.0, None)
+            .unwrap(),
+        None
+    );
+    note_a
+        .finish_page_shape(
+            ShapeElement {
+                shape: Shape::Arrow {
+                    a: Point2 { x: 5.0, y: 5.0 },
+                    b: Point2 { x: 195.0, y: 0.0 },
+                },
+                start,
+                end,
+                ..square(arrow.clone(), 0.0, 0.0)
+            },
+            top.clone(),
+        )
+        .unwrap();
+
+    let note_b = core_b.clone().open_note(note_a.id()).unwrap();
+    let rec_b = Arc::new(RecNote::default());
+    note_b.set_listener(rec_b.clone());
+    wait_for("shapes reach B", || {
+        note_b
+            .page_elements()
+            .map(|p| p.len() == 3)
+            .unwrap_or(false)
+    });
+
+    // Selecting: inside the square counts, not only its outline.
+    let probe = |element: &str| PageProbe {
+        element: element.into(),
+        x: 200.0,
+        y: 5.0,
+    };
+    assert_eq!(
+        note_a.hit_page_at(vec![probe(&x), probe(&y)], 4.0).unwrap(),
+        Some(y.clone())
+    );
+
+    // Renderers derive the ends from where the squares are drawn.
+    let resolved = resolve_page_bindings(note_a.page_elements().unwrap(), origins(0.0));
+    let (a, b) = arrow_ends(&resolved, &arrow);
+    assert!(
+        (a.x - 24.0).abs() < 1e-3 && (b.x - 176.0).abs() < 1e-3,
+        "{a:?} {b:?}"
+    );
+
+    // A drags `y` onto line two (origin y = 20) and 80 below it.
+    let events_before = *rec_b.page_events.lock().unwrap();
+    note_a
+        .move_page_elements(
+            vec![PageMove {
+                element: y.clone(),
+                dx: 0.0,
+                dy: 80.0,
+                anchor: Some(two.clone()),
+            }],
+            origins(20.0),
+        )
+        .unwrap();
+    wait_for("B hears the move", || {
+        *rec_b.page_events.lock().unwrap() > events_before
+    });
+    let page_b = note_b.page_elements().unwrap();
+    let moved = page_b.iter().find(|p| p.element.id() == y).unwrap();
+    assert_eq!(moved.anchor, two);
+    assert_eq!(moved.char_index, Some(4));
+    // Stored ends were re-routed toward (200, 100) in the same commit.
+    let (a, b) = arrow_ends(&page_b, &arrow);
+    assert!(a.y > 0.0 && b.y > 60.0, "{a:?} {b:?}");
+    assert_eq!(
+        (a, b),
+        arrow_ends(
+            &resolve_page_bindings(page_b.clone(), origins(20.0)),
+            &arrow
+        )
+    );
+
+    // The text reflows: line two moves down 30 and the square with it;
+    // the arrow's head follows (re-angled, so a little less than 30).
+    let (_, b_shifted) = arrow_ends(&resolve_page_bindings(page_b, origins(50.0)), &arrow);
+    assert!(b_shifted.y - b.y > 20.0, "{b:?} -> {b_shifted:?}");
 }
 
 /// An inline sketch drawn on A reaches B as sketch-keyed wet ink, then as

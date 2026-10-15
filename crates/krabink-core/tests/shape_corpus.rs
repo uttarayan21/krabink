@@ -20,6 +20,7 @@ fn variant(shape: Option<Shape>) -> &'static str {
         Some(Shape::Arrow { .. }) => "arrow",
         Some(Shape::Rect { .. }) => "rect",
         Some(Shape::Ellipse { .. }) => "ellipse",
+        Some(Shape::Diamond { .. }) => "diamond",
         None => "none",
     }
 }
